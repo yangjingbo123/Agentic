@@ -1,0 +1,29 @@
+# 强化学习框架
+ray[rllib]==2.9.0
+gymnasium==0.29.1
+pettingzoo==1.24.3
+
+# 深度学习
+torch==2.1.0
+transformers==4.36.0
+sentence-transformers==2.2.2
+
+# LLM推理（本地部署）
+vllm==0.3.0
+autoawq==0.1.8
+
+# 数据处理
+datasets==2.16.0
+pandas==2.1.4
+numpy==1.24.3
+
+# 实验管理
+wandb==0.16.2
+
+# 可视化
+matplotlib==3.8.2
+seaborn==0.13.0
+
+# 工具
+tqdm==4.66.1
+pyyaml==6.0.1

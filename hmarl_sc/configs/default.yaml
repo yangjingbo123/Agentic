@@ -1,0 +1,95 @@
+# HMARL-SC 默认配置
+
+# 环境配置
+environment:
+  dataset: "gsm8k"
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  max_episodes: 30000
+
+# LLM配置
+llm:
+  model: "Qwen/Qwen3-7B-Instruct"
+  backend: "vllm"
+  quantization: "awq"
+  temperature_explore: 0.7
+  temperature_diagnose: 0.3
+  max_tokens: 512
+  cache_enabled: true
+  cache_dir: "./llm_cache"
+  gpu_memory_utilization: 0.3
+
+# 预算配置
+budget:
+  k_equiv: 10
+  single_cot_tokens: 400
+  total_budget: 4000
+  light_ratio: 0.05
+  standard_ratio: 0.15
+  heavy_ratio: 0.30
+
+# 高层配置
+high_level:
+  gamma: 0.99
+  max_rounds: 8
+  obs_dim: 271
+  hidden_dim: 128
+
+# 低层配置
+low_level:
+  gamma: 0.95
+  k_max_light: 3
+  k_max_standard: 5
+  k_max_heavy: 8
+  obs_dim: 512
+  hidden_dim: 128
+  shared_trunk: true
+
+# 奖励配置
+reward:
+  alpha: 0.2
+  beta_high: 0.00025
+  beta_low: 0.00083
+  beta_verifier: 0.1
+  eta: 0.5
+
+# PPO训练配置
+ppo:
+  lr_policy: 3.0e-4
+  lr_value: 1.0e-3
+  clip_epsilon: 0.1
+  lambda_gae: 0.95
+  entropy_coeff_high: 0.01
+  entropy_coeff_low: 0.02
+  train_batch_size: 2000
+  sgd_minibatch_size: 64
+  num_sgd_iter: 10
+
+# Stage 0: BC初始化
+stage0:
+  num_episodes: 3000
+  rule_policies: ["simple", "verify", "challenge"]
+  bc_epochs: 30
+  bc_batch_size: 32
+
+# Stage 1: 交替冻结训练
+stage1:
+  num_rounds: 3
+  phase_a_steps: 1000
+  phase_b_steps: 1000
+  decay_factor: 0.8
+  min_steps: 300
+
+# Stage 2: 联合微调
+stage2:
+  num_steps: 5000
+  lr_decay: 0.33
+  check_interval: 100
+
+# 监控配置
+monitoring:
+  wandb_project: "hmarl-sc"
+  log_interval: 10
+  eval_interval: 50
+  save_interval: 200

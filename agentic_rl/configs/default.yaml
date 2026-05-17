@@ -1,0 +1,18 @@
+llm:
+  model_path: "Qwen/Qwen3-8B"
+
+data:
+  train_path: "data/gsm8k_train.jsonl"
+  test_path: "data/gsm8k_test.jsonl"
+
+agentic:
+  epochs: 3
+  n_samples: 4
+  lr: 1.0e-5
+  clip_epsilon: 0.02
+  max_tokens: 512
+  max_rounds: 3        # Controller最多调度几轮（每轮开头都会重新决策）
+  max_interactions: 3  # 每轮内最多触发几次交互
+  kl_coef: 0.1
+  target_kl: 6.0
+  max_grad_norm: 1.0

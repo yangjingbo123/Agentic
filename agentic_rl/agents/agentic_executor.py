@@ -21,13 +21,13 @@ ROLE_NAMES = {"proposer": "Proposer", "critic": "Critic", "verifier": "Verifier"
 
 
 class AgenticExecutor:
-    def __init__(self, models: dict, tokenizer, config):
-        # models: {"controller": model, "proposer": model, "critic": model, "verifier": model}
+    def __init__(self, models: dict, tokenizer, config, vllm_engine=None):
         self.models = models
         self.tokenizer = tokenizer
         self.max_tokens = config.get("max_tokens", 512)
         self.max_interactions = config.get("max_interactions", 3)
-        self.max_rounds = config.get("max_rounds", 3)  # Controller最多调度几轮
+        self.max_rounds = config.get("max_rounds", 3)
+        self.vllm_engine = vllm_engine
 
     def run_episode(self, question: str, correct_answer: str) -> dict:
         blackboard = Blackboard()
@@ -177,26 +177,36 @@ class AgenticExecutor:
         )
 
     def _run_turn(self, role, system, user, all_messages, turn_id, turn_ids, log_probs) -> str:
-        model = self.models[role]
         messages = [{"role": "system", "content": system},
                     {"role": "user",   "content": user}]
-        inputs = self.tokenizer.apply_chat_template(
-            messages, return_tensors="pt", add_generation_prompt=True
-        ).to(model.device)
 
-        with torch.no_grad():
-            outputs = model.generate(
-                inputs, max_new_tokens=self.max_tokens,
-                return_dict_in_generate=True, output_scores=True,
+        if self.vllm_engine is not None:
+            prompt = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
             )
-
-        new_tokens = outputs.sequences[0][inputs.shape[1]:]
-        for token_id, scores in zip(new_tokens, outputs.scores):
-            lp = F.log_softmax(scores[0], dim=-1)[token_id].item()
-            log_probs.append(lp)
-            turn_ids.append(turn_id)
-
-        response = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+            response, turn_lps = self.vllm_engine.generate(role, prompt)
+            log_probs.extend(turn_lps)
+            turn_ids.extend([turn_id] * len(turn_lps))
+        else:
+            model = self.models[role]
+            if hasattr(model, 'set_role'):
+                model.set_role(role)
+            inputs = self.tokenizer.apply_chat_template(
+                messages, return_tensors="pt", add_generation_prompt=True,
+                return_dict=True,
+            ).to(model.device)
+            input_ids = inputs["input_ids"]
+            with torch.no_grad():
+                outputs = model.generate(
+                    input_ids, max_new_tokens=self.max_tokens,
+                    return_dict_in_generate=True, output_scores=True,
+                )
+            new_tokens = outputs.sequences[0][input_ids.shape[1]:]
+            for token_id, scores in zip(new_tokens, outputs.scores):
+                lp = F.log_softmax(scores[0], dim=-1)[token_id].item()
+                log_probs.append(lp)
+                turn_ids.append(turn_id)
+            response = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
         all_messages.append({
             "role_name": role,
             "system":    system,

@@ -27,8 +27,7 @@ class GRPOAgenticTrainer:
         self.executor = AgenticExecutor(models, tokenizer, config, vllm_engine=vllm_engine)
         self.optimizers = {
             role: torch.optim.AdamW(
-                list(model.parameters(role)) if hasattr(model, 'set_role')
-                else [p for p in model.parameters() if p.requires_grad],
+                [p for p in model.parameters() if p.requires_grad],
                 lr=config.get("lr", 1e-5),
             )
             for role, model in models.items()
@@ -75,8 +74,7 @@ class GRPOAgenticTrainer:
 
         # 同步 LoRA 权重到 vLLM（每步更新后）
         if self.vllm_engine is not None:
-            shared = next(iter(self.models.values()))
-            self.vllm_engine.sync_all_loras(shared)
+            self.vllm_engine.sync_all_loras(self.models)
 
         mean_kl = total_kl / self.n_samples
         self.kl_ctrl.update(mean_kl, n_steps=1)

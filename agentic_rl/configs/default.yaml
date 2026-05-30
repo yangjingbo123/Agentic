@@ -12,8 +12,8 @@ agentic:
   lr: 1.0e-6
   clip_epsilon: 0.02
   max_tokens: 512
-  max_rounds: 3
-  max_interactions: 3
-  kl_coef: 0.0
+  max_rounds: 2
+  max_interactions: 2
+  kl_coef: 0.1
   target_kl: 6.0
   max_grad_norm: 1.0

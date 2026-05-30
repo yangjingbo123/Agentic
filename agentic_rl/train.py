@@ -33,10 +33,14 @@ def main():
         if not args.no_vllm:
             from llm.vllm_engine import VLLMInferenceEngine
             print("Initializing vLLM engine...", flush=True)
+            import torch
+            n_gpus = torch.cuda.device_count()
+            # 多卡时 vLLM 用 tensor parallelism，显存利用率可以更高
+            vllm_mem = 0.85 if n_gpus >= 4 else 0.35
             vllm_engine = VLLMInferenceEngine(
                 config["llm"]["model_path"],
                 max_tokens=config["agentic"].get("max_tokens", 512),
-                gpu_memory_utilization=0.35,
+                gpu_memory_utilization=vllm_mem,
             )
             print("vLLM ready.", flush=True)
 

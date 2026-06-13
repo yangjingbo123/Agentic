@@ -3,3 +3,10 @@ __pycache__/
 *.pyc
 .env
 .venv/
+slurm-*.out
+slurm-*.err
+wandb/
+outputs/
+.hydra/
+*.log
+diag-*.out

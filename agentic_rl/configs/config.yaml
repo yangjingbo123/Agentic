@@ -1,0 +1,17 @@
+defaults:
+  - llm: qwen3_8b
+  - agentic: default
+  - data: math
+  - _self_
+
+exp_name: "run"
+stage: "agentic"
+no_vllm: false
+sft_checkpoint: "/scratch/users/k24104674/jingbo_checkpoints/sft"
+
+sft:
+  epochs: 3
+  lr: 2.0e-5
+  batch: 2
+  max_len: 512
+  save_dir: "/scratch/users/k24104674/jingbo_checkpoints/sft"

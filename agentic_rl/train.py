@@ -1,7 +1,13 @@
-import argparse
 import json
+import os
 import random
-import yaml
+import subprocess
+
+import numpy as np
+import torch
+import hydra
+import wandb
+from omegaconf import DictConfig, OmegaConf
 
 
 def load_dataset(path: str):
@@ -9,76 +15,246 @@ def load_dataset(path: str):
         return [json.loads(line) for line in f]
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--stage", default="agentic")
-    parser.add_argument("--config", default="configs/default.yaml")
-    parser.add_argument("--no-vllm", action="store_true")
-    parser.add_argument("--sft-checkpoint", default="checkpoints/sft", help="SFT checkpoint to load")
-    args = parser.parse_args()
+def resolve_vllm_cuda_visible_devices(cfg: DictConfig) -> str:
+    explicit = cfg.agentic.get("vllm_cuda_visible_devices", None)
+    if explicit not in (None, "", "null"):
+        return str(explicit)
 
-    with open(args.config) as f:
-        config = yaml.safe_load(f)
-
-    if args.stage == "agentic":
-        from llm.trainable_llm import load_trainable_models
-        from training.grpo_trainer import GRPOAgenticTrainer
-
-        models, ref_models, tokenizer = load_trainable_models(
-            config["llm"]["model_path"],
-            sft_checkpoint=args.sft_checkpoint if args.sft_checkpoint else None,
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    tokens = [token.strip() for token in visible.split(",") if token.strip()]
+    slot = int(cfg.agentic.get("vllm_gpu_slot", 1))
+    if not tokens:
+        return str(slot)
+    if slot >= len(tokens):
+        raise ValueError(
+            f"agentic.vllm_gpu_slot={slot} but CUDA_VISIBLE_DEVICES={visible!r} only has {len(tokens)} entries"
         )
+    return tokens[slot]
 
-        vllm_engine = None
-        if not args.no_vllm:
-            from llm.vllm_engine import VLLMInferenceEngine
-            print("Initializing vLLM engine...", flush=True)
-            import torch
-            n_gpus = torch.cuda.device_count()
-            # 多卡时 vLLM 用 tensor parallelism，显存利用率可以更高
-            vllm_mem = 0.85 if n_gpus >= 4 else 0.35
-            vllm_engine = VLLMInferenceEngine(
-                config["llm"]["model_path"],
-                max_tokens=config["agentic"].get("max_tokens", 512),
-                gpu_memory_utilization=vllm_mem,
+
+def print_gpu_snapshot(label: str):
+    print(f"\n[diag][gpu] ===== {label} =====", flush=True)
+    print(
+        f"[diag][gpu] pid={os.getpid()} CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}",
+        flush=True,
+    )
+    print(
+        f"[diag][gpu] torch.cuda.is_available={torch.cuda.is_available()} "
+        f"device_count={torch.cuda.device_count()}",
+        flush=True,
+    )
+    if torch.cuda.is_available():
+        for idx in range(torch.cuda.device_count()):
+            allocated = torch.cuda.memory_allocated(idx) / 1024**3
+            reserved = torch.cuda.memory_reserved(idx) / 1024**3
+            print(
+                f"[diag][gpu] logical cuda:{idx} name={torch.cuda.get_device_name(idx)} "
+                f"allocated={allocated:.2f}GiB reserved={reserved:.2f}GiB",
+                flush=True,
             )
-            print("vLLM ready.", flush=True)
 
-        trainer = GRPOAgenticTrainer(models, ref_models, tokenizer, config.get("agentic", {}), vllm_engine=vllm_engine)
+    commands = [
+        [
+            "nvidia-smi",
+            "--query-gpu=index,name,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ],
+        [
+            "nvidia-smi",
+            "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
+            "--format=csv,noheader,nounits",
+        ],
+    ]
+    for cmd in commands:
+        try:
+            result = subprocess.run(cmd, check=False, text=True, capture_output=True)
+        except FileNotFoundError:
+            print("[diag][gpu] nvidia-smi not found", flush=True)
+            break
+        print(f"[diag][gpu] $ {' '.join(cmd)}", flush=True)
+        output = result.stdout.strip() or result.stderr.strip() or "<no output>"
+        for line in output.splitlines():
+            print(f"[diag][gpu] {line}", flush=True)
+    print(f"[diag][gpu] ===== end {label} =====\n", flush=True)
 
-        agentic_cfg = config.get("agentic", {})
-        dataset = load_dataset(config["data"]["train_path"])
-        batch_size = agentic_cfg.get("batch_size", len(dataset))
-        epochs = agentic_cfg.get("epochs", 3)
 
-        print(f"Dataset: {len(dataset)} items, batch_size={batch_size}, epochs={epochs}", flush=True)
+@hydra.main(config_path="configs", config_name="config", version_base=None)
+def main(cfg: DictConfig):
+    wandb.init(
+        project="agentic-rl",
+        name=cfg.exp_name,
+        config=OmegaConf.to_container(cfg, resolve=True),
+    )
 
-        step = 0
-        for epoch in range(epochs):
-            batch = random.sample(dataset, min(batch_size, len(dataset)))
-            for item in batch:
-                try:
-                    stats = trainer.train_step(item["question"], item["answer"])
-                except Exception:
-                    import traceback; traceback.print_exc()
-                    raise
-                step += 1
-                print(
-                    f"epoch={epoch} step={step} "
-                    f"reward={stats['mean_reward']:.3f} acc={stats['accuracy']:.2f} "
-                    f"loss={stats['loss']:.4f} kl={stats['kl']:.4f}",
-                    flush=True,
-                )
+    from llm.trainable_llm import load_trainable_models
+    from training.grpo_trainer import GRPOAgenticTrainer
 
-        import os
-        os.makedirs("checkpoints", exist_ok=True)
-        for role in ["controller", "proposer", "critic", "verifier"]:
-            models[role].save_pretrained(f"checkpoints/{role}", role=role)
+    model, tokenizer = load_trainable_models(
+        cfg.llm.model_path,
+        sft_checkpoint=cfg.sft_checkpoint if cfg.sft_checkpoint else None,
+    )
+    print_gpu_snapshot("after train model load")
 
-    else:
-        raise ValueError(f"Unknown stage: {args.stage}")
+    vllm_engine = None
+    if not cfg.no_vllm:
+        from llm.vllm_engine import VLLMInferenceEngine, MultiVLLMEngine
+        vllm_cuda_visible_devices = resolve_vllm_cuda_visible_devices(cfg)
+        num_workers = cfg.agentic.get("vllm_num_workers", 1)
+        gpu_util = cfg.agentic.get("vllm_gpu_memory_utilization", 0.65)
+        common = dict(
+            max_tokens=cfg.agentic.max_tokens,
+            gpu_memory_utilization=gpu_util,
+            max_model_len=cfg.agentic.get("vllm_max_model_len", 4096),
+            startup_timeout_s=cfg.agentic.get("vllm_start_timeout_s", 300),
+            rpc_timeout_s=cfg.agentic.get("vllm_rpc_timeout_s", 600),
+        )
+        if num_workers > 1:
+            _visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            _tokens = [t.strip() for t in _visible.split(",") if t.strip()]
+            _slot = int(cfg.agentic.get("vllm_gpu_slot", 1))
+            gpus = _tokens[_slot:_slot + num_workers] if _tokens else [str(_slot + i) for i in range(num_workers)]
+            print(f"Initializing {num_workers} vLLM workers on GPUs {gpus}...", flush=True)
+            engines = [VLLMInferenceEngine(cfg.llm.model_path, vllm_gpu=g, **common) for g in gpus]
+            vllm_engine = MultiVLLMEngine(engines)
+        else:
+            print(f"Initializing vLLM worker with CUDA_VISIBLE_DEVICES={vllm_cuda_visible_devices}...", flush=True)
+            vllm_engine = VLLMInferenceEngine(cfg.llm.model_path, vllm_gpu=vllm_cuda_visible_devices, **common)
+        print(f"vLLM worker ready: {vllm_engine.ping()}", flush=True)
+        print_gpu_snapshot("after vLLM worker init")
+        # sync SFT weights into vLLM before first rollout
+        _test_ids = torch.tensor([[1, 2, 3, 4, 5]], device=model.device)
+        model._model.set_adapter("controller")
+        with torch.no_grad():
+            _logits_before = model._model(_test_ids, use_cache=False).logits[0].float()
+        print(f"[diag] logits_finite BEFORE sync_lora: {torch.isfinite(_logits_before).all().item()}", flush=True)
+        del _logits_before, _test_ids
+
+        vllm_engine.sync_lora(model)
+        print("vLLM synced with SFT checkpoint.", flush=True)
+
+        _test_ids = torch.tensor([[1, 2, 3, 4, 5]], device=model.device)
+        model._model.set_adapter("controller")
+        with torch.no_grad():
+            _logits_after = model._model(_test_ids, use_cache=False).logits[0].float()
+        print(f"[diag] logits_finite AFTER sync_lora: {torch.isfinite(_logits_after).all().item()}", flush=True)
+        del _logits_after, _test_ids
+
+    trainer = GRPOAgenticTrainer(model, tokenizer, OmegaConf.to_container(cfg.agentic), vllm_engine=vllm_engine)
+
+    dataset = load_dataset(cfg.data.train_path)
+    eval_dataset = load_dataset(cfg.data.test_path) if cfg.data.get("test_path") else []
+    eval_freq = cfg.agentic.get("eval_freq", 20)
+    eval_samples = cfg.agentic.get("eval_samples", 100)
+    from agents.agentic_executor import AgenticExecutor, normalize_answer
+    eval_executor = AgenticExecutor(model, tokenizer, OmegaConf.to_container(cfg.agentic), vllm_engine=vllm_engine)
+
+    def run_eval(step):
+        if not eval_dataset or vllm_engine is None:
+            return
+        items = random.sample(eval_dataset, min(eval_samples, len(eval_dataset)))
+        episodes = eval_executor.run_episodes_batch(
+            [it["question"] for it in items],
+            [it["answer"]   for it in items],
+        )
+        acc = sum(ep["is_correct"] for ep in episodes) / len(episodes)
+        print(f"  [eval] step={step} eval_acc={acc:.3f} (n={len(items)})", flush=True)
+        wandb.log({"eval_accuracy": acc}, step=step)
+    batch_size = cfg.agentic.batch_size
+    max_steps = cfg.agentic.get("max_steps", 500)
+    print(f"Dataset: {len(dataset)} items, batch_size={batch_size}, max_steps={max_steps}", flush=True)
+
+    ckpt_dir = f"/scratch/users/k24104674/jingbo_checkpoints/rl-{cfg.exp_name}"
+    save_freq = cfg.agentic.get("save_freq", 50)
+
+    # resume from checkpoint if exists
+    step = 0
+    resume_path = os.path.join(ckpt_dir, "trainer_state.json")
+    if os.path.exists(resume_path):
+        with open(resume_path) as f:
+            state = json.load(f)
+        step = state["step"]
+        import safetensors.torch as st
+        from llm.trainable_llm import ROLE_ADAPTER
+        for adapter_name in ROLE_ADAPTER.values():
+            w = st.load_file(os.path.join(ckpt_dir, f"{adapter_name}", "adapter_model.safetensors"))
+            model._model.set_adapter(adapter_name)
+            for name, param in model._model.named_parameters():
+                src = name.replace(f".{adapter_name}.", ".")
+                if src in w and param.requires_grad:
+                    param.data.copy_(w[src].to(param.device))
+        print(f"Resumed from step={step}", flush=True)
+
+    # infinite dataloader — shuffle and cycle, no epoch concept
+    data_pool = dataset[:]
+    random.shuffle(data_pool)
+    pool_idx = 0
+
+    # Ensure vLLM uses LoRA weights from the start, not the base model
+    if vllm_engine is not None and not any(vllm_engine._lora_loaded.values()):
+        vllm_engine.sync_lora(model)
+        print("Initial vLLM LoRA sync done.", flush=True)
+
+    while step < max_steps:
+        # take next batch, reshuffle when exhausted
+        if pool_idx + batch_size > len(data_pool):
+            random.shuffle(data_pool)
+            pool_idx = 0
+        batch = data_pool[pool_idx: pool_idx + batch_size]
+        pool_idx += batch_size
+
+        # Run all batch_size * n_samples rollouts in one batched vLLM call
+        questions = [item["question"] for item in batch]
+        answers   = [item["answer"]   for item in batch]
+        n_s = trainer.n_samples
+        all_eps = trainer.executor.run_episodes_batch(
+            questions * n_s, answers * n_s
+        )
+        # group by question, compute per-question advantage
+        batch_rollouts = []
+        for qi in range(len(batch)):
+            eps = [all_eps[qi + len(batch) * s] for s in range(n_s)]
+            rewards = [sum(ep["rewards"]) for ep in eps]
+            valid = [(ep, r) for ep, r in zip(eps, rewards) if np.isfinite(r)]
+            if valid:
+                batch_rollouts.append(([e for e, _ in valid], [r for _, r in valid]))
+        if not batch_rollouts:
+            continue
+
+        try:
+            stats = trainer.update(batch_rollouts)
+        except Exception:
+            import traceback; traceback.print_exc()
+            raise
+        step += 1
+        skipped = stats.get("skipped", False)
+        print(
+            f"step={step} reward={stats['mean_reward']:.3f} acc={stats['accuracy']:.2f} "
+            f"loss={stats['loss']:.4f} kl={stats['kl']:.4f}"
+            + (" [skipped: zero variance]" if skipped else ""),
+            flush=True,
+        )
+        log_data = {"reward": stats["mean_reward"], "accuracy": stats["accuracy"]}
+        if not skipped:
+            log_data.update({"loss": stats["loss"], "kl": stats["kl"]})
+        wandb.log(log_data, step=step)
+
+        if eval_freq > 0 and step % eval_freq == 0:
+            run_eval(step)
+
+        if step % save_freq == 0:
+            os.makedirs(ckpt_dir, exist_ok=True)
+            model.save_pretrained(ckpt_dir)
+            with open(resume_path, "w") as f:
+                json.dump({"step": step}, f)
+            print(f"  [ckpt] saved step={step} to {ckpt_dir}", flush=True)
+
+    os.makedirs(ckpt_dir, exist_ok=True)
+    model.save_pretrained(ckpt_dir)
+    with open(resume_path, "w") as f:
+        json.dump({"step": step}, f)
+    print(f"Saved to {ckpt_dir}", flush=True)
+    wandb.finish()
 
 
 if __name__ == "__main__":
     main()
-

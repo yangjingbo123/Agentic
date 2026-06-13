@@ -60,13 +60,22 @@ class GRPOAgenticTrainer:
     def update(self, batch_rollouts: list) -> dict:
         """
         batch_rollouts: list of (episodes, ep_rewards) from collect_rollouts.
-        Compute advantages across the whole batch, then do one gradient update.
+        GRPO: compute advantages within each group (same question), not across the batch.
         """
-        # Flatten all episodes and compute batch-level advantage normalisation
         all_episodes = []
-        all_rewards  = []
+        advantages   = []
+        all_rewards  = []  # for logging only
+
         for episodes, ep_rewards in batch_rollouts:
+            group_mean = np.mean(ep_rewards)
+            group_std  = np.std(ep_rewards)
+            # skip group if zero variance (all same reward) — no learning signal
+            if group_std < 1e-6:
+                group_adv = [0.0] * len(ep_rewards)
+            else:
+                group_adv = [(r - group_mean) / (group_std + 1e-8) for r in ep_rewards]
             all_episodes.extend(episodes)
+            advantages.extend(group_adv)
             all_rewards.extend(ep_rewards)
 
         mean_r = np.mean(all_rewards)
@@ -75,7 +84,7 @@ class GRPOAgenticTrainer:
         print(f"  [rollout] correct={n_correct}/{len(all_episodes)} reward_mean={mean_r:.3f} "
               f"reward_std={std_r:.4f}", flush=True)
 
-        if std_r < 1e-6:
+        if not any(adv != 0.0 for adv in advantages):
             if self.vllm_engine is not None:
                 self.vllm_engine.sync_lora(self.model)
             return {
@@ -83,8 +92,6 @@ class GRPOAgenticTrainer:
                 "accuracy": float(np.mean([ep["is_correct"] for ep in all_episodes])),
                 "kl": 0.0, "skipped": True,
             }
-
-        advantages = [(r - mean_r) / (std_r + 1e-8) for r in all_rewards]
 
         total_loss    = 0.0
         total_kl      = 0.0

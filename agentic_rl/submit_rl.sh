@@ -1,11 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=agentic_rl
 #SBATCH --partition=interruptible_gpu
-#SBATCH --gres=gpu:3
+#SBATCH --gres=gpu:2
 #SBATCH --constraint=a100_80g|h100 
-#SBATCH --mem=128G
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=64G
 #SBATCH --output=slurm-%j.out  # 保存日志文件
 #SBATCH --error=slurm-%j.err    # 保存错误日志
+#SBATCH --requeue               # 被抢占后自动重新排队
 
 set -e
 
@@ -29,7 +31,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TRITON_CACHE_DIR=/tmp/triton_cache_${SLURM_JOB_ID}
 rm -rf /cephfs/volumes/hpc_home/k24104674/aed22256-9e0b-4f4f-86c1-c56793988876/.cache/flashinfer/
 
-EXP_NAME=${EXP_NAME:-math-grpo}
+EXP_NAME=${EXP_NAME:-math-grpo_3}
 
 echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $SLURMD_NODENAME"

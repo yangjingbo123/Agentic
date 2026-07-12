@@ -40,6 +40,7 @@ class GRPOAgenticTrainer:
         self.kl_ctrl = AdaptiveKLController(
             init_kl_coef=config.get("kl_coef", 0.1),
             target_kl=config.get("target_kl", 6.0),
+            horizon=config.get("kl_horizon", 10000),
         )
 
     def collect_rollouts(self, question: str, correct_answer: str):

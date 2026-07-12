@@ -148,17 +148,23 @@ def main(cfg: DictConfig):
     from agents.agentic_executor import AgenticExecutor, normalize_answer
     eval_executor = AgenticExecutor(model, tokenizer, OmegaConf.to_container(cfg.agentic), vllm_engine=vllm_engine)
 
+    # fixed eval subset — first N items of the pre-split test file, same across all experiments
+    _eval_items = eval_dataset[:eval_samples] if eval_dataset else []
+
     def run_eval(step):
-        if not eval_dataset or vllm_engine is None:
+        if not _eval_items or vllm_engine is None:
             return
-        items = random.sample(eval_dataset, min(eval_samples, len(eval_dataset)))
         episodes = eval_executor.run_episodes_batch(
-            [it["question"] for it in items],
-            [it["answer"]   for it in items],
+            [it["question"] for it in _eval_items],
+            [it["answer"]   for it in _eval_items],
         )
-        acc = sum(ep["is_correct"] for ep in episodes) / len(episodes)
-        print(f"  [eval] step={step} eval_acc={acc:.3f} (n={len(items)})", flush=True)
-        wandb.log({"eval_accuracy": acc}, step=step)
+        acc         = sum(ep["is_correct"] for ep in episodes) / len(episodes)
+        reward_mean = sum(sum(ep["rewards"]) for ep in episodes) / len(episodes)
+        avg_turns   = sum(len(ep["rewards"]) for ep in episodes) / len(episodes)
+        print(f"  [eval] step={step} eval_acc={acc:.3f} reward={reward_mean:.3f} "
+              f"avg_turns={avg_turns:.1f} (n={len(_eval_items)})", flush=True)
+        wandb.log({"eval_accuracy": acc, "eval_reward": reward_mean,
+                   "eval_avg_turns": avg_turns}, step=step)
     batch_size = cfg.agentic.batch_size
     max_steps = cfg.agentic.get("max_steps", 500)
     print(f"Dataset: {len(dataset)} items, batch_size={batch_size}, max_steps={max_steps}", flush=True)

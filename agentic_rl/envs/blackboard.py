@@ -48,8 +48,10 @@ class Blackboard:
         if self.flaws:
             lines.append(f"发现问题：{self.flaws[-1]['content'][:80]}")
         if self.scores:
-            best = max(self.get_distinct_answers(), key=self.get_avg_score)
-            lines.append(f"最高置信答案：{best}（分数{self.get_avg_score(best):.2f}）")
+            distinct = self.get_distinct_answers()
+            if distinct:
+                best = max(distinct, key=self.get_avg_score)
+                lines.append(f"最高置信答案：{best}（分数{self.get_avg_score(best):.2f}）")
         if self.interactions:
             last = self.interactions[-1]
             lines.append(f"最近交互：{last['from']}→{last['target']}（{last['action']}）")

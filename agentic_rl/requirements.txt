@@ -1,7 +1,0 @@
-torch==2.9.0+cu130
-transformers==5.8.1
-peft==0.18.0
-accelerate==1.12.0
-datasets==4.8.4
-tqdm==4.67.1
-pyyaml

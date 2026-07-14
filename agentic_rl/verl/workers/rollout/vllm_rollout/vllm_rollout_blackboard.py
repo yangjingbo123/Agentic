@@ -93,6 +93,9 @@ class VLLMBlackboardRollout:
             disable_log_stats=config.get("disable_log_stats", True),
             enable_prefix_caching=True,
             seed=config.get("seed", 0),
+            enable_chunked_prefill=config.get("enable_chunked_prefill", False),
+            max_num_batched_tokens=config.get("max_num_batched_tokens", None),
+            max_num_seqs=config.get("max_num_seqs", 256),
         )
         self.inference_engine.sleep(level=1)
 

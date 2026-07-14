@@ -1,5 +1,5 @@
-# Blackboard 4-role multi-agent GRPO training on 8x H100
-# Usage: python -m verl.rema_trainer.main_ppo --config-path ../../configs/verl --config-name blackboard_4role_grpo
+# Blackboard 4-role multi-agent GRPO training on 2x H100 80GB
+# Usage: bash scripts/train_verl_blackboard.sh
 
 defaults:
   - _self_
@@ -12,7 +12,7 @@ data:
   prompt_key:  question
   max_prompt_length:  2048
   max_response_length: 1024
-  train_batch_size: 24    # questions per step; total episodes = 24 * n=8 = 192; must be divisible by n_gpus=3
+  train_batch_size: 24    # questions per step; total episodes = 24 * n=8 = 192; must be divisible by n_gpus=2
   shuffle: True
   filter_overlong_prompts: False
   truncation: left
@@ -58,7 +58,7 @@ actor_rollout_ref:
     fsdp_config:
       param_offload: False
       optimizer_offload: False
-      fsdp_size: -1          # shard across all 4 GPUs
+      fsdp_size: -1          # shard across all 2 GPUs
     ulysses_sequence_parallel_size: 1
     checkpoint:
       contents: ['model', 'hf_model', 'optimizer', 'extra']
@@ -92,10 +92,11 @@ actor_rollout_ref:
     dtype: bfloat16
     # ── vLLM engine ───────────────────────────────────────────────
     tensor_model_parallel_size: 1
-    gpu_memory_utilization: 0.50   # leave ~40 GiB for FSDP training on the same GPU
+    gpu_memory_utilization: 0.75   # 0.75×79=59 GB > FSDP(33)+vLLM_model(16)=49 GB, ~10 GB for KV cache
     enforce_eager: True            # skip CUDA graph compilation to save 10-15GB
     enable_chunked_prefill: True
     max_num_batched_tokens: 8192
+    max_num_seqs: 256       # limit vLLM sampler warmup memory (default 1024 causes OOM)
     disable_log_stats: True
     enable_sleep_mode: True
     seed: 42

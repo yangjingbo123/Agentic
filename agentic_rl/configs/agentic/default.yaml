@@ -1,21 +1,25 @@
-batch_size: 8
-n_samples: 8
-lr: 3.0e-6
-clip_epsilon: 0.05
+batch_size: 32
+n_samples: 16
+lr: 1.0e-5
+clip_epsilon: 0.2
 max_tokens: 1024
 max_rounds: 4
 max_interactions: 3
-kl_coef: 0.05
-target_kl: 6.0
-kl_horizon: 200
 max_grad_norm: 1.0
 max_steps: 200
-save_freq: 2
+save_freq: 20
 eval_freq: 10
+eval_samples: 300
+# RACA controller reward
+ctrl_alpha: 0.3
+ctrl_beta: 0.2
+# RACA variance floor (prevents zero-std anchor groups from being skipped)
+raca_delta: 1.0e-4
 vllm_gpu_slot: 1
 vllm_cuda_visible_devices: null
 vllm_gpu_memory_utilization: 0.65
-vllm_num_workers: 1
+vllm_num_workers: 3
 vllm_max_model_len: 4096
 vllm_start_timeout_s: 300
-vllm_rpc_timeout_s: 600
+vllm_rpc_timeout_s: 1800
+val_before_train: true

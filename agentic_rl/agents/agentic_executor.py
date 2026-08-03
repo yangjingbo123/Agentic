@@ -28,6 +28,9 @@ class AgenticExecutor:
         self.max_interactions = config.get("max_interactions", 3)
         self.max_rounds = config.get("max_rounds", 3)
         self.vllm_engine = vllm_engine
+        # RACA controller reward hyperparameters
+        self.ctrl_alpha = config.get("ctrl_alpha", 0.3)
+        self.ctrl_beta  = config.get("ctrl_beta",  0.2)
 
     # ── batch entry point (N episodes in parallel, batched per turn-slot) ───
     def run_episodes_batch(self, questions: list, correct_answers: list) -> list:
@@ -113,8 +116,11 @@ class AgenticExecutor:
 
             still_active = []
             start_info = []  # (i, tid, role, system, user, meta_plan)
+            # ctrl_tid_map: episode_idx → controller turn_id for this round
+            ctrl_tid_map = {}
             for (i, tid, sys, usr), res in zip(ctrl_info, ctrl_res):
                 record(i, "controller", sys, usr, res, tid)
+                ctrl_tid_map[i] = tid          # store controller tid before filtering
                 meta_plan = res[0]
                 if self._parse_strategy(meta_plan) == "stop":
                     continue
@@ -135,18 +141,28 @@ class AgenticExecutor:
                  for _, _, role, s, u, _ in start_info]
             )
 
+            # initialise per-episode round state
+            # round_turn_ids starts with (ctrl_tid, "controller") so the controller
+            # turn is included in round_records and gets a RACA reward signal.
+            ep_st = {}
             for (i, tid, role, sys, usr, meta_plan), res in zip(start_info, start_res):
                 record(i, role, sys, usr, res, tid)
                 response = res[0]
                 self._write_to_blackboard(blackboards[i], role, response)
-                round_turn_ids = [(tid, role)]
-                role_outputs   = {role: response}
+                ep_st[i] = {
+                    "role_outputs":   {role: response},
+                    "round_turn_ids": [(ctrl_tid_map[i], "controller"), (tid, role)],
+                    "meta_plan":      meta_plan,
+                    "pending":        [(role, response)],
+                }
 
-                # interaction turns (episode-serial; rare path)
-                pending = [(role, response)]
-                interaction_count = 0
-                while pending and interaction_count < self.max_interactions:
-                    initiator, init_out = pending.pop(0)
+            # interaction turns — batched across all episodes at each depth
+            for _ in range(self.max_interactions):
+                batch_req = []
+                for i, st in ep_st.items():
+                    if not st["pending"]:
+                        continue
+                    initiator, init_out = st["pending"].pop(0)
                     action, target, reason = self._parse_interaction(init_out)
                     if action != "none" and target != "none":
                         blackboards[i].add_message(Message(
@@ -156,40 +172,55 @@ class AgenticExecutor:
                                      "target": target, "reason": reason},
                         ))
                     if target in ROLE_NAMES and action not in ("none", "support"):
-                        itid  = next_tid(i)
-                        isys  = PromptTemplates.interaction_response_system(
+                        itid = next_tid(i)
+                        isys = PromptTemplates.interaction_response_system(
                             ROLE_NAMES[target], action, init_out)
-                        iusr  = f"黑板状态：{blackboards[i].to_text()}\n问题：{questions[i]}"
-                        ires  = self.vllm_engine.generate_batch(
-                            [{"role": target, "prompt": make_prompt(isys, iusr)}])[0]
-                        record(i, target, isys, iusr, ires, itid)
-                        round_turn_ids.append((itid, target))
-                        resp_out = ires[0]
-                        role_outputs[target] = resp_out
-                        self._write_to_blackboard(blackboards[i], target, resp_out)
-                        pending.append((target, resp_out))
-                        interaction_count += 1
+                        iusr = f"黑板状态：{blackboards[i].to_text()}\n问题：{questions[i]}"
+                        batch_req.append((i, itid, target, isys, iusr))
+                if not batch_req:
+                    break
+                ires_all = self.vllm_engine.generate_batch(
+                    [{"role": t, "prompt": make_prompt(s, u)} for _, _, t, s, u in batch_req]
+                )
+                for (i, itid, target, isys, iusr), ires in zip(batch_req, ires_all):
+                    record(i, target, isys, iusr, ires, itid)
+                    resp_out = ires[0]
+                    ep_st[i]["role_outputs"][target] = resp_out
+                    ep_st[i]["round_turn_ids"].append((itid, target))
+                    self._write_to_blackboard(blackboards[i], target, resp_out)
+                    ep_st[i]["pending"].append((target, resp_out))
 
-                if "proposer" not in role_outputs:
+            # proposer fallback — batched across all episodes that need it
+            prop_req = []
+            for i, st in ep_st.items():
+                if "proposer" not in st["role_outputs"]:
                     ptid = next_tid(i)
-                    ps, pu = role_system_user(i, "proposer", questions[i], meta_plan)
-                    pres = self.vllm_engine.generate_batch(
-                        [{"role": "proposer", "prompt": make_prompt(ps, pu)}])[0]
+                    ps, pu = role_system_user(i, "proposer", questions[i], st["meta_plan"])
+                    prop_req.append((i, ptid, ps, pu))
+            if prop_req:
+                prop_res_all = self.vllm_engine.generate_batch(
+                    [{"role": "proposer", "prompt": make_prompt(s, u)} for _, _, s, u in prop_req]
+                )
+                for (i, ptid, ps, pu), pres in zip(prop_req, prop_res_all):
                     record(i, "proposer", ps, pu, pres, ptid)
-                    round_turn_ids.append((ptid, "proposer"))
                     prop_out = pres[0]
-                    role_outputs["proposer"] = prop_out
+                    ep_st[i]["role_outputs"]["proposer"] = prop_out
+                    ep_st[i]["round_turn_ids"].append((ptid, "proposer"))
                     self._write_to_blackboard(blackboards[i], "proposer", prop_out)
 
-                _, prop_answer = self._parse_reasoning(role_outputs.get("proposer", ""))
-                critic_flagged = "critic" in role_outputs and "无错误" not in role_outputs["critic"]
-                verifier_score = (self._parse_score(role_outputs["verifier"])
-                                  if "verifier" in role_outputs else None)
+            # commit round records
+            for i, st in ep_st.items():
+                ro = st["role_outputs"]
+                _, prop_answer = self._parse_reasoning(ro.get("proposer", ""))
+                critic_flagged = "critic" in ro and "无错误" not in ro["critic"]
+                verifier_score = (self._parse_score(ro["verifier"])
+                                  if "verifier" in ro else None)
                 round_records[i].append({
                     "proposer_answer": prop_answer,
                     "critic_flagged":  critic_flagged,
                     "verifier_score":  verifier_score,
-                    "turn_ids":        round_turn_ids,
+                    "strategy":        self._parse_strategy(st["meta_plan"]),
+                    "turn_ids":        st["round_turn_ids"],
                 })
 
         # ── finalise ─────────────────────────────────────────────────────────
@@ -197,39 +228,21 @@ class AgenticExecutor:
         for i in range(n):
             final_answer = self._majority_vote(blackboards[i])
             is_correct   = normalize_answer(final_answer) == normalize_answer(correct_answers[i])
-            n_turns = max(turn_counters[i], 1)
-            rewards = [0.0] * n_turns
 
-            last_prop_tid = None
-            for rnd in round_records[i]:
-                for tid, role in rnd["turn_ids"]:
-                    if role == "proposer" and tid < n_turns:
-                        last_prop_tid = tid
-            rewards[last_prop_tid if last_prop_tid is not None else n_turns - 1] += (
-                1.0 if is_correct else -0.5)
-
-            for rnd in round_records[i]:
-                prop_correct = (normalize_answer(rnd["proposer_answer"]) ==
-                                normalize_answer(correct_answers[i]))
-                for tid, role in rnd["turn_ids"]:
-                    if tid >= n_turns:
-                        continue
-                    if role == "critic" and rnd["critic_flagged"]:
-                        rewards[tid] += 0.3 if is_correct else -0.1
-                    elif role == "verifier" and rnd["verifier_score"] is not None:
-                        if (prop_correct and rnd["verifier_score"] >= 0.5 or
-                                not prop_correct and rnd["verifier_score"] < 0.5):
-                            rewards[tid] += 0.1
+            raca_turn_data = self._compute_raca_turn_data(
+                round_records[i], correct_answers[i], is_correct,
+                self.max_rounds, self.ctrl_alpha, self.ctrl_beta,
+            )
 
             results.append({
-                "messages":      all_messages[i],
-                "turn_ids":      turn_ids_list[i],
-                "log_probs":     log_probs_list[i],
-                "seq_input_ids": seq_input_ids_l[i],
-                "seq_step_ids":  seq_step_ids_l[i],
-                "rewards":       rewards,
-                "final_answer":  final_answer,
-                "is_correct":    is_correct,
+                "messages":       all_messages[i],
+                "turn_ids":       turn_ids_list[i],
+                "log_probs":      log_probs_list[i],
+                "seq_input_ids":  seq_input_ids_l[i],
+                "seq_step_ids":   seq_step_ids_l[i],
+                "raca_turn_data": raca_turn_data,
+                "final_answer":   final_answer,
+                "is_correct":     is_correct,
             })
         return results
 
@@ -251,11 +264,12 @@ class AgenticExecutor:
         round_records = []
 
         for _ in range(self.max_rounds):
+            ctrl_tid = next_turn_id()
             meta_plan = self._run_turn(
                 role="controller",
                 system=PromptTemplates.controller_system(),
                 user=f"问题：{question}\n当前状态：{blackboard.to_text()}",
-                all_messages=all_messages, turn_id=next_turn_id(),
+                all_messages=all_messages, turn_id=ctrl_tid,
                 turn_ids=turn_ids, log_probs=log_probs,
                 seq_input_ids=seq_input_ids, seq_step_ids=seq_step_ids,
             )
@@ -265,7 +279,8 @@ class AgenticExecutor:
             focus = self._parse_focus(meta_plan)
             start_role = focus if focus != "balanced" else "proposer"
             role_outputs = {}
-            round_turn_ids = []
+            # Initialise with controller so it appears in round_records and gets RACA reward.
+            round_turn_ids = [(ctrl_tid, "controller")]
 
             def tracked_next_turn_id(role):
                 tid = next_turn_id()
@@ -326,46 +341,27 @@ class AgenticExecutor:
                 "proposer_answer": prop_answer,
                 "critic_flagged":  critic_flagged,
                 "verifier_score":  verifier_score,
+                "strategy":        self._parse_strategy(meta_plan),
                 "turn_ids":        list(round_turn_ids),
             })
 
         final_answer = self._majority_vote(blackboard)
         is_correct = normalize_answer(final_answer) == normalize_answer(correct_answer)
-        n_turns = turn_counter[0]
-        if n_turns == 0:
-            n_turns = 1
-        rewards = [0.0] * n_turns
 
-        last_proposer_tid = None
-        for rnd in round_records:
-            for tid, role in rnd["turn_ids"]:
-                if role == "proposer" and tid < n_turns:
-                    last_proposer_tid = tid
-        rewards[last_proposer_tid if last_proposer_tid is not None else -1] += (
-            1.0 if is_correct else -0.5)
-
-        for rnd in round_records:
-            prop_correct = normalize_answer(rnd["proposer_answer"]) == normalize_answer(correct_answer)
-            for tid, role in rnd["turn_ids"]:
-                if tid >= n_turns:
-                    continue
-                if role == "critic" and rnd["critic_flagged"]:
-                    rewards[tid] += 0.3 if is_correct else -0.1
-                elif role == "verifier" and rnd["verifier_score"] is not None:
-                    correct_high = prop_correct and rnd["verifier_score"] >= 0.5
-                    correct_low  = not prop_correct and rnd["verifier_score"] < 0.5
-                    if correct_high or correct_low:
-                        rewards[tid] += 0.1
+        raca_turn_data = self._compute_raca_turn_data(
+            round_records, correct_answer, is_correct,
+            self.max_rounds, self.ctrl_alpha, self.ctrl_beta,
+        )
 
         return {
-            "messages":      all_messages,
-            "turn_ids":      turn_ids,
-            "log_probs":     log_probs,
-            "seq_input_ids": seq_input_ids,
-            "seq_step_ids":  seq_step_ids,
-            "rewards":       rewards,
-            "final_answer":  final_answer,
-            "is_correct":    is_correct,
+            "messages":       all_messages,
+            "turn_ids":       turn_ids,
+            "log_probs":      log_probs,
+            "seq_input_ids":  seq_input_ids,
+            "seq_step_ids":   seq_step_ids,
+            "raca_turn_data": raca_turn_data,
+            "final_answer":   final_answer,
+            "is_correct":     is_correct,
         }
 
     def _run_role(self, role, question, meta_plan, blackboard,
@@ -451,6 +447,79 @@ class AgenticExecutor:
         elif role == "verifier":
             answer = blackboard.traces[-1][1] if blackboard.traces else ""
             blackboard.add_message(Message(2, MessageType.SCORE, (answer, self._parse_score(output))))
+
+    def _compute_raca_turn_data(
+        self,
+        round_records: list,
+        correct_answer: str,
+        is_correct: bool,
+        max_rounds: int,
+        alpha: float,
+        beta: float,
+    ) -> dict:
+        """Compute RACA per-turn reward data (Phase 2 of the algorithm).
+
+        Returns a dict mapping turn_id → {"role": str, "round": int, "reward": float}.
+        The trainer reads this to build anchor groups and compute advantages.
+        """
+        turn_data: dict = {}
+
+        # Pre-compute per-round proposer correctness for critic's causal reward.
+        prop_correct_per_round: list = []
+        for rnd in round_records:
+            pc = normalize_answer(rnd["proposer_answer"]) == normalize_answer(correct_answer)
+            prop_correct_per_round.append(pc)
+
+        last_ctrl_tid = None
+
+        for rnd_idx, rnd in enumerate(round_records):
+            p_t      = prop_correct_per_round[rnd_idx]
+            strategy = rnd.get("strategy", "explore")   # controller strategy for this round
+            # p_{t+1}: next round's proposer correctness, or episode outcome for last round
+            if rnd_idx + 1 < len(round_records):
+                p_t1 = prop_correct_per_round[rnd_idx + 1]
+            else:
+                p_t1 = is_correct
+
+            for tid, role in rnd["turn_ids"]:
+                if role == "proposer":
+                    reward = 1.0 if p_t else 0.0
+
+                elif role == "critic":
+                    f = rnd["critic_flagged"]
+                    if f and not p_t:       # 真阳性：正确识别错误
+                        reward = 0.3 * float(p_t1) + 0.1 * (1.0 - float(p_t1))
+                    elif f and p_t:         # 假阳性：干扰了正确解
+                        reward = -0.2
+                    elif not f and p_t:     # 真阴性：正确放行
+                        reward = 0.1
+                    else:                   # 漏检：未发现错误
+                        reward = 0.0
+
+                elif role == "verifier":
+                    vs = rnd["verifier_score"]
+                    if vs is not None:
+                        reward = 1.0 - abs(vs - float(p_t))
+                    else:
+                        reward = 0.0
+
+                elif role == "controller":
+                    reward = 0.0            # placeholder; last ctrl turn updated below
+                    last_ctrl_tid = tid
+
+                else:
+                    reward = 0.0
+
+                turn_data[tid] = {"role": role, "round": rnd_idx, "strategy": strategy, "reward": reward}
+
+        # Controller efficiency reward: only the last controller turn gets the real signal.
+        t_stop = len(round_records)
+        if last_ctrl_tid is not None:
+            efficiency = alpha * float(is_correct) * (max_rounds - t_stop) / max(max_rounds, 1)
+            ctrl_reward = float(is_correct) + efficiency - beta * (1.0 - float(is_correct))
+            turn_data[last_ctrl_tid]["reward"] = ctrl_reward
+
+        return turn_data
 
     def _parse_strategy(self, meta_plan: str) -> str:
         m = re.search(r"strategy:\s*(explore|refine|verify|stop)", meta_plan)

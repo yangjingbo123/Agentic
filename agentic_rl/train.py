@@ -146,10 +146,17 @@ def main(cfg: DictConfig):
     eval_freq = cfg.agentic.get("eval_freq", 20)
     eval_samples = cfg.agentic.get("eval_samples", 100)
     from agents.agentic_executor import AgenticExecutor, normalize_answer
-    eval_executor = AgenticExecutor(model, tokenizer, OmegaConf.to_container(cfg.agentic), vllm_engine=vllm_engine)
+    eval_executor = AgenticExecutor(
+        model, tokenizer, OmegaConf.to_container(cfg.agentic),
+        vllm_engine=vllm_engine, eval_mode=True,
+    )
 
-    # fixed eval subset — first N items of the pre-split test file, same across all experiments
-    _eval_items = eval_dataset[:eval_samples] if eval_dataset else []
+    # fixed eval subset — Level 5 only (hardest tier), first N items, same across all experiments
+    # Level 5 problems are where multi-agent collaboration has the most impact;
+    # easier levels inflate baseline accuracy and reduce discrimination.
+    _eval_items = [it for it in eval_dataset if it.get("level") == "Level 5"][:eval_samples] if eval_dataset else []
+    if _eval_items:
+        print(f"Eval subset: {len(_eval_items)} Level-5 items (from {len(eval_dataset)} total)", flush=True)
 
     def run_eval(step):
         if not _eval_items or vllm_engine is None:
@@ -158,9 +165,16 @@ def main(cfg: DictConfig):
             [it["question"] for it in _eval_items],
             [it["answer"]   for it in _eval_items],
         )
-        acc         = sum(ep["is_correct"] for ep in episodes) / len(episodes)
-        reward_mean = sum(sum(ep["rewards"]) for ep in episodes) / len(episodes)
-        avg_turns   = sum(len(ep["rewards"]) for ep in episodes) / len(episodes)
+        acc = sum(ep["is_correct"] for ep in episodes) / len(episodes)
+        # reward_mean: mean total RACA reward per episode (sum of all turn rewards)
+        reward_mean = float(np.mean([
+            sum(v["reward"] for v in ep.get("raca_turn_data", {}).values())
+            for ep in episodes
+        ]))
+        # avg_turns: mean number of turns per episode
+        avg_turns = float(np.mean([
+            len(ep.get("raca_turn_data", {})) for ep in episodes
+        ]))
         print(f"  [eval] step={step} eval_acc={acc:.3f} reward={reward_mean:.3f} "
               f"avg_turns={avg_turns:.1f} (n={len(_eval_items)})", flush=True)
         wandb.log({"eval_accuracy": acc, "eval_reward": reward_mean,
@@ -169,7 +183,7 @@ def main(cfg: DictConfig):
     max_steps = cfg.agentic.get("max_steps", 500)
     print(f"Dataset: {len(dataset)} items, batch_size={batch_size}, max_steps={max_steps}", flush=True)
 
-    ckpt_dir = f"/scratch/users/k24104674/jingbo_checkpoints/rl-{cfg.exp_name}"
+    ckpt_dir = f"checkpoints/rl-{cfg.exp_name}"
     save_freq = cfg.agentic.get("save_freq", 50)
 
     # resume from checkpoint if exists
@@ -184,10 +198,15 @@ def main(cfg: DictConfig):
         for adapter_name in ROLE_ADAPTER.values():
             w = st.load_file(os.path.join(ckpt_dir, f"{adapter_name}", "adapter_model.safetensors"))
             model._model.set_adapter(adapter_name)
+            loaded = 0
             for name, param in model._model.named_parameters():
+                if "lora_" not in name:
+                    continue
                 src = name.replace(f".{adapter_name}.", ".")
-                if src in w and param.requires_grad:
+                if src in w:
                     param.data.copy_(w[src].to(param.device))
+                    loaded += 1
+            print(f"  [resume] {adapter_name}: loaded {loaded} params", flush=True)
         print(f"Resumed from step={step}", flush=True)
 
     # infinite dataloader — shuffle and cycle, no epoch concept
@@ -199,6 +218,9 @@ def main(cfg: DictConfig):
     if vllm_engine is not None and not any(vllm_engine._lora_loaded.values()):
         vllm_engine.sync_lora(model)
         print("Initial vLLM LoRA sync done.", flush=True)
+
+    if cfg.agentic.get("val_before_train", False):
+        run_eval(0)
 
     while step < max_steps:
         # take next batch, reshuffle when exhausted
@@ -212,17 +234,35 @@ def main(cfg: DictConfig):
         questions = [item["question"] for item in batch]
         answers   = [item["answer"]   for item in batch]
         n_s = trainer.n_samples
-        all_eps = trainer.executor.run_episodes_batch(
-            questions * n_s, answers * n_s
-        )
-        # group by question, compute per-question advantage
+        all_q = questions * n_s
+        all_a = answers * n_s
+        if vllm_engine is not None and hasattr(vllm_engine, "engines") and len(vllm_engine.engines) > 1:
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+            _engines = vllm_engine.engines
+            _k = len(_engines)
+            _agentic_cfg = OmegaConf.to_container(cfg.agentic)
+            _chunks_q = [all_q[i::_k] for i in range(_k)]
+            _chunks_a = [all_a[i::_k] for i in range(_k)]
+            def _run_chunk(eng, qs, ans):
+                ex = AgenticExecutor(model, tokenizer, _agentic_cfg, vllm_engine=eng)
+                return ex.run_episodes_batch(qs, ans)
+            with _TPE(max_workers=_k) as _pool:
+                _futures = [_pool.submit(_run_chunk, eng, qs, ans)
+                            for eng, qs, ans in zip(_engines, _chunks_q, _chunks_a)]
+                _chunks_out = [f.result() for f in _futures]
+            all_eps = [None] * len(all_q)
+            for _ei, _res in enumerate(_chunks_out):
+                for _j, _ep in enumerate(_res):
+                    all_eps[_ei + _j * _k] = _ep
+        else:
+            all_eps = trainer.executor.run_episodes_batch(all_q, all_a)
+        # group by question — each group is the list of N rollouts for that question
         batch_rollouts = []
         for qi in range(len(batch)):
             eps = [all_eps[qi + len(batch) * s] for s in range(n_s)]
-            rewards = [sum(ep["rewards"]) for ep in eps]
-            valid = [(ep, r) for ep, r in zip(eps, rewards) if np.isfinite(r)]
-            if valid:
-                batch_rollouts.append(([e for e, _ in valid], [r for _, r in valid]))
+            valid = [ep for ep in eps if ep is not None and ep.get("raca_turn_data")]
+            if len(valid) >= 2:   # need at least 2 for anchor-group comparison
+                batch_rollouts.append(valid)
         if not batch_rollouts:
             continue
 

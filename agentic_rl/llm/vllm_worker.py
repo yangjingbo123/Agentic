@@ -116,12 +116,12 @@ class VLLMWorker:
                 log_probs.append(0.0)
         return {"text": out.text, "log_probs": log_probs, "token_ids": list(out.token_ids)}
 
-    def generate(self, role: str, prompt: str):
+    def generate(self, role: str, prompt: str, temperature: float = 1.0):
         # Only the controller is a short routing turn. Proposer/Critic/Verifier
         # must continue after </interaction> so their answer/score fields exist.
         stop = ["</meta-plan>"] if role == "controller" else None
         params = self.SamplingParams(
-            max_tokens=self.max_tokens, temperature=1.0, logprobs=20,
+            max_tokens=self.max_tokens, temperature=temperature, logprobs=20,
             stop=stop, include_stop_str_in_output=bool(stop),
         )
         outputs = self.llm.generate(
@@ -131,16 +131,19 @@ class VLLMWorker:
         return self._extract_output(outputs[0].outputs[0])
 
     def generate_batch(self, requests: list):
-        """requests: list of {"role": str, "prompt": str}. Returns list in same order."""
-        # Group by (role, stop) to share SamplingParams, but vLLM handles mixed lora fine.
+        """requests: list of {"role": str, "prompt": str, "temperature": float}.
+        temperature defaults to 1.0 when omitted (for training rollouts).
+        Pass temperature=0.0 for greedy eval decoding.
+        Returns list in same order."""
         inputs, lora_reqs, params_list = [], [], []
         for req in requests:
             role = req["role"]
+            temp = req.get("temperature", 1.0)
             stop = ["</meta-plan>"] if role == "controller" else None
             inputs.append(req["prompt"])
             lora_reqs.append(self._make_lora_req(role))
             params_list.append(self.SamplingParams(
-                max_tokens=self.max_tokens, temperature=1.0, logprobs=20,
+                max_tokens=self.max_tokens, temperature=temp, logprobs=20,
                 stop=stop, include_stop_str_in_output=bool(stop),
             ))
         # vLLM generate accepts per-request SamplingParams and LoRARequest
@@ -173,7 +176,8 @@ def serve(sock, worker):
             elif op == "sync_lora":
                 result = worker.sync_lora(req["manifest"])
             elif op == "generate":
-                result = worker.generate(req["role"], req["prompt"])
+                result = worker.generate(req["role"], req["prompt"],
+                                        req.get("temperature", 1.0))
             elif op == "generate_batch":
                 result = worker.generate_batch(req["requests"])
             elif op == "shutdown":

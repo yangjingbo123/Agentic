@@ -1,2 +1,21 @@
 MMOA-RAG/
 ReMA-public/
+
+# macOS
+.DS_Store
+
+# IDE / local settings
+.claude/
+
+# Large binary files (papers, not code)
+*.pdf
+
+# Python
+__pycache__/
+*.pyc
+
+# wandb / checkpoints
+agentic_rl/wandb/
+agentic_rl/checkpoints/
+agentic_rl/*.log
+agentic_rl/*.pid

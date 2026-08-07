@@ -154,12 +154,15 @@ class VLLMInferenceEngine:
     def ping(self):
         return self._request("ping")
 
-    def generate(self, role: str, prompt: str) -> tuple[str, list[float], list[int]]:
-        result = self._request("generate", role=role, prompt=prompt)
+    def generate(self, role: str, prompt: str, temperature: float = 1.0) -> tuple[str, list[float], list[int]]:
+        result = self._request("generate", role=role, prompt=prompt, temperature=temperature)
         return result["text"], result["log_probs"], result["token_ids"]
 
     def generate_batch(self, requests: list[dict]) -> list[tuple[str, list[float], list[int]]]:
-        """requests: list of {"role": str, "prompt": str}. Returns list in same order."""
+        """requests: list of {"role": str, "prompt": str, "temperature": float}.
+        temperature defaults to 1.0 when omitted (training rollout).
+        Pass temperature=0.0 for greedy eval decoding.
+        Returns list in same order."""
         results = self._request("generate_batch", requests=requests)
         return [(r["text"], r["log_probs"], r["token_ids"]) for r in results]
 
@@ -273,8 +276,8 @@ class MultiVLLMEngine:
         self.engines = engines
         self._lora_loaded = engines[0]._lora_loaded
 
-    def generate(self, role: str, prompt: str):
-        return self.engines[0].generate(role, prompt)
+    def generate(self, role: str, prompt: str, temperature: float = 1.0):
+        return self.engines[0].generate(role, prompt, temperature=temperature)
 
     def generate_batch(self, requests: list) -> list:
         if not requests:
@@ -295,6 +298,11 @@ class MultiVLLMEngine:
         return merged
 
     def sync_lora(self, model):
+        """Serialize sync_lora calls to avoid concurrent set_adapter/save_pretrained
+        on the same PEFT model — those operations are not thread-safe.
+        The save is fast (LoRA weights only); the per-worker RPC calls inside
+        each eng.sync_lora are already serialized by eng._lock.
+        """
         for eng in self.engines:
             eng.sync_lora(model)
         self._lora_loaded = self.engines[0]._lora_loaded

@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import bitsandbytes as bnb
+from collections import defaultdict
 
 from agents.agentic_executor import AgenticExecutor
 from llm.trainable_llm import ROLE_ADAPTER
@@ -12,196 +13,246 @@ def logprobs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Te
     return F.log_softmax(logits, dim=-1).gather(1, labels.unsqueeze(1)).squeeze(1)
 
 
-class AdaptiveKLController:
-    def __init__(self, init_kl_coef=0.1, target_kl=6.0, horizon=10000):
-        self.value = init_kl_coef
-        self.target = target_kl
-        self.horizon = horizon
-
-    def update(self, current_kl, n_steps):
-        proportional_error = np.clip(current_kl / self.target - 1, -0.2, 0.2)
-        self.value *= 1 + proportional_error * n_steps / self.horizon
-
-
 class GRPOAgenticTrainer:
     def __init__(self, model, tokenizer, config, vllm_engine=None):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.vllm_engine = vllm_engine
-        self.executor = AgenticExecutor(model, tokenizer, config, vllm_engine=vllm_engine)
-        self.optimizer = bnb.optim.AdamW8bit(
-            [p for p in model.parameters() if p.requires_grad],
+        self.model         = model
+        self.tokenizer     = tokenizer
+        self.vllm_engine   = vllm_engine
+        self.executor      = AgenticExecutor(model, tokenizer, config, vllm_engine=vllm_engine)
+        # 必须收集全部四个 adapter 的 LoRA 参数，不能依赖 requires_grad。
+        # PEFT set_adapter() 只把激活 adapter 的 requires_grad 设为 True，
+        # 如果只收集 requires_grad=True 的参数，非激活 adapter 既不会被
+        # optimizer.step() 更新，也不会被 zero_grad() 清零，梯度持续累加。
+        self.optimizer     = bnb.optim.AdamW8bit(
+            model.lora_parameters(),
             lr=config.get("lr", 1e-5),
         )
-        self.clip_epsilon  = config.get("clip_epsilon", 0.02)
+        self.clip_epsilon  = config.get("clip_epsilon", 0.2)
         self.n_samples     = config.get("n_samples", 8)
         self.max_grad_norm = config.get("max_grad_norm", 1.0)
         self.ppo_epochs    = config.get("ppo_epochs", 1)
-        self.kl_ctrl = AdaptiveKLController(
-            init_kl_coef=config.get("kl_coef", 0.1),
-            target_kl=config.get("target_kl", 6.0),
-            horizon=config.get("kl_horizon", 10000),
-        )
+        self.raca_delta    = config.get("raca_delta", 1e-4)   # variance floor
+        self.kl_coef       = config.get("kl_coef", 0.04)      # KL penalty coefficient
 
-    def collect_rollouts(self, question: str, correct_answer: str):
-        """Run n_samples rollouts for one question in a single batched vLLM call."""
-        episodes = self.executor.run_episodes_batch(
-            [question] * self.n_samples, [correct_answer] * self.n_samples
-        )
-        ep_rewards = [sum(ep["rewards"]) for ep in episodes]
-        valid_mask = [np.isfinite(r) for r in ep_rewards]
-        episodes   = [ep for ep, v in zip(episodes, valid_mask) if v]
-        ep_rewards = [r  for r,  v in zip(ep_rewards, valid_mask) if v]
+    # ── RACA Phase 3: two-level advantage computation ────────────────────────
 
-        if not episodes:
-            print("  [rollout] all episodes have nan rewards, skipping", flush=True)
-            return None
-        return episodes, ep_rewards
+    def _compute_raca_advantages(self, episodes: list) -> list:
+        """Compute per-turn RACA advantages for N episodes of the same question.
+
+        Returns a list of N dicts: {turn_id → float advantage}.
+        Controller turns use Layer 1 (episode-level).
+        Proposer/Critic/Verifier turns use Layer 2 (step-level anchor).
+        """
+        N     = len(episodes)
+        delta = self.raca_delta
+
+        # ── Layer 1: controller episode-level advantage ──────────────────────
+        # r_ctrl per episode = the single scalar from the last controller turn.
+        ctrl_episode_rewards = []
+        for ep in episodes:
+            td = ep.get("raca_turn_data", {})
+            r = sum(v["reward"] for v in td.values() if v["role"] == "controller")
+            ctrl_episode_rewards.append(r)
+
+        mu_ctrl  = float(np.mean(ctrl_episode_rewards))
+        sig_ctrl = float(np.std(ctrl_episode_rewards))
+        ctrl_adv = [
+            (r - mu_ctrl) / max(sig_ctrl, delta)
+            for r in ctrl_episode_rewards
+        ]
+
+        # ── Layer 2: step-level anchor groups for prop/crit/verif ───────────
+        # Anchor: (role, controller_strategy) — groups turns by the cognitive
+        # context the controller assigned for that round, rather than by round
+        # number. Turns sharing the same (role, strategy) faced a comparable
+        # task context (e.g., all proposers invoked under "refine" after errors
+        # were flagged), enabling a cleaner controlled comparison.
+        anchor_groups: dict = defaultdict(list)
+        for ep_idx, ep in enumerate(episodes):
+            for tid, v in ep.get("raca_turn_data", {}).items():
+                if v["role"] == "controller":
+                    continue
+                key = (v["role"], v.get("strategy", "explore"))
+                anchor_groups[key].append((ep_idx, tid, v["reward"]))
+
+        # Normalise within each anchor group → step advantages
+        step_adv: dict = {}   # (ep_idx, tid) → float
+        for (role, rnd), group in anchor_groups.items():
+            if len(group) < 2:
+                continue
+            rewards = [r for _, _, r in group]
+            mu  = float(np.mean(rewards))
+            sig = float(np.std(rewards))
+            denom = max(sig, delta)
+            for ep_idx, tid, r in group:
+                step_adv[(ep_idx, tid)] = (r - mu) / denom
+
+        # ── Build per-episode advantage dicts ────────────────────────────────
+        per_ep_adv = [{} for _ in range(N)]
+
+        for ep_idx, ep in enumerate(episodes):
+            for tid, v in ep.get("raca_turn_data", {}).items():
+                if v["role"] == "controller":
+                    # All controller turns in this episode share the episode advantage.
+                    per_ep_adv[ep_idx][tid] = ctrl_adv[ep_idx]
+                else:
+                    # Use step advantage if the anchor group had enough members.
+                    sa = step_adv.get((ep_idx, tid))
+                    if sa is not None:
+                        per_ep_adv[ep_idx][tid] = sa
+
+        return per_ep_adv
+
+    # ── Training loop ────────────────────────────────────────────────────────
+
+    def _count_valid_turns(self, episode: dict, per_turn_adv: dict) -> int:
+        """Count turns that have both response tokens and a valid advantage."""
+        vocab_size = self.model._model.config.vocab_size
+        return sum(
+            1 for msg in episode["messages"]
+            if (msg.get("turn_id") in per_turn_adv
+                and [t for t in msg.get("response_ids", []) if 0 <= t < vocab_size])
+        )
 
     def update(self, batch_rollouts: list) -> dict:
+        """RACA update.
+
+        batch_rollouts: list of episode-groups, each group being the list of N
+        rollouts for one question.  Shape: list[list[episode_dict]].
         """
-        batch_rollouts: list of (episodes, ep_rewards) from collect_rollouts.
-        GRPO: compute advantages within each group (same question), not across the batch.
-        """
-        all_episodes = []
-        advantages   = []
-        all_rewards  = []  # for logging only
+        # ── compute RACA advantages per group ────────────────────────────────
+        all_episodes:    list = []
+        all_per_turn_adv: list = []
 
-        for episodes, ep_rewards in batch_rollouts:
-            group_mean = np.mean(ep_rewards)
-            group_std  = np.std(ep_rewards)
-            # skip group if zero variance (all same reward) — no learning signal
-            if group_std < 1e-6:
-                group_adv = [0.0] * len(ep_rewards)
-            else:
-                group_adv = [(r - group_mean) / (group_std + 1e-8) for r in ep_rewards]
-            all_episodes.extend(episodes)
-            advantages.extend(group_adv)
-            all_rewards.extend(ep_rewards)
+        for episode_group in batch_rollouts:
+            if len(episode_group) < 2:
+                continue
+            per_ep_adv = self._compute_raca_advantages(episode_group)
+            for ep, adv in zip(episode_group, per_ep_adv):
+                if adv:   # skip episodes where no turn got an advantage
+                    all_episodes.append(ep)
+                    all_per_turn_adv.append(adv)
 
-        mean_r = np.mean(all_rewards)
-        std_r  = np.std(all_rewards)
-        n_correct = sum(ep["is_correct"] for ep in all_episodes)
-        print(f"  [rollout] correct={n_correct}/{len(all_episodes)} reward_mean={mean_r:.3f} "
-              f"reward_std={std_r:.4f}", flush=True)
-
-        if not any(adv != 0.0 for adv in advantages):
+        if not all_episodes:
             if self.vllm_engine is not None:
                 self.vllm_engine.sync_lora(self.model)
-            return {
-                "loss": 0.0, "mean_reward": mean_r,
-                "accuracy": float(np.mean([ep["is_correct"] for ep in all_episodes])),
-                "kl": 0.0, "skipped": True,
-            }
+            return {"loss": 0.0, "mean_reward": 0.0, "accuracy": 0.0,
+                    "kl": 0.0, "skipped": True}
+
+        # Logging
+        n_correct  = sum(ep["is_correct"] for ep in all_episodes)
+        mean_acc   = n_correct / len(all_episodes)
+        # Mean controller reward as a proxy for "reward" in logs
+        mean_r = float(np.mean([
+            sum(v["reward"] for v in ep.get("raca_turn_data", {}).values()
+                if v["role"] == "controller")
+            for ep in all_episodes
+        ]))
+        print(f"  [rollout] correct={n_correct}/{len(all_episodes)} "
+              f"mean_ctrl_reward={mean_r:.3f}", flush=True)
+
+        # Pre-count total valid turns for normalization
+        total_valid = max(
+            sum(self._count_valid_turns(ep, adv)
+                for ep, adv in zip(all_episodes, all_per_turn_adv)), 1
+        )
 
         total_loss    = 0.0
-        total_kl      = 0.0
         total_n_valid = 0
+        total_kl      = 0.0
 
         for _ in range(self.ppo_epochs):
             self.optimizer.zero_grad()
-            did_backward = False
+            did_backward  = False
             epoch_loss    = 0.0
-            epoch_kl      = 0.0
             epoch_n_valid = 0
+            epoch_kl      = 0.0
 
-            for ep, adv in zip(all_episodes, advantages):
-                ep_loss, kl, n_valid = self._compute_loss(ep, adv, len(all_episodes))
+            for ep, adv in zip(all_episodes, all_per_turn_adv):
+                ep_loss, n_valid, ep_kl = self._compute_loss(ep, adv, total_valid)
                 if n_valid > 0:
                     did_backward = True
                 epoch_loss    += ep_loss
-                epoch_kl      += kl
                 epoch_n_valid += n_valid
+                epoch_kl      += ep_kl
 
             if did_backward:
+                # 同理，裁剪全部 LoRA 参数的梯度，不依赖 requires_grad。
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    [p for p in self.model.parameters() if p.requires_grad],
+                    self.model.lora_parameters(),
                     self.max_grad_norm,
                 )
                 self.optimizer.step()
-                mean_epoch_kl = epoch_kl / max(epoch_n_valid, 1)
-                print(f"  [update] grad_norm={grad_norm:.4f} loss={epoch_loss:.4f} kl={mean_epoch_kl:.4f}", flush=True)
+                print(f"  [update] grad_norm={grad_norm:.4f} loss={epoch_loss:.4f} "
+                      f"kl={epoch_kl / max(epoch_n_valid, 1):.6f}",
+                      flush=True)
             else:
-                print(f"  [update] SKIPPED: no valid gradients", flush=True)
+                print("  [update] SKIPPED: no valid gradients", flush=True)
 
             total_loss    += epoch_loss
-            total_kl      += epoch_kl
             total_n_valid += epoch_n_valid
+            total_kl      += epoch_kl
 
         if self.vllm_engine is not None:
             self.vllm_engine.sync_lora(self.model)
 
-        mean_kl = total_kl / max(total_n_valid, 1)
-        self.kl_ctrl.update(mean_kl, n_steps=1)
-
         return {
-            "loss":        total_loss / (len(all_episodes) * self.ppo_epochs),
+            "loss":        total_loss / max(total_n_valid, 1),
             "mean_reward": mean_r,
-            "accuracy":    float(np.mean([ep["is_correct"] for ep in all_episodes])),
-            "kl":          mean_kl,
+            "accuracy":    mean_acc,
+            "kl":          total_kl / max(total_n_valid, 1),
         }
+
+    # ── Per-turn PPO loss ────────────────────────────────────────────────────
 
     _LOG_RATIO_THRESHOLD = 50.0
 
-    def _compute_loss(self, episode: dict, episode_advantage: float, normalization: int) -> tuple:
-        """Per-turn PPO loss: backward immediately after each turn to keep peak memory minimal."""
-        device     = next(p for p in self.model._model.parameters()).device
-        # guard: skip episode if LoRA weights have gone NaN/Inf
-        for p in self.model._model.parameters():
-            if p.requires_grad and not torch.isfinite(p).all():
+    def _compute_loss(
+        self,
+        episode: dict,
+        per_turn_adv: dict,   # turn_id → float advantage
+        normalization: int,
+    ) -> tuple:
+        """Per-turn GRPO clip loss with KL penalty.
+
+        Reference model = base model without LoRA (via as_ref()).
+        KL ≈ mean(new_logprob - ref_logprob), penalises policy drift.
+        Backward after each turn to keep peak memory minimal.
+        per_turn_adv: maps turn_id → RACA advantage scalar.
+        Returns (mean_loss, n_valid_turns, mean_kl).
+        """
+        device = next(p for p in self.model._model.parameters()).device
+
+        # Guard: skip episode if LoRA weights have gone NaN/Inf.
+        # Check all LoRA params, not just requires_grad ones — set_adapter()
+        # during loss computation means only the active adapter has
+        # requires_grad=True, but NaN could be in any adapter.
+        for p in self.model.lora_parameters():
+            if not torch.isfinite(p).all():
                 print("  [loss] NaN/Inf in model weights, skipping episode", flush=True)
-                return 0.0, 0.0, 0
-        vocab_size = self.model._model.config.vocab_size
-        messages   = episode["messages"]
+                return 0.0, 0, 0.0
+
+        vocab_size   = self.model._model.config.vocab_size
+        messages     = episode["messages"]
         all_old_lps  = torch.tensor(episode["log_probs"], dtype=torch.float32, device=device)
         all_old_lps  = torch.nan_to_num(all_old_lps, nan=0.0, posinf=0.0, neginf=0.0)
         all_turn_ids = torch.tensor(episode["turn_ids"], device=device)
 
-        # --- Pass 1: pre-compute all ref log-probs in a single no_grad block ---
-        ref_lps_cache = {}  # turn_id -> ref_lps tensor
-        self.model._model.disable_adapter_layers()
-        with torch.inference_mode():
-            for msg in messages:
-                turn_id  = msg.get("turn_id", 0)
-                resp_ids = [t for t in msg.get("response_ids", []) if 0 <= t < vocab_size]
-                if not resp_ids:
-                    continue
-                prompt_text = self.tokenizer.apply_chat_template(
-                    [{"role": "system", "content": msg["system"]},
-                     {"role": "user",   "content": msg["user"]}],
-                    tokenize=False, add_generation_prompt=True,
-                    enable_thinking=False,
-                )
-                prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
-                if not prompt_ids:
-                    continue
-                p_len = len(prompt_ids)
-                input_ids = torch.tensor(prompt_ids + resp_ids, dtype=torch.long, device=device).unsqueeze(0)
-                resp_labels = torch.tensor(resp_ids, dtype=torch.long, device=device)
-                _ref = self.model._model(input_ids, use_cache=False).logits[0]
-                _ref_resp = _ref[p_len - 1: p_len + len(resp_ids) - 1].float().contiguous()
-                del _ref, input_ids
-                ref_lps_cache[turn_id] = logprobs_from_logits(_ref_resp, resp_labels)
-                del _ref_resp
-        self.model._model.enable_adapter_layers()
-
-        # --- Pass 2: new log-probs with gradients, per-turn backward ---
         total_loss = 0.0
-        total_kl = 0.0
-        n_valid  = 0
-        _logged  = False
+        total_kl   = 0.0
+        n_valid    = 0
 
         for msg in messages:
-            turn_id  = msg.get("turn_id", 0)
+            turn_id = msg.get("turn_id", 0)
+
+            # Only process turns that have a RACA advantage assigned.
+            advantage = per_turn_adv.get(turn_id)
+            if advantage is None:
+                continue
+
             role     = msg.get("role_name", "proposer")
             resp_ids = [t for t in msg.get("response_ids", []) if 0 <= t < vocab_size]
             if not resp_ids:
-                if not _logged: print(f"  [diag] turn={turn_id} SKIP resp_ids empty", flush=True); _logged=True
-                continue
-
-            ref_lps = ref_lps_cache.get(turn_id)
-            if ref_lps is None or not torch.isfinite(ref_lps).all():
-                if not _logged: print(f"  [diag] turn={turn_id} SKIP ref_lps invalid", flush=True); _logged=True
                 continue
 
             mask    = (all_turn_ids == turn_id)
@@ -209,7 +260,6 @@ class GRPOAgenticTrainer:
             n_resp  = len(resp_ids)
             n_align = min(n_resp, old_lps.shape[0])
             if n_align == 0:
-                if not _logged: print(f"  [diag] turn={turn_id} SKIP n_align=0 old_lps={old_lps.shape[0]} resp_ids={n_resp}", flush=True); _logged=True
                 continue
 
             prompt_text = self.tokenizer.apply_chat_template(
@@ -221,60 +271,60 @@ class GRPOAgenticTrainer:
             prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
             p_len = len(prompt_ids)
             if p_len == 0:
-                if not _logged: print(f"  [diag] turn={turn_id} SKIP p_len=0", flush=True); _logged=True
                 continue
 
-            input_ids   = torch.tensor(prompt_ids + resp_ids, dtype=torch.long, device=device).unsqueeze(0)
+            input_ids   = torch.tensor(
+                prompt_ids + resp_ids, dtype=torch.long, device=device
+            ).unsqueeze(0)
             resp_labels = torch.tensor(resp_ids, dtype=torch.long, device=device)
 
+            # Reference forward (base model, no LoRA, no grad)
+            with self.model.as_ref():
+                with torch.no_grad():
+                    ref_logits = self.model._model(input_ids, use_cache=False).logits[0]
+                    _ref_rl = ref_logits[p_len - 1: p_len + n_resp - 1].float().contiguous()
+                    del ref_logits
+            ref_lps = logprobs_from_logits(_ref_rl, resp_labels.to(_ref_rl.device))
+            del _ref_rl
+
+            # LoRA forward (active adapter, with grad)
             self.model._model.set_adapter(ROLE_ADAPTER.get(role, "proposer"))
-            if not _logged:
-                print(f"  [diag] p_len={p_len} n_resp={n_resp} prompt_max={max(prompt_ids)} resp_max={max(resp_ids)}", flush=True)
-            logits_new = self.model._model(input_ids, use_cache=False).logits[0]
-            logits_device = logits_new.device
-            if not _logged:
-                print(f"  [diag] turn={turn_id} role={role} p_len={p_len} n_resp={n_resp} "
-                      f"logits.shape={logits_new.shape} "
-                      f"logits_finite={torch.isfinite(logits_new).all().item()} "
-                      f"input_ids_max={input_ids.max().item()} vocab={vocab_size}", flush=True)
+            logits_new   = self.model._model(input_ids, use_cache=False).logits[0]
             _resp_logits = logits_new[p_len - 1: p_len + n_resp - 1].float().contiguous()
             del logits_new
-            new_lps = logprobs_from_logits(_resp_logits, resp_labels.to(logits_device))
+            new_lps = logprobs_from_logits(_resp_logits, resp_labels.to(_resp_logits.device))
             del _resp_logits
 
             if not torch.isfinite(new_lps).all():
-                if not _logged: print(f"  [diag] turn={turn_id} SKIP new_lps non-finite", flush=True); _logged=True
                 continue
 
-            ref_lps = ref_lps.to(new_lps.device)
             old_lps_aligned = old_lps[:n_align].to(new_lps.device)
-            log_ratio = (new_lps[:n_align] - old_lps_aligned).mean()
-            if not _logged: print(f"  [diag] turn={turn_id} role={role} n_align={n_align} log_ratio={log_ratio:.3f} new_lps_mean={new_lps.mean():.3f} old_lps_mean={old_lps_aligned.mean():.3f} req_grad={new_lps.requires_grad}", flush=True); _logged=True
+            log_ratio_tok   = new_lps[:n_align] - old_lps_aligned
+            log_ratio       = log_ratio_tok.mean()
+
             if not torch.isfinite(log_ratio):
                 continue
             if log_ratio.abs().item() > self._LOG_RATIO_THRESHOLD:
-                print(f"  [diag] turn={turn_id} SKIP |log_ratio|={log_ratio.abs().item():.1f} > {self._LOG_RATIO_THRESHOLD}", flush=True)
+                print(f"  [loss] turn={turn_id} SKIP |log_ratio|={log_ratio.abs().item():.1f}",
+                      flush=True)
                 continue
-            ratio = torch.exp(log_ratio)
 
+            ratio_tok = torch.exp(log_ratio_tok)
             pg_loss = torch.maximum(
-                -episode_advantage * ratio,
-                -episode_advantage * torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon),
-            )
+                -advantage * ratio_tok,
+                -advantage * torch.clamp(ratio_tok, 1 - self.clip_epsilon,
+                                                     1 + self.clip_epsilon),
+            ).mean()
 
-            kl = (new_lps[:n_align] - ref_lps[:n_align]).mean()
-            if not torch.isfinite(kl):
-                continue
+            # KL penalty: keep policy close to base model
+            kl = (new_lps[:n_align] - ref_lps[:n_align].to(new_lps.device)).mean()
+            turn_loss = pg_loss + self.kl_coef * kl
 
-            total_kl += abs(kl.item())
-            turn_loss = pg_loss + self.kl_ctrl.value * kl
-            (turn_loss / normalization).backward()  # immediate backward — only 1 turn in graph
-            total_loss += turn_loss.item()
-            n_valid += 1
+            (turn_loss / normalization).backward()  # immediate backward
+            total_loss += pg_loss.item()
+            total_kl   += kl.item()
+            n_valid    += 1
 
         if n_valid == 0:
-            print(f"  [loss] n_valid=0 n_messages={len(messages)} "
-                  f"turn_ids_range=[{all_turn_ids.min().item() if len(all_turn_ids) else 'N/A'},"
-                  f"{all_turn_ids.max().item() if len(all_turn_ids) else 'N/A'}]", flush=True)
-            return 0.0, 0.0, 0
-        return total_loss / n_valid, total_kl, n_valid
+            return 0.0, 0, 0.0
+        return total_loss / n_valid, n_valid, total_kl / n_valid

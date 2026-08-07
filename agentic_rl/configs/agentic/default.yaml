@@ -6,6 +6,7 @@ max_tokens: 1024
 max_rounds: 4
 max_interactions: 3
 max_grad_norm: 1.0
+kl_coef: 0.04  # KL penalty coefficient (reference = base model without LoRA)
 max_steps: 200
 save_freq: 20
 eval_freq: 10

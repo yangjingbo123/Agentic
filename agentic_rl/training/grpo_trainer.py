@@ -19,8 +19,12 @@ class GRPOAgenticTrainer:
         self.tokenizer     = tokenizer
         self.vllm_engine   = vllm_engine
         self.executor      = AgenticExecutor(model, tokenizer, config, vllm_engine=vllm_engine)
+        # 必须收集全部四个 adapter 的 LoRA 参数，不能依赖 requires_grad。
+        # PEFT set_adapter() 只把激活 adapter 的 requires_grad 设为 True，
+        # 如果只收集 requires_grad=True 的参数，非激活 adapter 既不会被
+        # optimizer.step() 更新，也不会被 zero_grad() 清零，梯度持续累加。
         self.optimizer     = bnb.optim.AdamW8bit(
-            [p for p in model.parameters() if p.requires_grad],
+            model.lora_parameters(),
             lr=config.get("lr", 1e-5),
         )
         self.clip_epsilon  = config.get("clip_epsilon", 0.2)
@@ -28,6 +32,7 @@ class GRPOAgenticTrainer:
         self.max_grad_norm = config.get("max_grad_norm", 1.0)
         self.ppo_epochs    = config.get("ppo_epochs", 1)
         self.raca_delta    = config.get("raca_delta", 1e-4)   # variance floor
+        self.kl_coef       = config.get("kl_coef", 0.04)      # KL penalty coefficient
 
     # ── RACA Phase 3: two-level advantage computation ────────────────────────
 
@@ -154,33 +159,39 @@ class GRPOAgenticTrainer:
 
         total_loss    = 0.0
         total_n_valid = 0
+        total_kl      = 0.0
 
         for _ in range(self.ppo_epochs):
             self.optimizer.zero_grad()
             did_backward  = False
             epoch_loss    = 0.0
             epoch_n_valid = 0
+            epoch_kl      = 0.0
 
             for ep, adv in zip(all_episodes, all_per_turn_adv):
-                ep_loss, n_valid = self._compute_loss(ep, adv, total_valid)
+                ep_loss, n_valid, ep_kl = self._compute_loss(ep, adv, total_valid)
                 if n_valid > 0:
                     did_backward = True
                 epoch_loss    += ep_loss
                 epoch_n_valid += n_valid
+                epoch_kl      += ep_kl
 
             if did_backward:
+                # 同理，裁剪全部 LoRA 参数的梯度，不依赖 requires_grad。
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    [p for p in self.model.parameters() if p.requires_grad],
+                    self.model.lora_parameters(),
                     self.max_grad_norm,
                 )
                 self.optimizer.step()
-                print(f"  [update] grad_norm={grad_norm:.4f} loss={epoch_loss:.4f}",
+                print(f"  [update] grad_norm={grad_norm:.4f} loss={epoch_loss:.4f} "
+                      f"kl={epoch_kl / max(epoch_n_valid, 1):.6f}",
                       flush=True)
             else:
                 print("  [update] SKIPPED: no valid gradients", flush=True)
 
             total_loss    += epoch_loss
             total_n_valid += epoch_n_valid
+            total_kl      += epoch_kl
 
         if self.vllm_engine is not None:
             self.vllm_engine.sync_lora(self.model)
@@ -189,7 +200,7 @@ class GRPOAgenticTrainer:
             "loss":        total_loss / max(total_n_valid, 1),
             "mean_reward": mean_r,
             "accuracy":    mean_acc,
-            "kl":          0.0,
+            "kl":          total_kl / max(total_n_valid, 1),
         }
 
     # ── Per-turn PPO loss ────────────────────────────────────────────────────
@@ -202,17 +213,24 @@ class GRPOAgenticTrainer:
         per_turn_adv: dict,   # turn_id → float advantage
         normalization: int,
     ) -> tuple:
-        """Per-turn GRPO clip loss (no KL penalty).
+        """Per-turn GRPO clip loss with KL penalty.
+
+        Reference model = base model without LoRA (via as_ref()).
+        KL ≈ mean(new_logprob - ref_logprob), penalises policy drift.
         Backward after each turn to keep peak memory minimal.
         per_turn_adv: maps turn_id → RACA advantage scalar.
+        Returns (mean_loss, n_valid_turns, mean_kl).
         """
         device = next(p for p in self.model._model.parameters()).device
 
         # Guard: skip episode if LoRA weights have gone NaN/Inf.
-        for p in self.model._model.parameters():
-            if p.requires_grad and not torch.isfinite(p).all():
+        # Check all LoRA params, not just requires_grad ones — set_adapter()
+        # during loss computation means only the active adapter has
+        # requires_grad=True, but NaN could be in any adapter.
+        for p in self.model.lora_parameters():
+            if not torch.isfinite(p).all():
                 print("  [loss] NaN/Inf in model weights, skipping episode", flush=True)
-                return 0.0, 0
+                return 0.0, 0, 0.0
 
         vocab_size   = self.model._model.config.vocab_size
         messages     = episode["messages"]
@@ -221,6 +239,7 @@ class GRPOAgenticTrainer:
         all_turn_ids = torch.tensor(episode["turn_ids"], device=device)
 
         total_loss = 0.0
+        total_kl   = 0.0
         n_valid    = 0
 
         for msg in messages:
@@ -259,6 +278,16 @@ class GRPOAgenticTrainer:
             ).unsqueeze(0)
             resp_labels = torch.tensor(resp_ids, dtype=torch.long, device=device)
 
+            # Reference forward (base model, no LoRA, no grad)
+            with self.model.as_ref():
+                with torch.no_grad():
+                    ref_logits = self.model._model(input_ids, use_cache=False).logits[0]
+                    _ref_rl = ref_logits[p_len - 1: p_len + n_resp - 1].float().contiguous()
+                    del ref_logits
+            ref_lps = logprobs_from_logits(_ref_rl, resp_labels.to(_ref_rl.device))
+            del _ref_rl
+
+            # LoRA forward (active adapter, with grad)
             self.model._model.set_adapter(ROLE_ADAPTER.get(role, "proposer"))
             logits_new   = self.model._model(input_ids, use_cache=False).logits[0]
             _resp_logits = logits_new[p_len - 1: p_len + n_resp - 1].float().contiguous()
@@ -287,10 +316,15 @@ class GRPOAgenticTrainer:
                                                      1 + self.clip_epsilon),
             ).mean()
 
-            (pg_loss / normalization).backward()  # immediate backward — only 1 turn in graph
+            # KL penalty: keep policy close to base model
+            kl = (new_lps[:n_align] - ref_lps[:n_align].to(new_lps.device)).mean()
+            turn_loss = pg_loss + self.kl_coef * kl
+
+            (turn_loss / normalization).backward()  # immediate backward
             total_loss += pg_loss.item()
+            total_kl   += kl.item()
             n_valid    += 1
 
         if n_valid == 0:
-            return 0.0, 0
-        return total_loss / n_valid, n_valid
+            return 0.0, 0, 0.0
+        return total_loss / n_valid, n_valid, total_kl / n_valid

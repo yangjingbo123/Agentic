@@ -9,7 +9,66 @@ from llm.prompt_templates import PromptTemplates
 
 
 def normalize_answer(s: str) -> str:
+    """Strip non-numeric characters for fallback string comparison.
+
+    WARNING: This is a lossy normalizer — \frac{1}{2} becomes "12".
+    Prefer math_equal() for answer comparison.
+    """
     return re.sub(r"[^0-9.\-]", "", s.strip())
+
+
+def _extract_number(s: str) -> float | None:
+    """Try to extract a numeric value from a math answer string.
+
+    Handles common LaTeX patterns: \frac{a}{b}, a/b, integers, decimals.
+    Returns None if no number can be extracted.
+    """
+    s = s.strip()
+    # Direct number
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    # \frac{a}{b}
+    m = re.match(r'\\frac\{(-?[\d.]+)\}\{(-?[\d.]+)\}', s)
+    if m:
+        try:
+            return float(m.group(1)) / float(m.group(2))
+        except (ZeroDivisionError, ValueError):
+            pass
+    # a/b format
+    m = re.match(r'(-?[\d.]+)\s*/\s*(-?[\d.]+)', s)
+    if m:
+        try:
+            return float(m.group(1)) / float(m.group(2))
+        except (ZeroDivisionError, ValueError):
+            pass
+    # \text{...} wrapped
+    m = re.search(r'\\text\{([^}]+)\}', s)
+    if m:
+        return _extract_number(m.group(1))
+    # Extract last number from string
+    nums = re.findall(r'-?\d+\.?\d*', s)
+    if nums:
+        try:
+            return float(nums[-1])
+        except ValueError:
+            pass
+    return None
+
+
+def math_equal(a: str, b: str, tol: float = 1e-6) -> bool:
+    """Compare two math answer strings, handling LaTeX and numeric forms.
+
+    Tries numeric comparison first (handles \frac, a/b, etc.),
+    then falls back to normalized string comparison.
+    """
+    va = _extract_number(a)
+    vb = _extract_number(b)
+    if va is not None and vb is not None:
+        return abs(va - vb) < tol
+    # Fall back to string comparison after normalization
+    return normalize_answer(a) == normalize_answer(b)
 
 
 ROLE_SYSTEM = {
@@ -21,13 +80,17 @@ ROLE_NAMES = {"proposer": "Proposer", "critic": "Critic", "verifier": "Verifier"
 
 
 class AgenticExecutor:
-    def __init__(self, model, tokenizer, config, vllm_engine=None):
+    def __init__(self, model, tokenizer, config, vllm_engine=None, eval_mode: bool = False):
         self.model = model
         self.tokenizer = tokenizer
         self.max_tokens = config.get("max_tokens", 512)
         self.max_interactions = config.get("max_interactions", 3)
         self.max_rounds = config.get("max_rounds", 3)
         self.vllm_engine = vllm_engine
+        # eval_mode: use greedy decoding (temperature=0) for deterministic evaluation;
+        # training rollouts use temperature=1.0 for exploration.
+        self.eval_mode = eval_mode
+        self.temperature = 0.0 if eval_mode else 1.0
         # RACA controller reward hyperparameters
         self.ctrl_alpha = config.get("ctrl_alpha", 0.3)
         self.ctrl_beta  = config.get("ctrl_beta",  0.2)
@@ -111,7 +174,8 @@ class AgenticExecutor:
                 ctrl_info.append((i, next_tid(i), sys, usr))
 
             ctrl_res = self.vllm_engine.generate_batch(
-                [{"role": "controller", "prompt": make_prompt(s, u)} for _, _, s, u in ctrl_info]
+                [{"role": "controller", "prompt": make_prompt(s, u),
+                  "temperature": self.temperature} for _, _, s, u in ctrl_info]
             )
 
             still_active = []
@@ -137,7 +201,8 @@ class AgenticExecutor:
                 continue
 
             start_res = self.vllm_engine.generate_batch(
-                [{"role": role, "prompt": make_prompt(s, u)}
+                [{"role": role, "prompt": make_prompt(s, u),
+                  "temperature": self.temperature}
                  for _, _, role, s, u, _ in start_info]
             )
 
@@ -180,7 +245,8 @@ class AgenticExecutor:
                 if not batch_req:
                     break
                 ires_all = self.vllm_engine.generate_batch(
-                    [{"role": t, "prompt": make_prompt(s, u)} for _, _, t, s, u in batch_req]
+                    [{"role": t, "prompt": make_prompt(s, u),
+                      "temperature": self.temperature} for _, _, t, s, u in batch_req]
                 )
                 for (i, itid, target, isys, iusr), ires in zip(batch_req, ires_all):
                     record(i, target, isys, iusr, ires, itid)
@@ -199,7 +265,8 @@ class AgenticExecutor:
                     prop_req.append((i, ptid, ps, pu))
             if prop_req:
                 prop_res_all = self.vllm_engine.generate_batch(
-                    [{"role": "proposer", "prompt": make_prompt(s, u)} for _, _, s, u in prop_req]
+                    [{"role": "proposer", "prompt": make_prompt(s, u),
+                      "temperature": self.temperature} for _, _, s, u in prop_req]
                 )
                 for (i, ptid, ps, pu), pres in zip(prop_req, prop_res_all):
                     record(i, "proposer", ps, pu, pres, ptid)
@@ -212,7 +279,7 @@ class AgenticExecutor:
             for i, st in ep_st.items():
                 ro = st["role_outputs"]
                 _, prop_answer = self._parse_reasoning(ro.get("proposer", ""))
-                critic_flagged = "critic" in ro and "无错误" not in ro["critic"]
+                critic_flagged = "critic" in ro and self._critic_found_errors(ro["critic"])
                 verifier_score = (self._parse_score(ro["verifier"])
                                   if "verifier" in ro else None)
                 round_records[i].append({
@@ -227,7 +294,7 @@ class AgenticExecutor:
         results = []
         for i in range(n):
             final_answer = self._majority_vote(blackboards[i])
-            is_correct   = normalize_answer(final_answer) == normalize_answer(correct_answers[i])
+            is_correct   = math_equal(final_answer, correct_answers[i])
 
             raca_turn_data = self._compute_raca_turn_data(
                 round_records[i], correct_answers[i], is_correct,
@@ -334,7 +401,7 @@ class AgenticExecutor:
                 self._write_to_blackboard(blackboard, "proposer", prop_out)
 
             _, prop_answer = self._parse_reasoning(role_outputs.get("proposer", ""))
-            critic_flagged = "critic" in role_outputs and "无错误" not in role_outputs["critic"]
+            critic_flagged = "critic" in role_outputs and self._critic_found_errors(role_outputs["critic"])
             verifier_score = (self._parse_score(role_outputs["verifier"])
                               if "verifier" in role_outputs else None)
             round_records.append({
@@ -346,7 +413,7 @@ class AgenticExecutor:
             })
 
         final_answer = self._majority_vote(blackboard)
-        is_correct = normalize_answer(final_answer) == normalize_answer(correct_answer)
+        is_correct = math_equal(final_answer, correct_answer)
 
         raca_turn_data = self._compute_raca_turn_data(
             round_records, correct_answer, is_correct,
@@ -392,7 +459,8 @@ class AgenticExecutor:
             prompt = self.tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
             )
-            response, turn_lps, token_ids = self.vllm_engine.generate(role, prompt)
+            response, turn_lps, token_ids = self.vllm_engine.generate(
+                role, prompt, temperature=self.temperature)
             resp_token_ids = token_ids
             n_resp = len(resp_token_ids)
             aligned_lps = list(turn_lps) + [0.0] * (n_resp - len(turn_lps))
@@ -442,7 +510,7 @@ class AgenticExecutor:
             reasoning, answer = self._parse_reasoning(output)
             blackboard.add_message(Message(0, MessageType.TRACE, (reasoning, answer)))
         elif role == "critic":
-            if "无错误" not in output:
+            if self._critic_found_errors(output):
                 blackboard.add_message(Message(1, MessageType.FLAW, {"content": output}))
         elif role == "verifier":
             answer = blackboard.traces[-1][1] if blackboard.traces else ""
@@ -467,7 +535,7 @@ class AgenticExecutor:
         # Pre-compute per-round proposer correctness for critic's causal reward.
         prop_correct_per_round: list = []
         for rnd in round_records:
-            pc = normalize_answer(rnd["proposer_answer"]) == normalize_answer(correct_answer)
+            pc = math_equal(rnd["proposer_answer"], correct_answer)
             prop_correct_per_round.append(pc)
 
         last_ctrl_tid = None
@@ -520,6 +588,32 @@ class AgenticExecutor:
             turn_data[last_ctrl_tid]["reward"] = ctrl_reward
 
         return turn_data
+
+    def _critic_found_errors(self, critic_output: str) -> bool:
+        """Robustly detect whether the critic found errors.
+
+        Old check: '"无错误" not in output' — too brittle because interaction
+        responses overwrite role_outputs["critic"] with a response that doesn't
+        follow the critic format and never contains "无错误", causing
+        critic_flagged to be almost always True.
+
+        New logic: parse the '错误分析' section specifically. If the section
+        says '无错误'/'无错'/'正确', return False. If it has other content,
+        return True. If the section is missing (e.g. interaction response),
+        conservatively return False.
+        """
+        # Fast path: if '无错误' appears anywhere, the critic approved.
+        if "无错误" in critic_output or "无错" in critic_output:
+            return False
+        # Try to find the '错误分析' section
+        err_match = re.search(r"错误分析[：:]\s*(.+?)(?=<|$)", critic_output, re.S)
+        if err_match:
+            err_text = err_match.group(1).strip()
+            # Non-empty error analysis that doesn't say 'no error' → errors found
+            return bool(err_text) and "无错误" not in err_text and "无错" not in err_text
+        # No '错误分析' section — likely an interaction response, not a review.
+        # Conservative: don't flag.
+        return False
 
     def _parse_strategy(self, meta_plan: str) -> str:
         m = re.search(r"strategy:\s*(explore|refine|verify|stop)", meta_plan)

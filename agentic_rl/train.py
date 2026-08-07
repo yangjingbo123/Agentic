@@ -146,7 +146,10 @@ def main(cfg: DictConfig):
     eval_freq = cfg.agentic.get("eval_freq", 20)
     eval_samples = cfg.agentic.get("eval_samples", 100)
     from agents.agentic_executor import AgenticExecutor, normalize_answer
-    eval_executor = AgenticExecutor(model, tokenizer, OmegaConf.to_container(cfg.agentic), vllm_engine=vllm_engine)
+    eval_executor = AgenticExecutor(
+        model, tokenizer, OmegaConf.to_container(cfg.agentic),
+        vllm_engine=vllm_engine, eval_mode=True,
+    )
 
     # fixed eval subset — Level 5 only (hardest tier), first N items, same across all experiments
     # Level 5 problems are where multi-agent collaboration has the most impact;
@@ -195,10 +198,15 @@ def main(cfg: DictConfig):
         for adapter_name in ROLE_ADAPTER.values():
             w = st.load_file(os.path.join(ckpt_dir, f"{adapter_name}", "adapter_model.safetensors"))
             model._model.set_adapter(adapter_name)
+            loaded = 0
             for name, param in model._model.named_parameters():
+                if "lora_" not in name:
+                    continue
                 src = name.replace(f".{adapter_name}.", ".")
-                if src in w and param.requires_grad:
+                if src in w:
                     param.data.copy_(w[src].to(param.device))
+                    loaded += 1
+            print(f"  [resume] {adapter_name}: loaded {loaded} params", flush=True)
         print(f"Resumed from step={step}", flush=True)
 
     # infinite dataloader — shuffle and cycle, no epoch concept

@@ -5,7 +5,7 @@ import re
 import torch
 import yaml
 
-from agents.agentic_executor import AgenticExecutor, normalize_answer
+from agents.agentic_executor import AgenticExecutor, math_equal
 from llm.trainable_llm import load_trainable_models
 from peft import PeftModel
 
@@ -32,12 +32,15 @@ def load_finetuned_models(model_path: str, checkpoint_dir: str):
                 continue
             weights = st.load_file(ckpt)
             model._model.set_adapter(adapter_name)
+            loaded = 0
             for name, param in model._model.named_parameters():
-                if not param.requires_grad:
+                if "lora_" not in name:
                     continue
                 src = re.sub(rf"\.{adapter_name}\.", ".", name)
                 if src in weights:
                     param.data.copy_(weights[src].to(param.device))
+                    loaded += 1
+            print(f"  [eval] {adapter_name}: loaded {loaded} params", flush=True)
         print(f"Loaded RL checkpoint from {checkpoint_dir}")
 
     return model, tokenizer
@@ -59,7 +62,7 @@ def evaluate(executor: AgenticExecutor, dataset: list) -> dict:
 
     for item in dataset:
         ep = executor.run_episode(item["question"], item["answer"])
-        correct_answer = normalize_answer(item["answer"])
+        correct_answer = item["answer"]
 
         if ep["is_correct"]:
             correct += 1
@@ -80,14 +83,14 @@ def evaluate(executor: AgenticExecutor, dataset: list) -> dict:
             if role == "proposer":
                 proposer_total += 1
                 m = re.search(r"最终答案：(.+)", resp)
-                last_proposer_ans = normalize_answer(m.group(1).strip()) if m else ""
-                if last_proposer_ans == correct_answer:
+                last_proposer_ans = m.group(1).strip() if m else ""
+                if math_equal(last_proposer_ans, correct_answer):
                     proposer_correct += 1
 
             elif role == "critic":
                 critic_total += 1
-                if "无错误" not in resp:
-                    if last_proposer_ans == correct_answer:
+                if executor._critic_found_errors(resp):
+                    if math_equal(last_proposer_ans, correct_answer):
                         critic_fp += 1  # 误报：proposer 对但 critic 挑错
                     else:
                         critic_tp += 1  # 正确挑错
@@ -131,7 +134,8 @@ def main():
     model, tokenizer = load_finetuned_models(
         config["llm"]["model_path"], args.checkpoint
     )
-    executor = AgenticExecutor(model, tokenizer, config.get("agentic", {}))
+    executor = AgenticExecutor(model, tokenizer, config.get("agentic", {}),
+                              vllm_engine=None, eval_mode=True)
 
     print(f"Evaluating on {len(dataset)} samples ({args.split})...")
     results = evaluate(executor, dataset)

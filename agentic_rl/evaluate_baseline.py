@@ -20,9 +20,9 @@ def main():
 
     from llm.trainable_llm import load_trainable_models
     from llm.vllm_engine import VLLMInferenceEngine
-    from agents.agentic_executor import AgenticExecutor, normalize_answer
+    from agents.agentic_executor import AgenticExecutor
 
-    models, _, tokenizer = load_trainable_models(config["llm"]["model_path"])
+    model, tokenizer = load_trainable_models(config["llm"]["model_path"])
 
     print("Initializing vLLM engine...", flush=True)
     vllm_engine = VLLMInferenceEngine(
@@ -32,7 +32,8 @@ def main():
     )
     print("vLLM ready.", flush=True)
 
-    executor = AgenticExecutor(models, tokenizer, config.get("agentic", {}), vllm_engine=vllm_engine)
+    executor = AgenticExecutor(model, tokenizer, config.get("agentic", {}),
+                              vllm_engine=vllm_engine, eval_mode=True)
 
     data_path = config["data"][f"{args.split}_path"]
     with open(data_path) as f:

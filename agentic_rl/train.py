@@ -222,6 +222,28 @@ def main(cfg: DictConfig):
     if cfg.agentic.get("val_before_train", False):
         run_eval(0)
 
+    # A batch whose groups all failed the variance filter applies no gradient, so
+    # it must not be charged to the step budget. That removes the unconditional
+    # `step += 1` that used to guarantee termination, hence the livelock guard.
+    skipped_batches       = 0
+    consecutive_skips     = 0
+    max_consecutive_skips = int(cfg.agentic.get("max_consecutive_skips", 50))
+
+    def note_skip(reason: str):
+        """Record a batch that produced no gradient; abort if nothing is learnable."""
+        nonlocal skipped_batches, consecutive_skips
+        skipped_batches   += 1
+        consecutive_skips += 1
+        print(f"  [skip] {reason} — step stays {step}, "
+              f"skipped_total={skipped_batches}", flush=True)
+        if consecutive_skips >= max_consecutive_skips:
+            raise RuntimeError(
+                f"{consecutive_skips} consecutive batches produced no gradient "
+                f"(last reason: {reason}). Training cannot progress — every rollout "
+                f"in every group scored identically. Check the reward function and "
+                f"rollout diversity (temperature, n_samples)."
+            )
+
     while step < max_steps:
         # take next batch, reshuffle when exhausted
         if pool_idx + batch_size > len(data_pool):
@@ -264,6 +286,7 @@ def main(cfg: DictConfig):
             if len(valid) >= 2:   # need at least 2 for anchor-group comparison
                 batch_rollouts.append(valid)
         if not batch_rollouts:
+            note_skip("no group had >=2 valid episodes")
             continue
 
         try:
@@ -271,17 +294,35 @@ def main(cfg: DictConfig):
         except Exception:
             import traceback; traceback.print_exc()
             raise
+
+        _g_kept, _g_total = stats.get("groups_kept", 0), stats.get("groups_total", 0)
+        if stats.get("skipped", False):
+            # Reusing the current step index for wandb would also clash with the
+            # point already logged there, so skip the log entirely and fold the
+            # running total into the next real step.
+            note_skip(f"no usable groups (0/{_g_total})")
+            continue
+
+        consecutive_skips = 0
         step += 1
-        skipped = stats.get("skipped", False)
         print(
             f"step={step} reward={stats['mean_reward']:.3f} acc={stats['accuracy']:.2f} "
-            f"loss={stats['loss']:.4f} kl={stats['kl']:.4f}"
-            + (" [skipped: zero variance]" if skipped else ""),
+            f"loss={stats['loss']:.4f} kl={stats['kl']:.4f} "
+            f"groups={_g_kept}/{_g_total}",
             flush=True,
         )
-        log_data = {"reward": stats["mean_reward"], "accuracy": stats["accuracy"]}
-        if not skipped:
-            log_data.update({"loss": stats["loss"], "kl": stats["kl"]})
+        log_data = {
+            "reward":          stats["mean_reward"],
+            "accuracy":        stats["accuracy"],
+            "loss":            stats["loss"],
+            "kl":              stats["kl"],
+            "skipped_batches": skipped_batches,
+        }
+        if _g_total:
+            # Fraction of question-groups that produced a usable advantage. A
+            # sustained drop means rollouts are collapsing to identical rewards
+            # and the batch is mostly dead weight.
+            log_data["group_keep_rate"] = _g_kept / _g_total
         wandb.log(log_data, step=step)
 
         if eval_freq > 0 and step % eval_freq == 0:

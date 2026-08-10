@@ -14,8 +14,16 @@ eval_samples: 300
 # RACA controller reward
 ctrl_alpha: 0.3
 ctrl_beta: 0.2
-# RACA variance floor (prevents zero-std anchor groups from being skipped)
+# Penalty per unused round when the final answer is wrong (mirrors ctrl_alpha's
+# bonus when it is right). Early stopping pays off only when p(correct) exceeds
+# gamma/(alpha+gamma) = 0.5 at these defaults. Raise to discourage stopping.
+ctrl_gamma: 0.3
+# RACA variance threshold: groups whose reward std is <= this are treated as
+# degenerate and dropped (they carry no comparative signal).
 raca_delta: 1.0e-4
+# Abort after this many consecutive batches that yield no gradient at all
+# (guards against a livelock now that skipped batches don't consume a step).
+max_consecutive_skips: 50
 vllm_gpu_slot: 1
 vllm_cuda_visible_devices: null
 vllm_gpu_memory_utilization: 0.65

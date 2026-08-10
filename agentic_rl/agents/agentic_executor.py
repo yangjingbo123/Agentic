@@ -94,6 +94,10 @@ class AgenticExecutor:
         # RACA controller reward hyperparameters
         self.ctrl_alpha = config.get("ctrl_alpha", 0.3)
         self.ctrl_beta  = config.get("ctrl_beta",  0.2)
+        # ctrl_gamma penalises unused rounds when the answer is wrong, mirroring
+        # ctrl_alpha's bonus for unused rounds when it is right. Without it,
+        # stopping early is weakly dominant at every confidence level.
+        self.ctrl_gamma = config.get("ctrl_gamma", 0.3)
 
     # ── batch entry point (N episodes in parallel, batched per turn-slot) ───
     def run_episodes_batch(self, questions: list, correct_answers: list) -> list:
@@ -107,6 +111,9 @@ class AgenticExecutor:
         seq_step_ids_l  = [[] for _ in range(n)]
         turn_counters   = [0] * n
         round_records   = [[] for _ in range(n)]
+        # Controller turn that ended each episode via strategy:stop (None if the
+        # episode ran out of max_rounds instead).
+        stop_ctrl_tids  = [None] * n
         active          = list(range(n))
 
         def next_tid(i):
@@ -187,6 +194,11 @@ class AgenticExecutor:
                 ctrl_tid_map[i] = tid          # store controller tid before filtering
                 meta_plan = res[0]
                 if self._parse_strategy(meta_plan) == "stop":
+                    # Remember the turn that ended the episode. Stop turns never
+                    # reach round_records, so without this they get no reward
+                    # entry, no advantage, and therefore no gradient — the single
+                    # most consequential controller action went untrained.
+                    stop_ctrl_tids[i] = tid
                     continue
                 still_active.append(i)
                 focus      = self._parse_focus(meta_plan)
@@ -299,6 +311,7 @@ class AgenticExecutor:
             raca_turn_data = self._compute_raca_turn_data(
                 round_records[i], correct_answers[i], is_correct,
                 self.max_rounds, self.ctrl_alpha, self.ctrl_beta,
+                self.ctrl_gamma, stop_ctrl_tid=stop_ctrl_tids[i],
             )
 
             results.append({
@@ -329,6 +342,7 @@ class AgenticExecutor:
             return tid
 
         round_records = []
+        stop_ctrl_tid = None
 
         for _ in range(self.max_rounds):
             ctrl_tid = next_turn_id()
@@ -341,6 +355,7 @@ class AgenticExecutor:
                 seq_input_ids=seq_input_ids, seq_step_ids=seq_step_ids,
             )
             if self._parse_strategy(meta_plan) == "stop":
+                stop_ctrl_tid = ctrl_tid
                 break
 
             focus = self._parse_focus(meta_plan)
@@ -418,6 +433,7 @@ class AgenticExecutor:
         raca_turn_data = self._compute_raca_turn_data(
             round_records, correct_answer, is_correct,
             self.max_rounds, self.ctrl_alpha, self.ctrl_beta,
+            self.ctrl_gamma, stop_ctrl_tid=stop_ctrl_tid,
         )
 
         return {
@@ -524,6 +540,8 @@ class AgenticExecutor:
         max_rounds: int,
         alpha: float,
         beta: float,
+        gamma: float = 0.3,
+        stop_ctrl_tid: int | None = None,
     ) -> dict:
         """Compute RACA per-turn reward data (Phase 2 of the algorithm).
 
@@ -580,12 +598,48 @@ class AgenticExecutor:
 
                 turn_data[tid] = {"role": role, "round": rnd_idx, "strategy": strategy, "reward": reward}
 
-        # Controller efficiency reward: only the last controller turn gets the real signal.
-        t_stop = len(round_records)
-        if last_ctrl_tid is not None:
-            efficiency = alpha * float(is_correct) * (max_rounds - t_stop) / max(max_rounds, 1)
-            ctrl_reward = float(is_correct) + efficiency - beta * (1.0 - float(is_correct))
-            turn_data[last_ctrl_tid]["reward"] = ctrl_reward
+        # ── Controller outcome reward ────────────────────────────────────────
+        # Exactly one controller turn carries the episode signal (every other
+        # controller turn keeps its 0.0 placeholder), so the trainer's per-episode
+        # sum over controller rewards stays equal to this single value.
+        #
+        # The turn that ends the episode must own the consequence of ending it:
+        # prefer the explicit "stop" turn, and fall back to the last working turn
+        # for episodes that ended by exhausting max_rounds. Previously the stop
+        # turn never entered round_records, so it got no reward entry at all while
+        # the unused-budget bonus landed on an earlier "continue" turn. An episode
+        # that stopped on round 0 produced entirely empty turn data and was then
+        # dropped from the batch, so immediate-stop rollouts trained on nothing.
+        t_stop      = len(round_records)
+        remaining   = (max_rounds - t_stop) / max(max_rounds, 1)
+        outcome_tid = stop_ctrl_tid if stop_ctrl_tid is not None else last_ctrl_tid
+
+        if outcome_tid is not None:
+            # The unused-round term is symmetric: saved rounds are a bonus when
+            # the answer is right and an equal-magnitude penalty when it is wrong.
+            # Its coefficient is (p*alpha - (1-p)*gamma), so with gamma == alpha
+            # early stopping only pays off once the answer is more likely right
+            # than wrong. The old one-sided form added the bonus but left the
+            # wrong-answer cost flat, making "stop now" weakly dominant at every
+            # confidence level — which drove avg_turns to the floor.
+            correct = float(is_correct)
+            ctrl_reward = (
+                correct
+                + alpha * correct * remaining
+                - beta  * (1.0 - correct)
+                - gamma * (1.0 - correct) * remaining
+            )
+            entry = turn_data.get(outcome_tid)
+            if entry is None:
+                # Stop turns are absent from round_records — create their entry.
+                turn_data[outcome_tid] = {
+                    "role":     "controller",
+                    "round":    t_stop,
+                    "strategy": "stop",
+                    "reward":   ctrl_reward,
+                }
+            else:
+                entry["reward"] = ctrl_reward
 
         return turn_data
 

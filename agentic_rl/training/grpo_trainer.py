@@ -56,10 +56,16 @@ class GRPOAgenticTrainer:
 
         mu_ctrl  = float(np.mean(ctrl_episode_rewards))
         sig_ctrl = float(np.std(ctrl_episode_rewards))
-        ctrl_adv = [
-            (r - mu_ctrl) / max(sig_ctrl, delta)
-            for r in ctrl_episode_rewards
-        ]
+        # Zero-variance group: every rollout for this question earned the same
+        # controller reward, so the episode-level comparison carries no signal.
+        # Emitting zeros anyway would still cost a forward+backward pass per turn
+        # and would inflate `total_valid`, shrinking the gradient contributed by
+        # the groups that do discriminate. Drop the level instead of scaling 0 by
+        # the variance floor.
+        ctrl_adv = (
+            [(r - mu_ctrl) / sig_ctrl for r in ctrl_episode_rewards]
+            if sig_ctrl > delta else None
+        )
 
         # ── Layer 2: step-level anchor groups for prop/crit/verif ───────────
         # Anchor: (role, controller_strategy) — groups turns by the cognitive
@@ -81,11 +87,14 @@ class GRPOAgenticTrainer:
             if len(group) < 2:
                 continue
             rewards = [r for _, _, r in group]
-            mu  = float(np.mean(rewards))
             sig = float(np.std(rewards))
-            denom = max(sig, delta)
+            if sig <= delta:
+                # Same reasoning as Layer 1: an anchor group whose members all
+                # scored identically offers no comparative signal.
+                continue
+            mu = float(np.mean(rewards))
             for ep_idx, tid, r in group:
-                step_adv[(ep_idx, tid)] = (r - mu) / denom
+                step_adv[(ep_idx, tid)] = (r - mu) / sig
 
         # ── Build per-episode advantage dicts ────────────────────────────────
         per_ep_adv = [{} for _ in range(N)]
@@ -94,7 +103,8 @@ class GRPOAgenticTrainer:
             for tid, v in ep.get("raca_turn_data", {}).items():
                 if v["role"] == "controller":
                     # All controller turns in this episode share the episode advantage.
-                    per_ep_adv[ep_idx][tid] = ctrl_adv[ep_idx]
+                    if ctrl_adv is not None:
+                        per_ep_adv[ep_idx][tid] = ctrl_adv[ep_idx]
                 else:
                     # Use step advantage if the anchor group had enough members.
                     sa = step_adv.get((ep_idx, tid))
@@ -123,21 +133,29 @@ class GRPOAgenticTrainer:
         # ── compute RACA advantages per group ────────────────────────────────
         all_episodes:    list = []
         all_per_turn_adv: list = []
+        n_groups      = 0   # question-groups eligible for advantage computation
+        n_groups_kept = 0   # ...that produced at least one usable advantage
 
         for episode_group in batch_rollouts:
             if len(episode_group) < 2:
                 continue
+            n_groups += 1
             per_ep_adv = self._compute_raca_advantages(episode_group)
+            kept = 0
             for ep, adv in zip(episode_group, per_ep_adv):
                 if adv:   # skip episodes where no turn got an advantage
                     all_episodes.append(ep)
                     all_per_turn_adv.append(adv)
+                    kept += 1
+            if kept:
+                n_groups_kept += 1
 
         if not all_episodes:
             if self.vllm_engine is not None:
                 self.vllm_engine.sync_lora(self.model)
             return {"loss": 0.0, "mean_reward": 0.0, "accuracy": 0.0,
-                    "kl": 0.0, "skipped": True}
+                    "kl": 0.0, "skipped": True,
+                    "groups_total": n_groups, "groups_kept": 0}
 
         # Logging
         n_correct  = sum(ep["is_correct"] for ep in all_episodes)
@@ -149,7 +167,8 @@ class GRPOAgenticTrainer:
             for ep in all_episodes
         ]))
         print(f"  [rollout] correct={n_correct}/{len(all_episodes)} "
-              f"mean_ctrl_reward={mean_r:.3f}", flush=True)
+              f"mean_ctrl_reward={mean_r:.3f} "
+              f"groups={n_groups_kept}/{n_groups}", flush=True)
 
         # Pre-count total valid turns for normalization
         total_valid = max(
@@ -201,6 +220,8 @@ class GRPOAgenticTrainer:
             "mean_reward": mean_r,
             "accuracy":    mean_acc,
             "kl":          total_kl / max(total_n_valid, 1),
+            "groups_total": n_groups,
+            "groups_kept":  n_groups_kept,
         }
 
     # ── Per-turn PPO loss ────────────────────────────────────────────────────

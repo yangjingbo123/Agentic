@@ -257,6 +257,6 @@ RL 训练前使用监督微调（SFT）对 Proposer adapter 预热，checkpoint 
 | GSM8K train | `data/gsm8k_train.jsonl` | RL 训练（默认） |
 | GSM8K test | `data/gsm8k_test.jsonl` | 评估 |
 | Math train | `data/math_train_rl.jsonl` | 可选训练集 |
-| Math test | `data/math_test_clean.jsonl` | 可选评估集 |
+| Math test | `data/math_test.jsonl` | 可选评估集 |
 
 数据格式：`{"question": ..., "answer": ...}`

@@ -432,7 +432,7 @@ $$\mathcal{L}_{\text{SFT}} = -\frac{1}{|R|}\sum_{k \in R} \log \pi_\theta(a_k \m
 | GSM8K train | `data/gsm8k_train.jsonl` | RL 训练（默认配置）|
 | GSM8K test | `data/gsm8k_test.jsonl` | 评估 |
 | MATH train | `data/math_train_rl.jsonl` | 可选训练集 |
-| MATH test | `data/math_test_clean.jsonl` | 可选评估集 |
+| MATH test | `data/math_test.jsonl` | 可选评估集 |
 
 数据格式：`{"question": "...", "answer": "..."}`
 

@@ -10,3 +10,6 @@ outputs/
 .hydra/
 *.log
 diag-*.out
+
+# 本地污染数据备份（旧版本可从 git 历史取回，不入库）
+data/backup_contaminated_*/

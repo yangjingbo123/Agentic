@@ -8,7 +8,7 @@ import random
 import time
 from openai import OpenAI
 
-API_KEY = "sk-YOCWM1eLkRSrDRH0160c881f47B2475aA7Fe5aD8AbF48eD5"
+API_KEY = os.environ.get("OPENAI_API_KEY", "")
 BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.vveai.com/v1")
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 

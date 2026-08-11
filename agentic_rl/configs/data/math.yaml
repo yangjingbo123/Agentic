@@ -1,3 +1,3 @@
-train_path: "data/math_train_rl.jsonl"
-test_path: "data/math_test_clean.jsonl"
+train_path: "data/math_train_rl.jsonl"   # 由 data/derive_rl_split.py 生成（主集去 SFT 泄漏）
+test_path: "data/math_test.jsonl"         # 直接用主测试集；旧 _clean 文件已废弃
 sft_path: "data/sft_train.jsonl"

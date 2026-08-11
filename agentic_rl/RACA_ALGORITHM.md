@@ -1,7 +1,14 @@
 # RACA：Role-Aware Credit Assignment
 
 > 本文件是当前实验的算法纲领，所有代码修改均以此为准。
-> 最后更新：2026-07-19
+> 最后更新：2026-08-11
+>
+> **版本说明**：本文档包含两个版本。下文首先是 v1 原文（保留不动，对应已完成的
+> ex6/ex8 实验），文末为 **RACA v2**（当前生效的纲领，所有新代码修改以 v2 为准）。
+
+---
+
+# 第一版（v1，原文保留）
 
 ---
 
@@ -461,3 +468,756 @@ RACA：Role-Aware Credit Assignment for Multi-Agent Reasoning
   └─────────────────┴──────────────────┴────────────────────────────────────────┴────────────────────────────┘
 
   核心论文贡献一句话：在可验证结果的结构化多角色协作推理中，用任务内生的语义结构（角色-轮次）作为 credit 分解的自然锚点，结合精确的逐轮验证信号，无需额外模型调用或环境重执行即可实现精确的两层信用分配。
+
+---
+---
+
+# 第一版实施与修复记录（v1.x，后补留档）
+
+> 本节为后补记录：v1 阶段在代码层面修复的关键问题。
+> 这些修复均已在当前代码中生效，**v2 全部继承**。
+>
+> **两批修复，证据来源不同：**
+>
+> | 批次 | 内容 | 依据 |
+> |------|------|------|
+> | A（基础正确性） | Fix 3~6、9~12、14~16 | commit `3611725` 的 git diff |
+> | B（行为诊断） | Fix 1、2、7、17 | commit `110fb86` + `train_20260807_062356.log`（200 步） |
+>
+> 每条 Fix 均已用 `git show <commit>^:<file>` 对比修改前后代码验证。
+> **Fix 13 经核验为误记，已作废**（详见该条）。
+>
+> 批次 B 的三个观测事实（下文多处引用）：
+> - `eval_avg_turns` 8.0 → 2.0 在 50 步内坍塌并永久锁死
+> - `loss` 从 −15.7 衰减到 ≈0.0000（step 60 之后基本空转）
+> - `eval_acc` 200 步仅 0.650 → 0.693（峰值 0.710@step180）
+>
+> ⚠️ **另有一项代码已修但数据未重新生成的遗留问题，见本节末尾「遗留问题」。**
+
+### Fix 1：stop turn 零梯度（最严重）
+
+- **症状**：controller 输出 `strategy: stop` 的 turn 从不进入 round_records，
+  因此没有 reward 条目、没有 advantage、没有梯度——**controller 最关键的一个动作
+  （终止决策）完全没被训练**；而省轮 bonus 却落在更早的 "continue" turn 上，
+  credit 错位。更极端地，第 0 轮就 stop 的 episode 产生完全空的 turn data，
+  整条 rollout 被从 batch 中丢弃。
+- **修复**：记录 `stop_ctrl_tid`，episode 结局奖励优先赋给显式 stop 的那个 turn
+  （耗尽 max_rounds 时回退到最后一个工作 turn）；stop turn 不在 round_records
+  时为其单独创建条目（strategy="stop"）。
+- **位置**：`agentic_executor.py` 的 `stop_ctrl_tids` 追踪与
+  `_compute_raca_turn_data` 的 outcome_tid 逻辑。
+
+### Fix 2：单边效率奖励导致 avg_turns 坍塌 → 引入 γ 对称惩罚
+
+- **症状**：原公式省轮只有 bonus（答对才有），答错的成本与用了几轮无关，
+  使得"立刻 stop"在任何置信水平下都是**弱占优**策略。日志实证：
+  `eval_avg_turns` 8.0 → 2.0（50 步内坍塌并锁死），critic/verifier 的修订
+  循环被完全绕过，多智能体管线退化成单次 proposer 直出。
+- **数值证据**（α=0.3, β=0.2, T_max=4，修复前公式）：
+
+  | p(correct) | E[r \| stop@1] | E[r \| stop@4] | 占优方 |
+  |---|---|---|---|
+  | 0.3 | +0.2275 | +0.1600 | 早停 |
+  | 0.5 | +0.5125 | +0.4000 | 早停 |
+  | 0.7 | +0.7975 | +0.6400 | 早停 |
+
+  答对时早停多拿 +0.225，答错时代价恒为 −β 与轮次无关 → 早停在**所有**
+  置信水平下都不劣。这不是调参问题，是奖励结构的定性缺陷。
+- **修复**：新增 `ctrl_gamma`（默认 0.3）：省下的轮次在答对时是 bonus（α 项）、
+  答错时是等强度惩罚（γ 项）。省轮项系数变为 `p·α − (1−p)·γ`，γ=α 时
+  分界点落在 p=0.5——只有答案更可能对时提前停才划算。
+  修复后实测：p=0.3 继续工作赢 / p=0.5 打平 / p=0.7 早停赢。
+- **位置**：`agentic_executor.py` `_compute_raca_turn_data` 的 outcome 奖励计算。
+
+**⚠️ 本文档 v1 正文 §2.4 的两处论断已被实验推翻**（原文按"保留不动"未改，在此更正）：
+
+1. §2.4 表格"任意轮答错 → −β = −0.2"——正是这个"与轮次无关"使早停无成本。
+2. §2.4 结尾"梯度差 ≥ 1.2，确保'求对'始终优先于'求快'，消除原公式的
+   dead zone 问题"——**该结论不成立**。底薪项 c^i 确实消除了原始公式
+   （见文末"来源"节 §2.4：`α·c·rem − β·(1−c)`，答对但用满轮次得 0）的
+   dead zone，但"求对优先于求快"只保证了答对的**绝对**收益更高，
+   并未阻止在**同等正确性下**无条件偏好求快。两者是不同的性质，
+   混淆导致了坍塌。
+
+**Controller 公式演化三阶段**（便于对照）：
+
+```
+① 原始（文末"来源"节 §2.4）  α·c·rem − β·(1−c)                    有 dead zone
+② v1 正文 §2.4（加底薪）      c + α·c·rem − β·(1−c)                 无 dead zone，但早停弱占优
+③ 修复后 / v2 §4.5（加 γ）    c + α·c·rem − β·(1−c) − γ·(1−c)·rem   早停仅在 p>0.5 时划算
+```
+
+### Fix 3：critic_flagged 几乎恒为 True → 鲁棒解析
+
+- **症状**：旧判定逻辑是 `"无错误" not in output`。交互响应会覆盖
+  `role_outputs["critic"]`，而响应文本不遵循 critic 标准格式、几乎不含
+  "无错误"三字，导致 critic_flagged 几乎恒为 True，四格矩阵奖励的输入信号
+  失真。
+- **修复**：`_critic_found_errors` 改为专门解析"错误分析"小节；小节缺失
+  （如交互响应）时保守地返回 False。
+- **位置**：`agentic_executor.py` `_critic_found_errors`。
+- **备注**：这是对症状的补丁；根因（响应覆盖主输出）由 v2 的
+  primary/responses 双槽存储根治。
+
+### Fix 4：controller turn 未进 round_records → 无 RACA 信号
+
+- **症状**：round_turn_ids 只收集工作角色的 turn，controller 的 continue turn
+  不在其中，拿不到奖励条目。
+- **修复**：每轮 round_turn_ids 以 `(ctrl_tid, "controller")` 初始化，
+  continue turn 拿 0.0 占位奖励、共享 episode 级 advantage（Layer 1 路由）。
+- **位置**：`agentic_executor.py` 两条执行路径（batch / 单 episode）均已处理。
+
+### Fix 5：Layer 2 anchor 从 (role, round) 改为 (role, strategy)
+
+- **症状**：初始设计（本文档末尾"来源"节 §4.2）用 round=t 做锚点，但 t≥2 时
+  不同 rollout 的黑板状态已分叉（有无 critic 干预经历不同），组内不再是
+  控制变量比较。
+- **修复**：锚点改为 controller 输出的 strategy 标签（v1 正文 §3.2 已按修复后
+  口径书写）。
+- **备注**：v2 进一步把标签改为从黑板状态机械推导的 σ（§3），消除策略漂移。
+
+### Fix 6：optimizer / grad clip 只收集激活 adapter → 非激活 adapter 梯度污染
+
+- **症状**：PEFT `set_adapter()` 只把激活 adapter 的 requires_grad 设为 True。
+  若仅收集 requires_grad=True 的参数，非激活 adapter 既不被
+  `optimizer.step()` 更新、也不被 `zero_grad()` 清零，梯度跨 step 持续累加。
+- **修复**：optimizer 构造与 `clip_grad_norm_` 均改为收集全部 4 个 adapter 的
+  `lora_parameters()`，不依赖 requires_grad。
+- **位置**：`grpo_trainer.py` `__init__` 与 `update`。
+
+### Fix 7：零方差组发零优势 → 直接丢弃该层/该组
+
+- **症状**：全对/全错的组若用方差下界发零优势，仍要为每个 turn 跑
+  forward+backward，且膨胀 total_valid，稀释有真实信号的组的梯度。
+- **修复**：Layer 1 零方差时整层丢弃（ctrl_adv=None）；Layer 2 anchor 组
+  σ≤δ 或 |G|<2 时跳过该组；无任何有效 advantage 的 episode 从 batch 剔除。
+- **位置**：`grpo_trainer.py` `_compute_raca_advantages` / `update`。
+
+### Fix 8：数值稳定性防护（NaN/Inf 与 log_ratio 飞车）
+
+- **症状**：训练中出现过 NaN loss（见 diagnose_nan.py 系列诊断脚本）与
+  极端 importance ratio 导致的梯度爆炸。
+- **修复**：① 每 episode 更新前检查全部 LoRA 权重有限性，NaN/Inf 则跳过；
+  ② rollout 旧 log_probs 过 `nan_to_num`；③ |mean log_ratio| > 50 的 turn
+  直接跳过；④ new_lps 非有限则跳过该 turn；⑤ 全局 grad clip（max_norm=1.0）。
+- **位置**：`grpo_trainer.py` `_compute_loss`。
+
+### Fix 9：SFT checkpoint 路径不匹配 → 静默跳过（实际用随机 LoRA 训练）
+
+- **症状**：实际 checkpoint 目录结构是嵌套的 `{sft}/{role}/{role}/`，
+  而加载代码只找扁平路径，找不到时**静默跳过**。后果：4 个 adapter 全是
+  随机初始化的 LoRA，RL 训练从头开始而非从 SFT 起点——但日志里看不出异常。
+- **修复**按顺序搜索嵌套 `{sft}/{role}/{role}/` → 扁平 `{sft}/{role}/` →
+  顶层 `{sft}/`；三者均不存在时 `raise FileNotFoundError` 而非跳过。
+  成功时打印每个 adapter 的已加载参数数（现为 144）作为可验证凭据。
+- **位置**：`llm/trainable_llm.py` `load_trainable_models`。
+
+### Fix 10：`extract_math_answer` 嵌套花括号截断（污染 ground truth）
+
+- **症状**：旧正则 `r"\\boxed\{([^}]+)\}"` 遇到 `\boxed{\frac{1}{2}}` 只能捕到
+  `\frac{1`——`[^}]` 在第一个 `}` 就停了。ground truth 被截断，
+  **模型答对也会被判错**。
+- **实测影响**（统计 answer 字段花括号不平衡的比例）：
+
+  | 数据文件 | 被截断 | 占比 |
+  |---|---|---|
+  | `math_train_rl.jsonl`（训练集） | 1303/5185 | **25.1%** |
+  | `math_test_clean.jsonl`（测试集） | 942/3663 | **25.7%** |
+  | eval 子集（Level5 前 300） | 61/300 | **20.3%** |
+
+  典型样例：`'\\frac{1'`、`'\\dfrac{9'`、`'(-\\sqrt{3'`、`'\\frac{2\\sqrt{53'`。
+- **修复**：改为花括号深度匹配解析器（depth 计数），不平衡时返回空串。
+- **位置**：`data/prepare_data.py` `extract_math_answer`。
+- **⚠️ 代码已修但数据未重新生成，见本节末尾「遗留问题」。**
+
+### Fix 11：`normalize_answer` 有损比较 → `math_equal`
+
+- **症状**：旧比较先过 `normalize_answer`（剔除所有非数字字符），
+  `\frac{1}{2}` 变成 `"12"`，与整数 `12` **假阳性匹配**。该比较函数是
+  p^i_t / c^i 的唯一来源，因此污染的是**所有四个角色奖励的输入信号**。
+- **修复**：新增 `math_equal()`：先试数值比较（支持 `\frac{a}{b}`、`a/b`、
+  小数、`\text{...}` 包裹），仅在无法提取数值时才回退到字符串归一化。
+  `normalize_answer` 保留但加上有损警告注释。
+- **位置**：`agents/agentic_executor.py` `_extract_number` / `math_equal`；
+  调用方 executor（3 处）与 `evaluate.py` 均已替换。
+
+### Fix 12：eval 用采样解码（temperature 硬编码 1.0）
+
+- **症状**：temperature 在 worker 层硬编码为 1.0，eval 与训练用同一套采样参数。
+  eval_acc 带量化噪声、不可复现，跨 step 比较的差异可能只是采样注入。
+- **修复**：`AgenticExecutor` 新增 `eval_mode` 参数，
+  `self.temperature = 0.0 if eval_mode else 1.0`；temperature 逐层透传
+  executor → `vllm_engine` → `vllm_worker` 的 `SamplingParams`。
+  `train.py` / `evaluate.py` / `evaluate_baseline.py` 的 eval 路径均传
+  `eval_mode=True`（贪心解码）。
+- **位置**：`agentic_executor.py`、`llm/vllm_engine.py`、`llm/vllm_worker.py`。
+
+### Fix 13（作废）
+
+此编号原记为"`MultiVLLMEngine.sync_lora` 并发竞态"，**经 git 核验为误记，已作废**。
+
+实际情况：`sync_lora` 从来就是串行的（`git show 3611725^` 确认）：
+
+```python
+def sync_lora(self, model):          # 修改前，已是串行
+    for eng in self.engines:
+        eng.sync_lora(model)
+    self._lora_loaded = self.engines[0]._lora_loaded
+```
+
+那个 `ThreadPoolExecutor` 属于同文件的 `generate_batch`，与 `sync_lora` 无关。
+commit 3611725 对该函数**只添加了解释性 docstring**（说明为何不该改成并发），
+未修正任何缺陷。编号保留空位以免打乱下文引用。
+
+### Fix 14：KL 项恒为 0（根本没有参考前向）
+
+- **症状**：日志里 `kl` 一直是 0.0——不是策略没漂，而是代码里压根没有算
+  reference log-probs，KL 惩罚项不存在。策略可以无限远离 base model（熵崩塌）。
+- **修复**：在 `_compute_loss` 里用 `model.as_ref()`（`disable_adapter_layers()`）
+  + `torch.no_grad()` 做一次 base model 前向，
+  `kl = mean(new_logprob − ref_logprob)`，
+  `turn_loss = pg_loss + kl_coef · kl`；新增 `kl_coef`（默认 0.04）。
+  代价：每 turn 多一次前向。
+- **位置**：`grpo_trainer.py` `_compute_loss`；`configs/agentic/default.yaml`。
+- **备注**：修复后日志中 kl 从 0.032 漂到 0.167（200 步）。大部分漂移发生在
+  轮次坍塌期（step 30～60）；Fix 1/2 生效后 KL 压力应自然减小。
+  若仍偏高可考虑 kl_coef → 0.1 或自适应 KL。
+
+### Fix 15：LoRA adapter dtype 不统一（F32 混入 bf16）
+
+- **症状**：`get_peft_model` 的 `autocast_adapter_dtype` 只作用于首个 adapter
+  （proposer），其余三个由 `add_adapter` 创建的 adapter 可能留在 F32，
+  与 bf16 base 混算。
+- **修复**：`add_adapter` 后统一 cast：取 `base_dtype = next(base.parameters()).dtype`，
+  将所有 `lora_` 参数 `.to(base_dtype)`。
+- **位置**：`llm/trainable_llm.py` `load_trainable_models`。
+
+### Fix 16：checkpoint 加载按 requires_grad 过滤 → 只载入 1/4 adapter
+
+- **症状**：与 Fix 6 同根因（`set_adapter()` 只让激活 adapter `requires_grad=True`），
+  但发生在**权重加载**路径：resume 与 eval 用 `param.requires_grad` 筛选要
+  `copy_` 的参数，导致只有当前激活的那一个 adapter 被真正载入，
+  其余三个静默保持随机初始值。
+- **修复**：筛选条件改为 `"lora_" in name`，不依赖 requires_grad。
+- **位置**：`train.py` resume 分支；`evaluate.py` checkpoint 加载。
+- **备注**：另修 `evaluate_baseline.py` 的返回值解包错误
+  （`models, _, tokenizer = ...` → `model, tokenizer = ...`，
+  `load_trainable_models` 只返回 2 个值），否则 baseline 评测直接报错。
+
+### Fix 17：无梯度的空步消耗 step 预算
+
+- **症状**：`step += 1` 无条件执行。Fix 7 丢弃退化组后，整批全退化时
+  本步什么都没学，但照样计入 `max_steps=200`——200 步里可能有一部分是空转。
+  另一条路径（无组满足 `len(valid)>=2`）虽不计步但完全静默。
+- **修复**：两条无梯度路径统一走 `note_skip()` 记账，`step` 不递增；
+  累计 `skipped_batches` 并在下次真实 step 写入 wandb。
+  **因移除了保证终止的无条件递增**，新增连续跳过上限
+  `max_consecutive_skips=50`，超限 `raise` 而非静默 break
+  （避免保存坏 checkpoint 却看似训练成功）。
+  skipped 分支不再 `wandb.log`，避免向已写过的 step 重复写入。
+- **位置**：`train.py` 训练循环；`configs/agentic/default.yaml`。
+- **副作用**：`max_steps` 现在表示**200 次真实更新**而非 200 次取批尝试，
+  退化率高时 wall-clock 会变长，不可与旧实验直接比耗时。
+
+### 可观测性新增（配合 Fix 7/17）
+
+| 输出 | 位置 | 用途 |
+|------|------|------|
+| `groups=kept/total` | stdout 每步 | 退化组比例 |
+| `[skip] ...` | stdout | 无梯度批次及原因 |
+| `group_keep_rate` | wandb | 持续低于 0.4 则需 DAPO 动态采样 |
+| `skipped_batches` | wandb | 累计丢弃批次 |
+
+### 小结
+
+按影响层次归类（而非发现顺序）：
+
+| 层次 | # | 问题 | 影响面 | v2 后续动作 |
+|------|---|------|--------|----------------|
+| **数据/监督信号** | 10 | `\boxed{}` 嵌套截断 | 25% ground truth 错误 | 继承（⚠️ 数据待重生） |
+| | 11 | `normalize_answer` 有损比较 | 所有角色奖励的输入信号 | 继承 |
+| | 3 | critic_flagged 恒为 True | critic 四格矩阵输入失真 | 继承；根因由 v2 双槽存储根治 |
+| **权重加载** | 9 | SFT 路径静默跳过 | 实际从随机 LoRA 开始训练 | 继承 |
+| | 16 | 加载按 requires_grad 过滤 | 只载入 1/4 adapter | 继承 |
+| | 15 | adapter dtype 不统一 | F32/bf16 混算 | 继承 |
+| **训练正确性** | 6 | optimizer 只收集激活 adapter | 非激活 adapter 梯度跳 step 累加 | 继承 |
+| | 14 | KL 项恒为 0 | 策略无约束漂移、熵崩塌风险 | 继承 |
+| | 8 | NaN / log_ratio 飞车 | 训练中断或梯度爆炸 | 继承 |
+| **credit 分配** | 1 | stop turn 零梯度 | controller 终止决策不可训练 | 继承；v2 中 stop 更成为其唯一职责 |
+| | 4 | controller turn 未进 round_records | controller 无 Layer 1 信号 | 继承 |
+| | 2 | 单边省轮奖励 | 早停弱占优、avg_turns 坍塌 | 继承（γ 项入 v2 公式） |
+| | 5 | anchor 用 round | 组内不可比 | v2 升级为机械 σ |
+| **梯度质量/流程** | 7 | 零方差组发零优势 | 稀释有效组梯度（loss→0） | 继承 |
+| | 17 | 空步消耗 step 预算 | 200 步中含空转步 | 继承 |
+| **评估可信度** | 12 | eval 用采样解码 | eval_acc 带噪、不可复现 | 继承 |
+
+---
+
+## ⚠️ 遗留问题：代码已修，数据未重新生成
+
+> **状态：已解决（2026-08-11，处理过程见本节末尾）。**
+
+Fix 10 修了 `extract_math_answer` 的代码，**但数据文件是修复前生成的，
+从未重跑**。时间戳证据：
+
+```
+data/math_test_clean.jsonl   Aug 7 10:39:13   ← 数据生成
+data/math_train_rl.jsonl     Aug 7 10:39:14   ← 数据生成
+data/prepare_data.py         Aug 7 11:07:16   ← 代码修复（比数据晚 28 分钟）
+```
+
+而 `configs/data/math.yaml` 仍指向这两个文件：
+
+```yaml
+train_path: "data/math_train_rl.jsonl"    # 25.1% ground truth 被截断
+test_path:  "data/math_test_clean.jsonl"  # 25.7% 被截断；eval 子集 20.3%
+```
+
+### 对已完成实验的影响
+
+`train_20260807_062356.log`（200 步）是在这份污染数据上跑的：
+
+1. **eval_acc 存在结构性上限**：eval 子集 20.3% 的题 ground truth 残缺，
+   模型答对也被判错 → **天花板约 79.7% 而非 100%**。
+   实测 eval_acc 0.693 对应有效题目上的真实准确率 ≈ 0.693/0.797 ≈ **87%**。
+2. **与 Fix 7 叠加**：这 25% 的"死题"模型永远答不对 → 组内 16 个 rollout 全错
+   → 零方差 → 被退化组过滤丢弃。这是 `group_keep_rate` 的一个**确定性**
+   损耗源，与策略好坏无关。
+3. **少量假阳性**：截断后偶尔反而匹配（如 gt `'\frac{1'` 提取为 1.0，
+   模型输出 `1` 也得 1.0 → 判对，而正确答案是 0.5）。主要是假阴性，
+   但假阳性同样存在。
+
+### ⚠️ 重生流程比想象的麻烦：派生文件无生成脚本
+
+不能只跑 `python data/prepare_data.py` 就事——它**只生成**
+`math_train.jsonl` / `math_test.jsonl`，而配置实际使用的是派生文件
+`math_train_rl.jsonl` / `math_test_clean.jsonl`，**仓库里没有任何脚本生成它们**
+（已 grep 全仓库确认）。
+
+实测派生关系：
+
+```
+math_train.jsonl   5586 条  →  math_train_rl.jsonl    5185 条  （剔除 401）
+math_test.jsonl    3669 条  →  math_test_clean.jsonl  3663 条  （剔除 6）
+
+✓ 严格子集（question 集合上）
+✓ 各 level 按比例减少（L5 2304→2140, L4 1690→1577, L3 1592→1468）
+✗ 不是去重（原文件 question 本身无重复）
+✗ 不是"剔除非纯数值 answer"（被剔的含纯数值 '6'/'9'/'-30'，
+   保留的含 1783 条 LaTeX）
+✗ 不是"剔除空 answer"（被剔的 401 条中 0 条为空）
+```
+
+**派生规则已破案（2026-08-11 实测）：是 SFT 数据泄漏防护。**
+
+`generate_sft.py` 用 `seed=42` 从 `math_train.jsonl` 采样 500 题生成 SFT 数据
+（成功 372 条）。实测剔除的 401 题中：
+
+```
+361/401 (90%) ∈ seed42/n500 采样集
+290/401 (72%) ∈ SFT 成功的 372 题
+test 剔除的 6 条：与 train、SFT 均零重叠（3 条是截断坏答案，疑似手工清理）
+```
+
+→ `math_train_rl` 的语义就是 **"RL 训练集 = 主训练集 − SFT 用过的题"**。
+未精确吻合的原因：当前 `math_train.jsonl` 是 10:39 重新生成的版本，与当初
+SFT 采样时的文件顺序/条数已不同，seed42 无法复现当时的采样——
+**精确剔除列表不可复现，但语义规则清楚，可按语义重建**（以 `sft_train.jsonl`
+中实际出现的 372 个 question 为剔除依据）。
+
+### ❌ 早先设想的"改配置指向主文件"方案不成立
+
+实测主文件同样污染：`math_train.jsonl` 截断率 **25.1%**（1404/5586）、
+`math_test.jsonl` **25.8%**（945/3669）——它们与派生文件是同一时刻（10:39）、
+用修复前代码生成的。只改配置指向、不重跑脚本，截断率一点不变，
+还会引入 SFT 泄漏（372 题回到 RL 训练集）。
+
+### ✅ 最终处理方案（已执行并验收，2026-08-11）
+
+```
+1. 重跑 python data/prepare_data.py（修复后代码）→ 干净主文件
+2. 新增 data/derive_rl_split.py（入库，消除"无脚本可复现"悬案）：
+   - 过滤空 answer（修复后解析器对不平衡花括号返回空串）
+   - 剔除 sft_train.jsonl 中实际出现的 question（防泄漏）
+   - 重建 math_train_rl.jsonl
+3. test_path 改指 math_test.jsonl（_clean 的6条剔除无泄漏依据，
+   坏答案在修复后自然消失，无保留价值）
+4. 旧污染文件备份在 data/backup_contaminated_20260807/（留作对照证据）
+```
+
+**执行结果（实测）**：
+
+```
+math_train.jsonl     5586 条  花括号不平衡 0（修复前 1404/25.1%）、空答案 4
+math_test.jsonl      3669 条  花括号不平衡 0（修复前  945/25.8%）、空答案 0
+math_train_rl.jsonl  5265 条  ＝ 5586 − 4 空答案 − 317 SFT 泄漏题
+RL 集 ∩ SFT 题目 ＝ 0；eval 子集 Level5[:300] 坏答案 ＝ 0（修复前 61/20.3%）
+修复样例：'\frac{1' → '\frac{1}{2}'，'\sqrt{2' → '\sqrt{2}+1'
+```
+
+注：新 RL 集 5265 条 vs 旧 5185 条——SFT 的 372 题中只有 317 题存在于当前主集
+（其余 55 题来自早期版本的主文件），旧的 401 剔除列表本就含不可复现成分，
+题目数差异符合预期。
+
+### 对实验可比性的影响（重要）
+
+1. **旧 checkpoint 与旧 eval_acc 均不可与新数据实验跨比**，需重跑 baseline。
+2. eval 子集是"Level 5 按文件顺序取前 300"，重新生成会改变文件顺序 →
+   **eval 题目集合本身也变了**。数据修复前后的曲线画在同一张图上时必须标注分界。
+3. SFT 数据（`sft_train.jsonl`）由外部 API 生成，**不经过 `extract_math_answer`**，
+   不受本问题影响，无需重生；且其 question 列表是去泄漏剔除的依据，**不可删改**。
+
+---
+---
+
+# 第二版（RACA v2，当前生效纲领）
+
+> 最后更新：2026-08-11
+> **核心卖点重定义**：不是"系统里有交互"，而是"交互作为显式动作被因果信用训练出来，
+> 且有行为演化证据"。v2 把 agent 间通信建模为带因果 credit 的一等动作——
+> 不仅评估说了什么，还评估该不该说、说给谁听、说完有没有用。
+
+---
+
+## 0. v2 相对 v1 的变更总览
+
+| # | 变更点 | v1 | v2 | 动机 |
+|---|--------|----|----|------|
+| 1 | Controller 定位 | strategy + focus + stop 三职责 | **仅 continue/stop**（元认知终止者） | focus 被 proposer fallback 架空；路由与交互机制冲突 |
+| 2 | 路由方式 | controller focus + 自由交互并存 | **交互是唯一路由机制** | 消除双重路由，交互成为 load-bearing |
+| 3 | 交互决策奖励 | 无（与 reward 零相关） | **交互因果奖励 + 固定成本 −c** | 无成本求助是 free option，会导致交互率饱和 |
+| 4 | 交互响应计分 | 与主 turn 共享 round 奖励（搭便车） | **响应 turn 按角色语义独立计分** | 响应质量需要独立梯度信号 |
+| 5 | 响应存储 | 覆盖 role_outputs（污染解析） | **primary / responses 分槽存储** | 根治 _critic_found_errors 类补丁问题 |
+| 6 | Layer 2 anchor | (role, controller 输出的 strategy) | **(role, 机械推导 σ, is_response)** | controller 标签随策略漂移，机械标签跨阶段可比 |
+| 7 | Anchor 组去重 | 同 episode 同轮多 turn 重复入组 | **按 (episode, round, role) 去重后广播** | 重复样本压低组内方差，稀释真实差异 |
+| 8 | Verifier 地位 | 分数不进任何决策（功能悬空） | **stop 的前置闸门** | 校准能力直接影响系统行为，求助 verifier 有因果通路 |
+| 9 | Critic 末轮奖励 | 真阳性回退用 c^i（幸存者偏差回流） | **末轮真阳性给固定正分** | 末轮无下一轮可影响，不应与结局耦合 |
+| 10 | Critic/Verifier 调用 | 由 focus / 交互随机触发 | **仅按需调用 + ε 强制注入** | 冷启动保护，避免 critic 零训练数据 |
+| 11 | 动作集 | none/request/support/challenge | **none/request/challenge**（删 support） | support 不改变任何状态，是纯噪声动作 |
+
+Controller 奖励公式（底薪 + 效率提成 + 对称惩罚，含 γ 项）**不变**；
+Proposer 逐轮奖励 p^i_t **不变**；Phase 4 更新流程 **不变**。
+
+---
+
+## 1. 系统设定
+
+模型架构不变：冻结 base LLM（Qwen3-8B）+ 4 个独立 LoRA adapter，
+k ∈ {ctrl, prop, crit, verif}。
+
+**角色定位（v2）**
+
+| 角色 | 决策视野 | 唯一职责 | 优势层 |
+|------|---------|---------|--------|
+| Controller | 宏观（episode） | 终止决策：当前答案值得信任吗？再跑一轮值不值？ | Layer 1 |
+| Proposer | 微观（turn） | 生成/改进解法 + 决定是否求助、向谁求助 | Layer 2 |
+| Critic | 微观（turn） | 按需审查错误 + 可要求 proposer 修正 | Layer 2 |
+| Verifier | 微观（turn） | 按需校准置信度，**把守 stop 闸门** | Layer 2 |
+
+决策层次与优势层一一对应：宏观决策（何时终止）用 episode 级 credit，
+微观通信（谁向谁说话）用 step 级 credit + 交互因果奖励。
+
+**新增符号**
+
+| 符号 | 含义 |
+|------|------|
+| σ^i_t | 第 t 轮开始时从黑板机械推导的上下文标签 ∈ {explore, refine, verify} |
+| u^i_t | 1[proposer 第 t 轮发起了交互] |
+| Δp^i_t | 交互后本轮内 proposer 答案的修正效果 |
+| c_int | 交互固定成本（默认 0.05） |
+| λ | 交互奖励合成权重（默认 1.0） |
+| ε_t | 强制注入 critic 审查的概率（随训练衰减） |
+
+---
+
+## 2. 交互协议
+
+### 2.1 每轮流程
+
+```
+1. Controller 看黑板 → continue | stop
+   约束：stop 仅当黑板上存在 verifier 分数；否则强制 continue 或自动触发一次 verify
+2. Proposer（固定起点，focus 逻辑删除）：解题/改进
+   → 输出答案 + 交互决策 {none | request:critic | request:verifier}
+3. 若发起交互 → target 以完整角色格式响应（追加写入，不覆盖）
+4. 响应方可再发起一跳（如 critic 发现错误 → request:proposer 要求修正，
+   proposer 的修正输出作为新 trace 进入多数投票——这是交互影响最终结果的因果通路）
+5. 每轮最多 2 跳；round record 落盘
+```
+
+### 2.2 动作集
+
+```
+action ∈ {none, request, challenge}     # 删除 support（不改变状态的噪声动作）
+target ∈ 另外两个工作角色
+```
+
+### 2.3 存储规则
+
+`role_outputs` 分两个槽：
+- `primary[role]`：该角色本轮的主输出（解析 p_t / flag / score 只用这个槽）
+- `responses[role]`：交互响应列表（独立计分，不参与主输出解析）
+
+### 2.4 冷启动保护（ε 强制注入）
+
+critic/verifier 仅按需调用会导致冷启动死锁：训练初期 proposer 从不求助
+→ critic 永远没有训练数据。解法：
+
+```
+以概率 ε_t 强制注入一次 critic 审查（ε_0 = 0.3，线性衰减至 0.05）
+- 被强制轮次：发起方不计交互决策奖励（决策不是它做的）
+- 响应方正常计分（其 token 仍是 on-policy 的，只有"被调用"这件事是强制的）
+```
+
+---
+
+## 3. 机械 σ 推导（替代 controller strategy 标签）
+
+每轮开始时从黑板状态确定性推导：
+
+```
+σ = explore   若黑板无 trace
+  = refine    若最近一条 critic flag 存在且未被后续 trace 处理
+  = verify    若已有候选答案且无未处理的 flag
+```
+
+**为什么替换**：controller 生成的 strategy 是策略相关的——训练中策略一变，
+anchor 分组的语义就漂移。机械推导的 σ 跨 rollout、跨训练阶段严格可比，
+且不依赖任何模型输出的解析成功率。
+
+---
+
+## 4. Phase 2（v2）：角色奖励 + 交互奖励
+
+### 4.1 Proposer（不变）
+
+```
+r_prop[i, t] = p^i_t
+```
+
+### 4.2 交互发起奖励（新增，核心设计）
+
+交互是一个动作，用它引起的状态变化计分，且**每次发起收固定成本 −c_int**：
+
+```
+发起（u=1）：r_int = −c_int + { +0.3   p_t=0 且交互后修正为对   （有效求助）
+                                0      p_t=0 且交互后仍错       （无效求助）
+                               −0.2   p_t=1                    （画蛇添足）}
+不发起（u=0）：r_int = { 0     p_t=0   （机会成本已隐含在 r_prop 中，不双重计罚）
+                        +0.1   p_t=1   （正确的自信）}
+```
+
+效果窗口：交互链在本轮内结束，"修正为对"以本轮结束时 primary/修正 trace 的
+正确性判定。
+
+**为什么必须有 −c_int**：若求助零成本且偶尔有用，"永远求助"是弱占优策略，
+交互率饱和到 100%，"学会交互"退化为"无脑交互"。加成本后，仅当预期修正收益
+超过通信成本时求助才划算，训练出的才是**选择性交互**——预期看到交互率与 p_t
+的负相关随训练增强，这是卖点的直接证据。
+
+**合成方式**：交互决策与角色输出在同一 turn 生成，该 turn 奖励为
+
+```
+r_turn = r_role + λ · r_int        # λ = 1.0，消融 {0, 0.5, 1.0, 2.0}
+```
+
+λ=0 即"有交互但不训练交互"，正是 v1 行为，作为关键对照组。
+
+### 4.3 Critic（四格矩阵保留，末轮修正）
+
+```
+         flagged (f=1)                        silent (f=0)
+p_t=0    真阳性: 0.3·p_{t+1} + 0.1·(1−p_{t+1})    漏检: 0
+p_t=1    假阳性: −0.2                              真阴性: +0.1
+```
+
+**末轮修正（v2）**：t = t_stop 时真阳性给固定分 **+0.2**，不再回退用 c^i。
+理由：末轮 critic 没有下一轮可影响，用 episode 结局计分会把 v1 批评过的
+幸存者偏差从后门带回来——而末轮恰是 critic turn 占比最高的位置。
+
+critic 作为响应方被调用时，同样按此矩阵计分（p 以它实际审查的那个答案计）。
+
+### 4.4 Verifier（校准奖励不变 + 闸门职责）
+
+```
+r_verif[i, t] = 1 − |v^i_t − p^i_t|
+```
+
+v2 中 verifier 的分数把守 stop 闸门（§2.1），校准好坏直接影响系统终止行为，
+不再功能悬空。
+
+### 4.5 Controller（公式不变）
+
+```
+r_ctrl[i] = c^i
+           + α · c^i · (T_max − t_stop) / T_max          # 效率提成（答对才有）
+           − β · (1 − c^i)                                # 答错惩罚
+           − γ · (1 − c^i) · (T_max − t_stop) / T_max    # 对称的省轮惩罚
+```
+
+α = 0.3，β = 0.2，γ = 0.3。仍仅赋给结束 episode 的那个 controller turn
+（stop turn 优先，耗尽轮次则为最后一个工作 turn）。
+
+### 4.6 交互响应方计分
+
+响应 turn 不再复用 round 奖励，按响应方自己的角色语义在响应后状态上评估：
+
+| 响应方 | 计分方式 |
+|--------|---------|
+| Critic | 四格矩阵，p 以被审查答案计，p_{t+1} 以响应后本轮修正结果计 |
+| Proposer（修正响应） | 新答案的 p（即 math_equal(新答案, a*)） |
+| Verifier | 校准奖励 1 − \|v − p\| |
+
+---
+
+## 5. Phase 3（v2）：两层优势
+
+### 5.1 Layer 1：Episode 级（仅 Controller，不变）
+
+```
+A_E_ctrl[i] = (r_ctrl[i] − μ_ctrl) / max(σ_ctrl, δ)
+```
+
+零方差组照旧丢弃该层（不发零梯度、不稀释 total_valid）。
+
+### 5.2 Layer 2：Step 级 anchor（v2 修改）
+
+**Anchor key**：
+
+```
+s̃ = (role = k, σ, is_response)      # σ 为机械推导标签，is_response ∈ {0, 1}
+```
+
+交互响应 turn 只和交互响应 turn 比，主 turn 只和主 turn 比。
+
+**组内去重（v2 新增）**：同一 episode 同一轮的同角色多个 turn 携带相同 reward
+时，只以一个代表样本入组计算 μ/σ，得到的 advantage 再广播回该轮该角色的全部
+turn。防止重复样本人为压低组内方差。
+
+```
+μ, σ ← mean/std over 去重后的 G_S(k, σ, is_resp)
+A_S = (r − μ) / max(σ, δ)
+|G_S| < 2 或 σ ≤ δ 时跳过该 anchor
+```
+
+### 5.3 路由（不变）
+
+```
+A_total[ctrl, i, t] = A_E_ctrl[i]
+A_total[k,    i, t] = A_S[k, i, σ_t, is_resp]     # k ∈ {prop, crit, verif}
+```
+
+---
+
+## 6. Phase 4：策略更新（不变）
+
+PPO clip loss + KL(对 base model) 惩罚，per-turn 立即 backward，
+梯度按 total_valid 归一化，4 adapter 经 set_adapter() 天然隔离。同 v1。
+
+---
+
+## 7. v2 伪代码
+
+```
+Algorithm RACA-v2
+─────────────────────────────────────────────────────────────────
+Params: N=16, T_max=4, clip_ε=0.2, α=0.3, β=0.2, γ=0.3, δ=1e-4,
+        c_int=0.05, λ=1.0, ε_0=0.3, max_hops=2
+─────────────────────────────────────────────────────────────────
+For each training step:
+
+  ▌ Phase 1: Rollout
+  For each q, i=1..N:
+    For t = 1..T_max:
+      σ^i_t ← derive_sigma(blackboard)                  # §3 机械推导
+      ctrl ← Controller(blackboard)
+      if ctrl == stop and blackboard.has_verifier_score: break
+      prop ← Proposer(q, blackboard)                    # 固定起点
+      记录 primary 输出、交互决策 u^i_t
+      forced ← Bernoulli(ε_t)                           # 冷启动注入
+      if u^i_t or forced:
+        执行交互链（≤ max_hops），响应追加写入 responses 槽
+    记录 {p, f, v, u, Δp, σ, t_stop, c}
+
+  ▌ Phase 2: Rewards
+  r_prop  ← p^i_t
+  r_int   ← 交互因果矩阵（§4.2），forced 轮次发起方不计
+  r_crit  ← 四格矩阵，末轮真阳性固定 +0.2（§4.3）
+  r_verif ← 1 − |v − p|
+  r_ctrl  ← c + α·c·rem − β·(1−c) − γ·(1−c)·rem
+  proposer 主 turn: r_turn ← r_prop + λ·r_int
+  响应 turn: 按 §4.6 独立计分
+
+  ▌ Phase 3: Advantages
+  Layer 1: A_E_ctrl ← 组内归一化 r_ctrl（零方差丢弃）
+  Layer 2: anchor (role, σ, is_response)，组内去重后归一化，广播回 turn
+
+  ▌ Phase 4: Update（同 v1）
+─────────────────────────────────────────────────────────────────
+```
+
+---
+
+## 8. 证据指标（卖点的实验支撑）
+
+训练全程记录：
+
+| 指标 | 定义 | 预期演化 |
+|------|------|---------|
+| 交互发起率 | mean(u^i_t) | 从随机 → 收敛到选择性水平（远低于 100%） |
+| 交互有效率 | P(wrong→right \| 发起交互) | 持续上升 |
+| 选择性 | corr(u^i_t, p^i_t) | 负相关随训练增强（错的时候才求助） |
+| 按 action/target 分解频率 | — | request:critic 在 refine 语境占比上升 |
+| stop 校准 | P(correct \| stop) vs P(correct \| exhausted) | stop 组显著更高 |
+
+**核心消融（三组对照）**：
+
+```
+A. 禁用交互（max_hops=0）
+B. 允许交互但 λ=0（= v1 行为：有交互、不训练交互）
+C. 完整 v2
+```
+
+C > B 即证明"交互被训练"有效；B vs A 分离"交互机制存在"本身的贡献。
+附加敏感性：λ ∈ {0, 0.5, 1, 2}，max_hops ∈ {1, 2, 3}，c_int ∈ {0, 0.05, 0.1}。
+
+---
+
+## 9. 超参数汇总（v2 新增部分）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| c_int | 0.05 | 交互固定成本 |
+| λ | 1.0 | 交互奖励合成权重 |
+| ε_0 → ε_min | 0.3 → 0.05 | 强制注入概率，线性衰减 |
+| max_hops | 2 | 每轮交互链上限 |
+| 末轮真阳性固定分 | +0.2 | critic 末轮奖励 |
+
+---
+
+## 10. 已知风险与观察点
+
+1. p_t=0 不发起给 0 分而非负分是刻意的（r_prop 已计罚，避免双重计数）；
+   若交互率过低，再考虑给"该求助没求助"加小负分。
+2. ε 衰减 schedule 需调：衰减太快 critic 训练不充分，太慢污染交互决策分布。
+3. 交互决策与角色输出同 turn 合成奖励存在 credit 混叠；若 λ 消融显示信号
+   互相干扰，备选方案是把交互决策拆成独立短生成 turn（代价：每轮多一次调用）。
+4. stop 闸门依赖 verifier 分数存在，需监控"为了 stop 而空跑 verify"的行为。
+
+---
+
+## 11. 待实现代码改动清单（v2）
+
+- [ ] `llm/prompt_templates.py`：controller prompt 改为仅 continue/stop；
+      proposer/critic/verifier 动作集删 support；proposer 交互决策格式明确化
+- [ ] `agents/agentic_executor.py`：删除 focus 解析与 start_role 逻辑，proposer 固定起点
+- [ ] `agents/agentic_executor.py`：role_outputs 分 primary/responses 双槽
+- [ ] `agents/agentic_executor.py`：实现机械 σ 推导（derive_sigma）
+- [ ] `agents/agentic_executor.py`：stop 闸门（无 verifier 分数不得 stop）
+- [ ] `agents/agentic_executor.py`：ε 强制注入 + forced 标记
+- [ ] `agents/agentic_executor.py`：交互因果奖励 r_int、响应独立计分、
+      critic 末轮固定分、r_turn 合成
+- [ ] `training/grpo_trainer.py`：anchor key 改 (role, σ, is_response) + 组内去重
+- [ ] `training/grpo_trainer.py`：新增指标日志（交互率/有效率/选择性/stop 校准）
+- [ ] `configs/agentic/default.yaml`：新增 c_int, lambda_int, eps_force, max_hops
+- [ ] `train.py`：消融开关（max_hops=0 / lambda_int=0）

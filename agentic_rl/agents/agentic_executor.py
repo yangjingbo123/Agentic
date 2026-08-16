@@ -4,71 +4,9 @@ from collections import Counter
 import torch
 import torch.nn.functional as F
 
+from agents.grader import math_equal   # 分层严格判等（Hendrycks 归一化，无数字兜底）
 from envs.blackboard import Blackboard, Message, MessageType
 from llm.prompt_templates import PromptTemplates
-
-
-def normalize_answer(s: str) -> str:
-    """Strip non-numeric characters for fallback string comparison.
-
-    WARNING: This is a lossy normalizer — \frac{1}{2} becomes "12".
-    Prefer math_equal() for answer comparison.
-    """
-    return re.sub(r"[^0-9.\-]", "", s.strip())
-
-
-def _extract_number(s: str) -> float | None:
-    """Try to extract a numeric value from a math answer string.
-
-    Handles common LaTeX patterns: \frac{a}{b}, a/b, integers, decimals.
-    Returns None if no number can be extracted.
-    """
-    s = s.strip()
-    # Direct number
-    try:
-        return float(s)
-    except ValueError:
-        pass
-    # \frac{a}{b}
-    m = re.match(r'\\frac\{(-?[\d.]+)\}\{(-?[\d.]+)\}', s)
-    if m:
-        try:
-            return float(m.group(1)) / float(m.group(2))
-        except (ZeroDivisionError, ValueError):
-            pass
-    # a/b format
-    m = re.match(r'(-?[\d.]+)\s*/\s*(-?[\d.]+)', s)
-    if m:
-        try:
-            return float(m.group(1)) / float(m.group(2))
-        except (ZeroDivisionError, ValueError):
-            pass
-    # \text{...} wrapped
-    m = re.search(r'\\text\{([^}]+)\}', s)
-    if m:
-        return _extract_number(m.group(1))
-    # Extract last number from string
-    nums = re.findall(r'-?\d+\.?\d*', s)
-    if nums:
-        try:
-            return float(nums[-1])
-        except ValueError:
-            pass
-    return None
-
-
-def math_equal(a: str, b: str, tol: float = 1e-6) -> bool:
-    """Compare two math answer strings, handling LaTeX and numeric forms.
-
-    Tries numeric comparison first (handles \frac, a/b, etc.),
-    then falls back to normalized string comparison.
-    """
-    va = _extract_number(a)
-    vb = _extract_number(b)
-    if va is not None and vb is not None:
-        return abs(va - vb) < tol
-    # Fall back to string comparison after normalization
-    return normalize_answer(a) == normalize_answer(b)
 
 
 ROLE_SYSTEM = {

@@ -145,7 +145,7 @@ def main(cfg: DictConfig):
     eval_dataset = load_dataset(cfg.data.test_path) if cfg.data.get("test_path") else []
     eval_freq = cfg.agentic.get("eval_freq", 20)
     eval_samples = cfg.agentic.get("eval_samples", 100)
-    from agents.agentic_executor import AgenticExecutor, normalize_answer
+    from agents.agentic_executor import AgenticExecutor
     eval_executor = AgenticExecutor(
         model, tokenizer, OmegaConf.to_container(cfg.agentic),
         vllm_engine=vllm_engine, eval_mode=True,

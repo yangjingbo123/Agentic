@@ -1291,9 +1291,35 @@ C > B 即证明"交互被训练"有效；B vs A 分离"交互机制存在"本身
 
 ### 新增监控指标（wandb）
 
-`int_rate` / `int_effectiveness` / `int_selectivity`（预期负相关增强）/
-`forced_rate` / `stop_rate` / `stop_acc` vs `exhaust_acc`（stop 校准）/
-`gate_blocked` / `eps_force`；eval 侧新增 `eval_int_rate`、`eval_stop_rate`。
+**RACA v2 证据指标（§8）**：`int_rate` / `int_effectiveness` /
+`int_selectivity`（预期负相关增强）/ `forced_rate` / `stop_rate` /
+`stop_acc` vs `exhaust_acc`（stop 校准）/ `gate_blocked` / `eps_force`；
+eval 侧新增 `eval_int_rate`、`eval_stop_rate`。
+
+**标准 GRPO 看盘项（补齐 v1 缺失项）**：
+
+| 类别 | 指标 | 健康区间 / 危险信号 |
+|------|------|------------------|
+| 策略健康 | `entropy` | 缓降正常；**断崖式下跌 = 熵坍塌**（GRPO 最常见死法） |
+| | `kl`（k3） | 缓慢爬升正常；指数上升 = 漂移失控 |
+| | `clip_frac` | 通常 <0.2；持续走高 = lr 过大或 off-policy 太深 |
+| | `ratio_mean` / `ratio_max` | mean 应 ≈1；max 飞了 = rollout/训练权重脱节 |
+| | `grad_norm`（stdout） | 有界即可；持续打到 clip 阈值是警报 |
+| 信号质量 | `group_keep_rate` | 优势可用组占比（现有） |
+| | `all_pass_frac` / `all_fail_frac` | 组内零方差 ⇒ 无梯度；持续上升 = 信号枯竭 |
+| | `group_reward_std` | 趋零 = 信号枯竭（考虑 DAPO 动态采样） |
+| 行为 | `resp_len` | 暴涨 = reward hacking / 熵坍塌前兆；暴跌 = 学会敷衍 |
+| | `parse_rate` | 「最终答案：」字段输出率；格式崩了 reward 再高也是假的 |
+
+**实施细节**：
+- `entropy` 必须在训练前向内采集（vLLM 只回 top-20 logprobs，算不出全分布熵）；
+  复用 `_compute_loss` 现有 logits，**分块（128 token）累加**——整体 log_softmax
+  会开 (n_resp, 151936) float32（n_resp=1024 时 ≈620MB）再加 exp() 又一份，极易 OOM。
+- 健康指标统一按 **token 加权**（分母 `n_tok`），避免短 turn 被过度加权；
+  均在 `no_grad` 下采集，不入计算图。
+- rollout 行为指标抽到 `training/metrics.py`（零 torch 依赖，可 CPU 单测），
+  统计对象是**全部** rollout（含被优势过滤掉的 episode）。
+- `loss` 本身基本不看（组内 z-normalization 使其期望为零），只在出 NaN 时有信息量。
 
 ### 断代提醒
 

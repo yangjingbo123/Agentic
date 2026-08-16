@@ -379,6 +379,70 @@ def test_integration_forced_injection_and_ablation():
     assert "critic" not in eng.calls and "verifier" not in eng.calls
 
 
+def test_parse_rate_metric():
+    """primary_parsed 逐层透传：无「最终答案：」字段时计为未解析。"""
+    # 未按格式输出（靠抽末尾数字兜底）
+    script = {
+        "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>"] * 4,
+        "proposer":   [INTER.format(a="none", t="none") + "算下来就是 4"] * 4,
+    }
+    ex = _mk_executor(FakeEngine(script), stop_gate=False)
+    res = ex.run_episodes_batch(["q"], ["4"])[0]
+    assert all(m["primary_parsed"] is False for m in res["raca_round_meta"])
+    # 按格式输出
+    script = {
+        "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>"] * 4,
+        "proposer":   [INTER.format(a="none", t="none") + "推理过程：x\n最终答案：4"] * 4,
+    }
+    ex = _mk_executor(FakeEngine(script), stop_gate=False)
+    res = ex.run_episodes_batch(["q"], ["4"])[0]
+    assert all(m["primary_parsed"] is True for m in res["raca_round_meta"])
+
+
+def test_signal_quality_metrics():
+    """信号质量统计：全对组/全错组占比 + 组内 std（零 torch 依赖）。"""
+    from training.metrics import rollout_metrics as T_metrics
+
+    def ep(correct, stopped=True, meta=None):
+        return {"is_correct": correct, "stopped": stopped,
+                "raca_round_meta": meta if meta is not None else []}
+
+    # 4 组：全对 / 全错 / 混合 / 混合
+    batch = [
+        [ep(True), ep(True)],
+        [ep(False), ep(False)],
+        [ep(True), ep(False)],
+        [ep(True), ep(False)],
+    ]
+    m = T_metrics(batch)
+    assert approx(m["all_pass_frac"], 0.25)
+    assert approx(m["all_fail_frac"], 0.25)
+    # std: [0, 0, 0.5, 0.5] → 均值 0.25
+    assert approx(m["group_reward_std"], 0.25)
+    # stop 校准：全部 stopped=True → stop_acc = 4/8，无 exhaust_acc
+    assert approx(m["stop_acc"], 0.5) and "exhaust_acc" not in m
+    assert approx(m["stop_rate"], 1.0)
+
+    # 信号枯竭极端：全部组全对 → all_pass=1, std=0（无可用梯度）
+    m = T_metrics([[ep(True), ep(True)], [ep(True), ep(True)]])
+    assert approx(m["all_pass_frac"], 1.0) and approx(m["group_reward_std"], 0.0)
+
+    # 交互指标 + 可解析率（从 round_meta 聚合）
+    meta_ok = [{"u": True, "forced": False, "p_primary": False, "p_end": True,
+                "target": "critic", "gate_blocked": False, "primary_parsed": True}]
+    meta_bad = [{"u": False, "forced": False, "p_primary": True, "p_end": True,
+                 "target": None, "gate_blocked": True, "primary_parsed": False}]
+    m = T_metrics([[ep(True, meta=meta_ok), ep(False, meta=meta_bad)]])
+    assert approx(m["int_rate"], 0.5)
+    assert approx(m["int_effectiveness"], 1.0)   # 唯一求助样本修对了
+    assert approx(m["parse_rate"], 0.5)
+    assert m["gate_blocked"] == 1
+    assert approx(m["int_selectivity"], -1.0)    # u 与 p_primary 完全负相关
+
+    # 空输入不崩
+    assert T_metrics([]) == {}
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

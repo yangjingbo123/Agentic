@@ -162,6 +162,8 @@ def compute_turn_data(
             "p_end":        p_end,
             "target":       rnd.get("target"),
             "gate_blocked": bool(rnd.get("gate_blocked", False)),
+            # 格式健康（可解析率监控）；缺失时保守计为已解析
+            "primary_parsed": bool(rnd.get("primary_parsed", True)),
         })
 
     # ── Controller episode 结果奖励（§4.5，公式与 v1 一致） ─────────────────

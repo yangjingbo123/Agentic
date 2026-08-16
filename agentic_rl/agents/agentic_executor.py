@@ -177,6 +177,9 @@ class AgenticExecutor:
                 st = ep_st[i]
                 st["primary_tid"] = tid
                 st["primary_answer"] = answer
+                # 格式健康：是否输出了「最终答案：」字段（而非靠抽末尾数字兜底）。
+                # 格式崩了 reward 再高也是假的，所以进入监控指标。
+                st["primary_parsed"] = "最终答案：" in out and bool(answer)
 
                 action, target, reason = parse_interaction(out)
                 u = action != "none" and self.max_hops > 0
@@ -261,6 +264,7 @@ class AgenticExecutor:
                     "gate_blocked":     st["gate_blocked"],
                     "primary_tid":      st["primary_tid"],
                     "primary_answer":   st["primary_answer"],
+                    "primary_parsed":   st["primary_parsed"],
                     "corrected_answer": st["corrected_answer"],
                     "u":                st["u"],
                     "forced":           st["forced"],

@@ -319,6 +319,9 @@ def main(cfg: DictConfig):
         print(
             f"step={step} reward={stats['mean_reward']:.3f} acc={stats['accuracy']:.2f} "
             f"loss={stats['loss']:.4f} kl={stats['kl']:.4f} "
+            f"ent={stats.get('entropy', 0.0):.3f} "
+            f"clip={stats.get('clip_frac', 0.0):.3f} "
+            f"len={stats.get('resp_len', 0.0):.0f} "
             f"groups={_g_kept}/{_g_total} "
             f"int_rate={stats.get('int_rate', 0.0):.2f} "
             f"stop_rate={stats.get('stop_rate', 0.0):.2f} eps={eps_force:.2f}",
@@ -332,8 +335,12 @@ def main(cfg: DictConfig):
             "skipped_batches": skipped_batches,
             "eps_force":       eps_force,
         }
-        # RACA v2 证据指标（§8）：交互率/有效率/选择性/stop 校准等，有则上报
-        for _mk in ("int_rate", "int_effectiveness", "int_selectivity",
+        # 策略健康（熵坍塌/漂移/权重脱节）+ 信号质量（梯度还能用多久）
+        # + 行为（reward hacking 侦测）+ RACA v2 证据指标（§8），有则上报
+        for _mk in ("entropy", "clip_frac", "ratio_mean", "ratio_max", "resp_len",
+                    "all_pass_frac", "all_fail_frac", "group_reward_std",
+                    "parse_rate",
+                    "int_rate", "int_effectiveness", "int_selectivity",
                     "forced_rate", "stop_rate", "stop_acc", "exhaust_acc",
                     "gate_blocked"):
             if _mk in stats:

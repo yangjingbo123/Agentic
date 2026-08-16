@@ -5,6 +5,7 @@ import bitsandbytes as bnb
 
 from agents.agentic_executor import AgenticExecutor
 from llm.trainable_llm import ROLE_ADAPTER
+from training.metrics import rollout_metrics
 from training.raca_adv import compute_raca_advantages
 
 
@@ -34,36 +35,11 @@ class GRPOAgenticTrainer:
         self.raca_delta    = config.get("raca_delta", 1e-4)   # variance floor
         self.kl_coef       = config.get("kl_coef", 0.04)      # KL penalty coefficient
 
-    # ── RACA v2 证据指标（§8）：从 rollout 行为统计，不受优势过滤影响 ──────
+    # ── Rollout 行为/信号质量指标：委托给零依赖的 training/metrics.py ──────
 
     @staticmethod
     def _interaction_metrics(batch_rollouts: list) -> dict:
-        eps = [ep for group in batch_rollouts for ep in group]
-        rounds = [m for ep in eps for m in ep.get("raca_round_meta", [])]
-        out = {}
-        if rounds:
-            us = [1.0 if m["u"] else 0.0 for m in rounds]
-            ps = [1.0 if m["p_primary"] else 0.0 for m in rounds]
-            out["int_rate"]     = float(np.mean(us))
-            out["forced_rate"]  = float(np.mean([m["forced"] for m in rounds]))
-            out["gate_blocked"] = int(sum(m["gate_blocked"] for m in rounds))
-            # 交互有效率：P(轮末修对 | 自发求助且 primary 错)
-            eff = [m["p_end"] for m in rounds if m["u"] and not m["p_primary"]]
-            if eff:
-                out["int_effectiveness"] = float(np.mean(eff))
-            # 选择性：corr(u, p_primary)，预期随训练负相关增强（错的时候才求助）
-            if np.std(us) > 0 and np.std(ps) > 0:
-                out["int_selectivity"] = float(np.corrcoef(us, ps)[0, 1])
-        # stop 校准：P(correct | stop) vs P(correct | 耗尽轮次)
-        stopped   = [ep["is_correct"] for ep in eps if ep.get("stopped")]
-        exhausted = [ep["is_correct"] for ep in eps if not ep.get("stopped")]
-        if stopped:
-            out["stop_acc"] = float(np.mean(stopped))
-        if exhausted:
-            out["exhaust_acc"] = float(np.mean(exhausted))
-        if eps:
-            out["stop_rate"] = float(np.mean([1.0 if ep.get("stopped") else 0.0 for ep in eps]))
-        return out
+        return rollout_metrics(batch_rollouts)
 
     # ── Training loop ────────────────────────────────────────────────────────
 
@@ -136,22 +112,25 @@ class GRPOAgenticTrainer:
 
         total_loss    = 0.0
         total_n_valid = 0
-        total_kl      = 0.0
+        agg = {"kl_sum": 0.0, "ent_sum": 0.0, "clip_sum": 0.0, "ratio_sum": 0.0,
+               "ratio_max": 0.0, "n_tok": 0, "resp_len_sum": 0, "n_turn": 0}
 
         for _ in range(self.ppo_epochs):
             self.optimizer.zero_grad()
             did_backward  = False
             epoch_loss    = 0.0
             epoch_n_valid = 0
-            epoch_kl      = 0.0
 
             for ep, adv in zip(all_episodes, all_per_turn_adv):
-                ep_loss, n_valid, ep_kl = self._compute_loss(ep, adv, total_valid)
+                ep_loss, n_valid, diag = self._compute_loss(ep, adv, total_valid)
                 if n_valid > 0:
                     did_backward = True
                 epoch_loss    += ep_loss
                 epoch_n_valid += n_valid
-                epoch_kl      += ep_kl
+                for k in ("kl_sum", "ent_sum", "clip_sum", "ratio_sum",
+                          "n_tok", "resp_len_sum", "n_turn"):
+                    agg[k] += diag.get(k, 0)
+                agg["ratio_max"] = max(agg["ratio_max"], diag.get("ratio_max", 0.0))
 
             if did_backward:
                 # 同理，裁剪全部 LoRA 参数的梯度，不依赖 requires_grad。
@@ -160,32 +139,42 @@ class GRPOAgenticTrainer:
                     self.max_grad_norm,
                 )
                 self.optimizer.step()
+                _nt = max(agg["n_tok"], 1)
                 print(f"  [update] grad_norm={grad_norm:.4f} loss={epoch_loss:.4f} "
-                      f"kl={epoch_kl / max(epoch_n_valid, 1):.6f}",
+                      f"kl={agg['kl_sum'] / _nt:.6f} "
+                      f"entropy={agg['ent_sum'] / _nt:.4f} "
+                      f"clip_frac={agg['clip_sum'] / _nt:.4f}",
                       flush=True)
             else:
                 print("  [update] SKIPPED: no valid gradients", flush=True)
 
             total_loss    += epoch_loss
             total_n_valid += epoch_n_valid
-            total_kl      += epoch_kl
 
         if self.vllm_engine is not None:
             self.vllm_engine.sync_lora(self.model)
 
+        _nt = max(agg["n_tok"], 1)
         return {
             "loss":        total_loss / max(total_n_valid, 1),
             "mean_reward": mean_r,
             "accuracy":    mean_acc,
-            "kl":          total_kl / max(total_n_valid, 1),
+            "kl":          agg["kl_sum"] / _nt,
             "groups_total": n_groups,
             "groups_kept":  n_groups_kept,
+            # ── 策略健康指标（标准 GRPO 看盘项） ──
+            "entropy":     agg["ent_sum"] / _nt,      # 断崖下跌 = 熵坍塌
+            "clip_frac":   agg["clip_sum"] / _nt,     # 持续 >0.2 = lr 过大/off-policy 太深
+            "ratio_mean":  agg["ratio_sum"] / _nt,    # 应 ≈1
+            "ratio_max":   agg["ratio_max"],          # 飞了 = rollout/训练权重脱节
+            "resp_len":    agg["resp_len_sum"] / max(agg["n_turn"], 1),
             **int_metrics,
         }
 
     # ── Per-turn PPO loss ────────────────────────────────────────────────────
 
     _LOG_RATIO_THRESHOLD = 50.0
+    _ENT_CHUNK = 128          # 熵分块大小（控制 (chunk, vocab) 临时张量峰值）
 
     def _compute_loss(
         self,
@@ -196,10 +185,10 @@ class GRPOAgenticTrainer:
         """Per-turn GRPO clip loss with KL penalty.
 
         Reference model = base model without LoRA (via as_ref()).
-        KL ≈ mean(new_logprob - ref_logprob), penalises policy drift.
         Backward after each turn to keep peak memory minimal.
         per_turn_adv: maps turn_id → RACA advantage scalar.
-        Returns (mean_loss, n_valid_turns, mean_kl).
+        Returns (mean_loss, n_valid_turns, diag) — diag 为健康指标的 token 加权和，
+        由调用方累加后除以 token 总数（避免短 turn 被过度加权）。
         """
         device = next(p for p in self.model._model.parameters()).device
 
@@ -210,7 +199,7 @@ class GRPOAgenticTrainer:
         for p in self.model.lora_parameters():
             if not torch.isfinite(p).all():
                 print("  [loss] NaN/Inf in model weights, skipping episode", flush=True)
-                return 0.0, 0, 0.0
+                return 0.0, 0, {}
 
         vocab_size   = self.model._model.config.vocab_size
         messages     = episode["messages"]
@@ -219,8 +208,11 @@ class GRPOAgenticTrainer:
         all_turn_ids = torch.tensor(episode["turn_ids"], device=device)
 
         total_loss = 0.0
-        total_kl   = 0.0
         n_valid    = 0
+        # 健康指标：token 加权累加（分母统一为 n_tok）
+        diag = {"kl_sum": 0.0, "ent_sum": 0.0, "clip_sum": 0.0,
+                "ratio_sum": 0.0, "ratio_max": 0.0, "n_tok": 0,
+                "resp_len_sum": 0, "n_turn": 0}
 
         for msg in messages:
             turn_id = msg.get("turn_id", 0)
@@ -273,6 +265,17 @@ class GRPOAgenticTrainer:
             _resp_logits = logits_new[p_len - 1: p_len + n_resp - 1].float().contiguous()
             del logits_new
             new_lps = logprobs_from_logits(_resp_logits, resp_labels.to(_resp_logits.device))
+            # 策略熵（全词表）：只能在这里算——vLLM 只回 top-20 logprobs，
+            # 而这里已有完整 logits。断崖式下跌 = 熵坍塌（GRPO 最常见的死法）。
+            # 分块累加：整体 log_softmax 会开 (n_resp, vocab) float32（n_resp=1024
+            # 时 ≈620MB）再加 exp() 又一份，极易 OOM；分块后峰值降到 ~1/8。
+            with torch.no_grad():
+                _ent_sum = 0.0
+                for _s in range(0, n_align, self._ENT_CHUNK):
+                    _blk = _resp_logits[_s: min(_s + self._ENT_CHUNK, n_align)]
+                    _lp  = F.log_softmax(_blk, dim=-1)
+                    _ent_sum += float((-(_lp.exp() * _lp).sum(-1)).sum().item())
+                    del _lp, _blk
             del _resp_logits
 
             if not torch.isfinite(new_lps).all():
@@ -307,9 +310,22 @@ class GRPOAgenticTrainer:
 
             (turn_loss / normalization).backward()  # immediate backward
             total_loss += pg_loss.item()
-            total_kl   += kl.item()
             n_valid    += 1
 
+            # ── 健康指标采集（均不入图） ───────────────────────────
+            with torch.no_grad():
+                # clip fraction：被 PPO clip 截断的 token 比例（通常 <0.2）
+                _clipped = ((ratio_tok < 1 - self.clip_epsilon) |
+                            (ratio_tok > 1 + self.clip_epsilon)).float().sum().item()
+                diag["clip_sum"]  += _clipped
+                diag["ratio_sum"] += ratio_tok.sum().item()
+                diag["ratio_max"]  = max(diag["ratio_max"], ratio_tok.max().item())
+                diag["kl_sum"]    += kl.item() * n_align
+                diag["ent_sum"]   += _ent_sum
+                diag["n_tok"]     += n_align
+                diag["resp_len_sum"] += n_resp
+                diag["n_turn"]    += 1
+
         if n_valid == 0:
-            return 0.0, 0, 0.0
-        return total_loss / n_valid, n_valid, total_kl / n_valid
+            return 0.0, 0, diag
+        return total_loss / n_valid, n_valid, diag

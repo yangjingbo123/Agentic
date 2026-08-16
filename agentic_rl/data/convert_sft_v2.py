@@ -1,4 +1,4 @@
-"""把 v1 格式的 SFT 数据确定性转换为 RACA v2 格式（零 API 成本）。
+"""把 v1 格式的 SFT 数据确定性转换为 RACA v2 格式，并做 GT 对账清洗（零 API 成本）。
 
 转换规则：
 - controller：system 换 v2 模板；<meta-plan> 的 strategy/focus →
@@ -8,6 +8,11 @@
   support* → action: none（v2 删除 support）；
   challenge* → action: challenge（target 缺失/非法则降级 none）；
   其余正文（推理过程/错误分析/分数）原样保留
+
+GT 对账清洗（SFT 生成于 Fix 10 污染期，内嵌 GT 可能截断）：
+- episode 的 answer 与干净主训练集（data/math_train.jsonl，空白归一匹配）
+  用 math_equal 对账：不一致（推理链教错答案）或找不到（GT 不可验证）
+  的 episode 整条删除；等价写法差异（math_equal 判等）保留。
 
 用法：python data/convert_sft_v2.py [in.jsonl] [out.jsonl]
 默认：data/sft_train.jsonl → data/sft_train_v2.jsonl
@@ -20,6 +25,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from llm.prompt_templates import PromptTemplates  # noqa: E402
+from agents.grader import math_equal              # noqa: E402
 
 V2_SYSTEM = {
     "controller": PromptTemplates.controller_system(),
@@ -71,12 +77,34 @@ def convert_worker_response(resp: str) -> str:
     return resp[:block.start()] + new_block + resp[block.end():]
 
 
-def convert(in_path: str, out_path: str):
-    n_ep = n_turn = 0
+def load_clean_answers(path: str) -> dict:
+    """干净主训练集：空白归一后的 question → answer。"""
+    out = {}
+    with open(path) as f:
+        for line in f:
+            r = json.loads(line)
+            out[re.sub(r"\s+", " ", r["question"].strip())] = r["answer"]
+    return out
+
+
+def convert(in_path: str, out_path: str, clean_path: str = "data/math_train.jsonl"):
+    clean = load_clean_answers(clean_path)
+    n_ep = n_turn = kept = drop_missing = drop_wrong = 0
     stats = {"stop": 0, "request": 0, "challenge": 0, "none": 0}
     with open(in_path) as fin, open(out_path, "w") as fout:
         for line in fin:
             ep = json.loads(line)
+            n_ep += 1
+
+            # ── GT 对账清洗（Fix 10 污染期生成的 SFT，GT 可能截断） ──
+            ca = clean.get(re.sub(r"\s+", " ", ep["question"].strip()))
+            if ca is None:
+                drop_missing += 1          # 干净集中不存在，GT 不可验证
+                continue
+            if not math_equal(ep["answer"], ca):
+                drop_wrong += 1            # 推理链教的是错/截断答案
+                continue
+
             for turn in ep.get("turns", []):
                 role = turn.get("role_name", "")
                 if role not in V2_SYSTEM:
@@ -94,8 +122,9 @@ def convert(in_path: str, out_path: str):
                             break
                 n_turn += 1
             fout.write(json.dumps(ep, ensure_ascii=False) + "\n")
-            n_ep += 1
-    print(f"converted {n_ep} episodes / {n_turn} turns -> {out_path}")
+            kept += 1
+    print(f"converted {kept}/{n_ep} episodes / {n_turn} turns -> {out_path}")
+    print(f"dropped: GT不可验证={drop_missing}, GT错误={drop_wrong}")
     print(f"stats: {stats}")
 
 

@@ -2,10 +2,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import bitsandbytes as bnb
-from collections import defaultdict
 
 from agents.agentic_executor import AgenticExecutor
 from llm.trainable_llm import ROLE_ADAPTER
+from training.raca_adv import compute_raca_advantages
 
 
 def logprobs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -34,84 +34,36 @@ class GRPOAgenticTrainer:
         self.raca_delta    = config.get("raca_delta", 1e-4)   # variance floor
         self.kl_coef       = config.get("kl_coef", 0.04)      # KL penalty coefficient
 
-    # ── RACA Phase 3: two-level advantage computation ────────────────────────
+    # ── RACA v2 证据指标（§8）：从 rollout 行为统计，不受优势过滤影响 ──────
 
-    def _compute_raca_advantages(self, episodes: list) -> list:
-        """Compute per-turn RACA advantages for N episodes of the same question.
-
-        Returns a list of N dicts: {turn_id → float advantage}.
-        Controller turns use Layer 1 (episode-level).
-        Proposer/Critic/Verifier turns use Layer 2 (step-level anchor).
-        """
-        N     = len(episodes)
-        delta = self.raca_delta
-
-        # ── Layer 1: controller episode-level advantage ──────────────────────
-        # r_ctrl per episode = the single scalar from the last controller turn.
-        ctrl_episode_rewards = []
-        for ep in episodes:
-            td = ep.get("raca_turn_data", {})
-            r = sum(v["reward"] for v in td.values() if v["role"] == "controller")
-            ctrl_episode_rewards.append(r)
-
-        mu_ctrl  = float(np.mean(ctrl_episode_rewards))
-        sig_ctrl = float(np.std(ctrl_episode_rewards))
-        # Zero-variance group: every rollout for this question earned the same
-        # controller reward, so the episode-level comparison carries no signal.
-        # Emitting zeros anyway would still cost a forward+backward pass per turn
-        # and would inflate `total_valid`, shrinking the gradient contributed by
-        # the groups that do discriminate. Drop the level instead of scaling 0 by
-        # the variance floor.
-        ctrl_adv = (
-            [(r - mu_ctrl) / sig_ctrl for r in ctrl_episode_rewards]
-            if sig_ctrl > delta else None
-        )
-
-        # ── Layer 2: step-level anchor groups for prop/crit/verif ───────────
-        # Anchor: (role, controller_strategy) — groups turns by the cognitive
-        # context the controller assigned for that round, rather than by round
-        # number. Turns sharing the same (role, strategy) faced a comparable
-        # task context (e.g., all proposers invoked under "refine" after errors
-        # were flagged), enabling a cleaner controlled comparison.
-        anchor_groups: dict = defaultdict(list)
-        for ep_idx, ep in enumerate(episodes):
-            for tid, v in ep.get("raca_turn_data", {}).items():
-                if v["role"] == "controller":
-                    continue
-                key = (v["role"], v.get("strategy", "explore"))
-                anchor_groups[key].append((ep_idx, tid, v["reward"]))
-
-        # Normalise within each anchor group → step advantages
-        step_adv: dict = {}   # (ep_idx, tid) → float
-        for (role, rnd), group in anchor_groups.items():
-            if len(group) < 2:
-                continue
-            rewards = [r for _, _, r in group]
-            sig = float(np.std(rewards))
-            if sig <= delta:
-                # Same reasoning as Layer 1: an anchor group whose members all
-                # scored identically offers no comparative signal.
-                continue
-            mu = float(np.mean(rewards))
-            for ep_idx, tid, r in group:
-                step_adv[(ep_idx, tid)] = (r - mu) / sig
-
-        # ── Build per-episode advantage dicts ────────────────────────────────
-        per_ep_adv = [{} for _ in range(N)]
-
-        for ep_idx, ep in enumerate(episodes):
-            for tid, v in ep.get("raca_turn_data", {}).items():
-                if v["role"] == "controller":
-                    # All controller turns in this episode share the episode advantage.
-                    if ctrl_adv is not None:
-                        per_ep_adv[ep_idx][tid] = ctrl_adv[ep_idx]
-                else:
-                    # Use step advantage if the anchor group had enough members.
-                    sa = step_adv.get((ep_idx, tid))
-                    if sa is not None:
-                        per_ep_adv[ep_idx][tid] = sa
-
-        return per_ep_adv
+    @staticmethod
+    def _interaction_metrics(batch_rollouts: list) -> dict:
+        eps = [ep for group in batch_rollouts for ep in group]
+        rounds = [m for ep in eps for m in ep.get("raca_round_meta", [])]
+        out = {}
+        if rounds:
+            us = [1.0 if m["u"] else 0.0 for m in rounds]
+            ps = [1.0 if m["p_primary"] else 0.0 for m in rounds]
+            out["int_rate"]     = float(np.mean(us))
+            out["forced_rate"]  = float(np.mean([m["forced"] for m in rounds]))
+            out["gate_blocked"] = int(sum(m["gate_blocked"] for m in rounds))
+            # 交互有效率：P(轮末修对 | 自发求助且 primary 错)
+            eff = [m["p_end"] for m in rounds if m["u"] and not m["p_primary"]]
+            if eff:
+                out["int_effectiveness"] = float(np.mean(eff))
+            # 选择性：corr(u, p_primary)，预期随训练负相关增强（错的时候才求助）
+            if np.std(us) > 0 and np.std(ps) > 0:
+                out["int_selectivity"] = float(np.corrcoef(us, ps)[0, 1])
+        # stop 校准：P(correct | stop) vs P(correct | 耗尽轮次)
+        stopped   = [ep["is_correct"] for ep in eps if ep.get("stopped")]
+        exhausted = [ep["is_correct"] for ep in eps if not ep.get("stopped")]
+        if stopped:
+            out["stop_acc"] = float(np.mean(stopped))
+        if exhausted:
+            out["exhaust_acc"] = float(np.mean(exhausted))
+        if eps:
+            out["stop_rate"] = float(np.mean([1.0 if ep.get("stopped") else 0.0 for ep in eps]))
+        return out
 
     # ── Training loop ────────────────────────────────────────────────────────
 
@@ -136,11 +88,17 @@ class GRPOAgenticTrainer:
         n_groups      = 0   # question-groups eligible for advantage computation
         n_groups_kept = 0   # ...that produced at least one usable advantage
 
+        # v2 证据指标：对全部 rollout 统计（含被优势过滤掉的 episode）
+        int_metrics = self._interaction_metrics(batch_rollouts)
+
         for episode_group in batch_rollouts:
             if len(episode_group) < 2:
                 continue
             n_groups += 1
-            per_ep_adv = self._compute_raca_advantages(episode_group)
+            per_ep_adv = compute_raca_advantages(
+                [ep.get("raca_turn_data", {}) for ep in episode_group],
+                delta=self.raca_delta,
+            )
             kept = 0
             for ep, adv in zip(episode_group, per_ep_adv):
                 if adv:   # skip episodes where no turn got an advantage
@@ -155,7 +113,7 @@ class GRPOAgenticTrainer:
                 self.vllm_engine.sync_lora(self.model)
             return {"loss": 0.0, "mean_reward": 0.0, "accuracy": 0.0,
                     "kl": 0.0, "skipped": True,
-                    "groups_total": n_groups, "groups_kept": 0}
+                    "groups_total": n_groups, "groups_kept": 0, **int_metrics}
 
         # Logging
         n_correct  = sum(ep["is_correct"] for ep in all_episodes)
@@ -222,6 +180,7 @@ class GRPOAgenticTrainer:
             "kl":          total_kl / max(total_n_valid, 1),
             "groups_total": n_groups,
             "groups_kept":  n_groups_kept,
+            **int_metrics,
         }
 
     # ── Per-turn PPO loss ────────────────────────────────────────────────────
@@ -337,8 +296,13 @@ class GRPOAgenticTrainer:
                                                      1 + self.clip_epsilon),
             ).mean()
 
-            # KL penalty: keep policy close to base model
-            kl = (new_lps[:n_align] - ref_lps[:n_align].to(new_lps.device)).mean()
+            # KL penalty (k3 估计器): exp(ref−new) − (ref−new) − 1 ≥ 0。
+            # v1 用 k1 = mean(new − ref)：ref 是常量，梯度 = ∇mean(new_lps)，
+            # 在 on-policy 采样下期望为零——只加噪声、无约束力。k3 的梯度
+            # 方向正确地把策略拉向 base model（GRPO 标准做法）。
+            # clamp 防 exp 溢出：delta>20 时 kl 已巨大，梯度方向不变。
+            delta_lp = (ref_lps[:n_align].to(new_lps.device) - new_lps[:n_align]).clamp(max=20.0)
+            kl = (torch.exp(delta_lp) - delta_lp - 1.0).mean()
             turn_loss = pg_loss + self.kl_coef * kl
 
             (turn_loss / normalization).backward()  # immediate backward

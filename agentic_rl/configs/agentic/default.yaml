@@ -18,6 +18,13 @@ ctrl_beta: 0.2
 # bonus when it is right). Early stopping pays off only when p(correct) exceeds
 # gamma/(alpha+gamma) = 0.5 at these defaults. Raise to discourage stopping.
 ctrl_gamma: 0.3
+# ── RACA v2: interaction-as-action ──
+c_int: 0.05          # 交互固定成本（每次自发发起扣除）
+lambda_int: 1.0      # 交互奖励合成权重；0 = 消融B（有交互不训练交互，即 v1 行为）
+max_hops: 2          # 每轮交互链响应跳数上限；0 = 消融A（完全禁用交互）
+stop_gate: true      # stop 需黑板存在 verifier 分数；消融A 时建议关闭
+eps_force_init: 0.3  # 强制注入 critic 审查的初始概率（冷启动保护，随 step 线性衰减）
+eps_force_min: 0.05
 # RACA variance threshold: groups whose reward std is <= this are treated as
 # degenerate and dropped (they carry no comparative signal).
 raca_delta: 1.0e-4

@@ -23,16 +23,38 @@ class Blackboard:
         self.flaws: list[dict] = []                   # {"content": str}
         self.scores: list[tuple[str, float]] = []     # (answer, score)
         self.interactions: list[dict] = []            # {from, action, target, reason}
+        # 全局事件序号：用于判断 flag 是否已被后续 trace 处理（RACA v2 机械 σ）
+        self._seq = 0
+        self._last_trace_seq = -1
+        self._last_flaw_seq = -1
 
     def add_message(self, msg: Message):
+        self._seq += 1
         if msg.msg_type == MessageType.TRACE:
             self.traces.append(msg.content)
+            self._last_trace_seq = self._seq
         elif msg.msg_type == MessageType.FLAW:
             self.flaws.append(msg.content)
+            self._last_flaw_seq = self._seq
         elif msg.msg_type == MessageType.SCORE:
             self.scores.append(msg.content)
         elif msg.msg_type == MessageType.INTERACTION:
             self.interactions.append(msg.content)
+
+    def derive_sigma(self) -> str:
+        """RACA v2 机械上下文标签（替代 controller 生成的 strategy）。
+
+        σ = explore  若黑板无 trace
+          = refine   若最近一条 critic flag 存在且未被后续 trace 处理
+          = verify   若已有候选答案且无未处理的 flag
+
+        确定性推导：跨 rollout、跨训练阶段严格可比，不依赖模型输出解析。
+        """
+        if not self.traces:
+            return "explore"
+        if self._last_flaw_seq > self._last_trace_seq:
+            return "refine"
+        return "verify"
 
     def get_distinct_answers(self) -> list[str]:
         return list({ans for _, ans in self.traces})

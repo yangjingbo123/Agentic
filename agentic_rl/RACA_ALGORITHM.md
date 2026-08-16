@@ -1237,16 +1237,66 @@ C > B 即证明"交互被训练"有效；B vs A 分离"交互机制存在"本身
 
 ## 11. 待实现代码改动清单（v2）
 
-- [ ] `llm/prompt_templates.py`：controller prompt 改为仅 continue/stop；
+> **状态：已全部实现（2026-08-16，实施记录见本节末尾）。**
+
+- [x] `llm/prompt_templates.py`：controller prompt 改为仅 continue/stop；
       proposer/critic/verifier 动作集删 support；proposer 交互决策格式明确化
-- [ ] `agents/agentic_executor.py`：删除 focus 解析与 start_role 逻辑，proposer 固定起点
-- [ ] `agents/agentic_executor.py`：role_outputs 分 primary/responses 双槽
-- [ ] `agents/agentic_executor.py`：实现机械 σ 推导（derive_sigma）
-- [ ] `agents/agentic_executor.py`：stop 闸门（无 verifier 分数不得 stop）
-- [ ] `agents/agentic_executor.py`：ε 强制注入 + forced 标记
-- [ ] `agents/agentic_executor.py`：交互因果奖励 r_int、响应独立计分、
-      critic 末轮固定分、r_turn 合成
-- [ ] `training/grpo_trainer.py`：anchor key 改 (role, σ, is_response) + 组内去重
-- [ ] `training/grpo_trainer.py`：新增指标日志（交互率/有效率/选择性/stop 校准）
-- [ ] `configs/agentic/default.yaml`：新增 c_int, lambda_int, eps_force, max_hops
-- [ ] `train.py`：消融开关（max_hops=0 / lambda_int=0）
+- [x] `agents/agentic_executor.py`：删除 focus 解析与 start_role 逻辑，proposer 固定起点
+- [x] `agents/agentic_executor.py`：role_outputs 分 primary/responses 双槽
+- [x] `agents/agentic_executor.py`：实现机械 σ 推导（derive_sigma，落在 envs/blackboard.py）
+- [x] `agents/agentic_executor.py`：stop 闸门（无 verifier 分数不得 stop）
+- [x] `agents/agentic_executor.py`：ε 强制注入 + forced 标记
+- [x] `agents/agentic_executor.py`：交互因果奖励 r_int、响应独立计分、
+      critic 末轮固定分、r_turn 合成（落在 agents/raca_rewards.py）
+- [x] `training/grpo_trainer.py`：anchor key 改 (role, σ, is_response) + 组内去重
+      （落在 training/raca_adv.py）
+- [x] `training/grpo_trainer.py`：新增指标日志（交互率/有效率/选择性/stop 校准）
+- [x] `configs/agentic/default.yaml`：新增 c_int, lambda_int, eps_force, max_hops
+- [x] `train.py`：消融开关（max_hops=0 / lambda_int=0 经 Hydra 覆盖即可）
+
+---
+
+## 12. v2 实施记录（2026-08-16）
+
+### 新增/重写的模块
+
+| 模块 | 职责 | 可测性 |
+|------|------|--------|
+| `agents/parsing.py` | decision/interaction/reasoning/score 解析（纯正则） | 零 torch 依赖 |
+| `agents/raca_rewards.py` | Phase 2 全部奖励（r_int/四格/响应计分/controller） | 零 torch 依赖 |
+| `training/raca_adv.py` | Phase 3 两层优势 + anchor 去重广播 | 零 torch/numpy 依赖 |
+| `envs/blackboard.py` | 事件序号 + `derive_sigma()` | 零依赖 |
+| `agents/agentic_executor.py` | v2 主流程（重写，无 HF-generate 旧路径） | 集成测试用 Fake 引擎 |
+| `test_raca_v2.py` | 15 条单测 + 2 条端到端集成（含在 15 内） | 本地 CPU 可跑 |
+
+### 规格未定死处的实施决策
+
+1. **Critic 真阳性效果量 q 三级解析**（合并 §4.3 与 §4.6 语义）：
+   本轮有后续修正 → q = 轮末正确性；无修正但有下一轮 → q = 下轮 primary；
+   末轮无修正 → 固定 +0.2。
+2. **stop 闸门拦截后强制 continue**（规格两选一中选了简单项，未自动触发 verify），
+   拦截次数记入 `gate_blocked` 监控（对应 §10 风险 4）。
+3. **r_int 只挂在 primary proposer turn**；响应方在链上再发起的下一跳属链机制，
+   不单独计奖（避免响应 turn 的 credit 混叠）。
+4. **forced 只在 u=0 时注入**；被注入轮发起方 r_int=0，响应方正常计分；
+   **eval 时 ε=0**（评测学到的策略本身）。
+5. **响应方 prompt = 标准角色格式 + 请求上下文后缀**，而非 v1 的自由格式
+   interaction_response —— 保证错误分析/分数字段可解析（配合双槽存储根治 Fix 3 类问题）。
+6. **KL 估计器 k1 → k3**（`exp(ref−new) − (ref−new) − 1`，delta clamp≤20）：
+   v1 的 k1 在 on-policy 采样下梯度期望为零，无约束力只加噪声；k3 非负且
+   梯度方向正确。**日志里 kl 数值量纲与旧实验不可比（k3 恒非负）。**
+7. 删除 v1 遗留：HF-generate 无 vLLM 路径（早已不可用）、seq_input_ids/seq_step_ids
+   记账（trainer 不消费）、strategy/focus 解析。`run_episode` 保留为 batch 路径的
+   薄包装；`evaluate.py` 离线评测现需传入 vLLM 引擎才能运行。
+
+### 新增监控指标（wandb）
+
+`int_rate` / `int_effectiveness` / `int_selectivity`（预期负相关增强）/
+`forced_rate` / `stop_rate` / `stop_acc` vs `exhaust_acc`（stop 校准）/
+`gate_blocked` / `eps_force`；eval 侧新增 `eval_int_rate`、`eval_stop_rate`。
+
+### 断代提醒
+
+v2 与 v1 实验三重不可比：① Fix 18 判分器变严（eval_acc 旧刻度系统性偏高）；
+② 奖励结构变化（r_int/响应计分/末轮固定分）；③ kl 曲线换 k3 估计器。
+v1 对照基线：用新 grader 重跑 rl-math-grpo_fixed-3 的 step-200 checkpoint eval。

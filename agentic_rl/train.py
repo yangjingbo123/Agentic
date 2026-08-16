@@ -175,10 +175,16 @@ def main(cfg: DictConfig):
         avg_turns = float(np.mean([
             len(ep.get("raca_turn_data", {})) for ep in episodes
         ]))
+        # RACA v2 行为指标（greedy、无 ε 注入，反映学到的策略本身）
+        _rounds = [m for ep in episodes for m in ep.get("raca_round_meta", [])]
+        eval_int_rate  = float(np.mean([m["u"] for m in _rounds])) if _rounds else 0.0
+        eval_stop_rate = float(np.mean([1.0 if ep.get("stopped") else 0.0 for ep in episodes]))
         print(f"  [eval] step={step} eval_acc={acc:.3f} reward={reward_mean:.3f} "
-              f"avg_turns={avg_turns:.1f} (n={len(_eval_items)})", flush=True)
+              f"avg_turns={avg_turns:.1f} int_rate={eval_int_rate:.2f} "
+              f"stop_rate={eval_stop_rate:.2f} (n={len(_eval_items)})", flush=True)
         wandb.log({"eval_accuracy": acc, "eval_reward": reward_mean,
-                   "eval_avg_turns": avg_turns}, step=step)
+                   "eval_avg_turns": avg_turns, "eval_int_rate": eval_int_rate,
+                   "eval_stop_rate": eval_stop_rate}, step=step)
     batch_size = cfg.agentic.batch_size
     max_steps = cfg.agentic.get("max_steps", 500)
     print(f"Dataset: {len(dataset)} items, batch_size={batch_size}, max_steps={max_steps}", flush=True)
@@ -252,6 +258,11 @@ def main(cfg: DictConfig):
         batch = data_pool[pool_idx: pool_idx + batch_size]
         pool_idx += batch_size
 
+        # RACA v2: ε 强制注入概率线性衰减（冷启动保护，§2.4）
+        _eps0 = float(cfg.agentic.get("eps_force_init", 0.3))
+        _epsm = float(cfg.agentic.get("eps_force_min", 0.05))
+        eps_force = max(_epsm, _eps0 - (_eps0 - _epsm) * step / max(max_steps, 1))
+
         # Run all batch_size * n_samples rollouts in one batched vLLM call
         questions = [item["question"] for item in batch]
         answers   = [item["answer"]   for item in batch]
@@ -267,7 +278,7 @@ def main(cfg: DictConfig):
             _chunks_a = [all_a[i::_k] for i in range(_k)]
             def _run_chunk(eng, qs, ans):
                 ex = AgenticExecutor(model, tokenizer, _agentic_cfg, vllm_engine=eng)
-                return ex.run_episodes_batch(qs, ans)
+                return ex.run_episodes_batch(qs, ans, eps_force=eps_force)
             with _TPE(max_workers=_k) as _pool:
                 _futures = [_pool.submit(_run_chunk, eng, qs, ans)
                             for eng, qs, ans in zip(_engines, _chunks_q, _chunks_a)]
@@ -277,7 +288,7 @@ def main(cfg: DictConfig):
                 for _j, _ep in enumerate(_res):
                     all_eps[_ei + _j * _k] = _ep
         else:
-            all_eps = trainer.executor.run_episodes_batch(all_q, all_a)
+            all_eps = trainer.executor.run_episodes_batch(all_q, all_a, eps_force=eps_force)
         # group by question — each group is the list of N rollouts for that question
         batch_rollouts = []
         for qi in range(len(batch)):
@@ -308,7 +319,9 @@ def main(cfg: DictConfig):
         print(
             f"step={step} reward={stats['mean_reward']:.3f} acc={stats['accuracy']:.2f} "
             f"loss={stats['loss']:.4f} kl={stats['kl']:.4f} "
-            f"groups={_g_kept}/{_g_total}",
+            f"groups={_g_kept}/{_g_total} "
+            f"int_rate={stats.get('int_rate', 0.0):.2f} "
+            f"stop_rate={stats.get('stop_rate', 0.0):.2f} eps={eps_force:.2f}",
             flush=True,
         )
         log_data = {
@@ -317,7 +330,14 @@ def main(cfg: DictConfig):
             "loss":            stats["loss"],
             "kl":              stats["kl"],
             "skipped_batches": skipped_batches,
+            "eps_force":       eps_force,
         }
+        # RACA v2 证据指标（§8）：交互率/有效率/选择性/stop 校准等，有则上报
+        for _mk in ("int_rate", "int_effectiveness", "int_selectivity",
+                    "forced_rate", "stop_rate", "stop_acc", "exhaust_acc",
+                    "gate_blocked"):
+            if _mk in stats:
+                log_data[_mk] = stats[_mk]
         if _g_total:
             # Fraction of question-groups that produced a usable advantage. A
             # sustained drop means rollouts are collapsing to identical rewards

@@ -719,6 +719,34 @@ commit 3611725 对该函数**只添加了解释性 docstring**（说明为何不
 - **副作用**：`max_steps` 现在表示**200 次真实更新**而非 200 次取批尝试，
   退化率高时 wall-clock 会变长，不可与旧实验直接比耗时。
 
+### Fix 18：`math_equal` "取最后一个数字"兜底 → 分层严格判等（grader.py）
+
+- **症状**：`_extract_number` 的最后兜底分支会从任意字符串里抽"最后一个数字"：
+  真值 `2\sqrt{3}` vs 回答 `3` → 都压成 3.0 → **假阳性**；
+  真值 `\frac{\pi}{2}` vs 回答 `1.57` → 抽成 2.0 vs 1.57 → **假阴性**。
+  实测：在 math_test 的 1365 个符号型答案上，"只答符号答案里最后一个数字"
+  的作弊策略旧判分器接受率 **66.2%**。eval 子集是 Level 5（符号答案占比最高，
+  全测试集 38% 为符号型），失真恰好集中在区分度最关键的题上；
+  且同一把歪尺子同时喂 `p_t`（proposer 奖励）、critic 因果奖励、`is_correct`
+  和 eval_acc，奖励地形与评测同源污染。
+- **修复**：新建 `agents/grader.py`（方案 A2，零第三方依赖）：
+  1. 移植 verl/Hendrycks MATH 官方 `strip_string`/`is_equiv` 归一化
+     （去 `\left\right`、dfrac/tfrac 统一、sqrt/frac 简写展开、去单位/百分号）；
+  2. 数值比较改为 **fullmatch 严格解析**（整个字符串是数/分数才走数值路径，
+     支持千分位、`\text{}` 包裹、负号在 `\frac` 外）；
+  3. **删除"最后一个数字"兜底**：无法证明等价一律 False；
+  4. 判等前轻量清洗：`\boxed{}` 提取、markdown 加粗、`$`、尾部标点、`x \in` 前缀。
+  配套 `test_grader.py`（42 条回归用例 + 对称性检查，用例取自真实测试集答案形态）。
+- **验收**：8934 条真实答案自反性 100% 通过；作弊策略接受率 66.2% → **8.5%**
+  （残余部分主要是合法等价：`118 \text{ dollars}` vs `118` 这类去单位后确实相等）。
+- **位置**：`agents/grader.py`（新增）；`agents/agentic_executor.py`（旧三函数删除，
+  改为 `from agents.grader import math_equal`）；`train.py`（移除失效 import）。
+- **副作用（重要）**：判分器变严后 **eval_acc 与旧实验不可比**（旧数字系统性偏高），
+  奖励地形同步改变——这是继 Fix 10 数据重生之后的又一次断代，应与 v2 开跑
+  对齐；如需折算历史实验，用新 grader 重跑旧 checkpoint 的 eval。
+  纯符号 vs 小数的跨形式等价（`\frac{\pi}{2}` vs `1.5708`）仍判 False，
+  属有意为之的保守选择（宁漏判不猜测）。
+
 ### 可观测性新增（配合 Fix 7/17）
 
 | 输出 | 位置 | 用途 |
@@ -736,6 +764,7 @@ commit 3611725 对该函数**只添加了解释性 docstring**（说明为何不
 |------|---|------|--------|----------------|
 | **数据/监督信号** | 10 | `\boxed{}` 嵌套截断 | 25% ground truth 错误 | 继承（⚠️ 数据待重生） |
 | | 11 | `normalize_answer` 有损比较 | 所有角色奖励的输入信号 | 继承 |
+| | 18 | `math_equal` 数字兜底假阳性 | 符号型答案奖励/评测双向失真 | 继承（grader.py，⚠️ eval_acc 断代） |
 | | 3 | critic_flagged 恒为 True | critic 四格矩阵输入失真 | 继承；根因由 v2 双槽存储根治 |
 | **权重加载** | 9 | SFT 路径静默跳过 | 实际从随机 LoRA 开始训练 | 继承 |
 | | 16 | 加载按 requires_grad 过滤 | 只载入 1/4 adapter | 继承 |
@@ -1208,16 +1237,92 @@ C > B 即证明"交互被训练"有效；B vs A 分离"交互机制存在"本身
 
 ## 11. 待实现代码改动清单（v2）
 
-- [ ] `llm/prompt_templates.py`：controller prompt 改为仅 continue/stop；
+> **状态：已全部实现（2026-08-16，实施记录见本节末尾）。**
+
+- [x] `llm/prompt_templates.py`：controller prompt 改为仅 continue/stop；
       proposer/critic/verifier 动作集删 support；proposer 交互决策格式明确化
-- [ ] `agents/agentic_executor.py`：删除 focus 解析与 start_role 逻辑，proposer 固定起点
-- [ ] `agents/agentic_executor.py`：role_outputs 分 primary/responses 双槽
-- [ ] `agents/agentic_executor.py`：实现机械 σ 推导（derive_sigma）
-- [ ] `agents/agentic_executor.py`：stop 闸门（无 verifier 分数不得 stop）
-- [ ] `agents/agentic_executor.py`：ε 强制注入 + forced 标记
-- [ ] `agents/agentic_executor.py`：交互因果奖励 r_int、响应独立计分、
-      critic 末轮固定分、r_turn 合成
-- [ ] `training/grpo_trainer.py`：anchor key 改 (role, σ, is_response) + 组内去重
-- [ ] `training/grpo_trainer.py`：新增指标日志（交互率/有效率/选择性/stop 校准）
-- [ ] `configs/agentic/default.yaml`：新增 c_int, lambda_int, eps_force, max_hops
-- [ ] `train.py`：消融开关（max_hops=0 / lambda_int=0）
+- [x] `agents/agentic_executor.py`：删除 focus 解析与 start_role 逻辑，proposer 固定起点
+- [x] `agents/agentic_executor.py`：role_outputs 分 primary/responses 双槽
+- [x] `agents/agentic_executor.py`：实现机械 σ 推导（derive_sigma，落在 envs/blackboard.py）
+- [x] `agents/agentic_executor.py`：stop 闸门（无 verifier 分数不得 stop）
+- [x] `agents/agentic_executor.py`：ε 强制注入 + forced 标记
+- [x] `agents/agentic_executor.py`：交互因果奖励 r_int、响应独立计分、
+      critic 末轮固定分、r_turn 合成（落在 agents/raca_rewards.py）
+- [x] `training/grpo_trainer.py`：anchor key 改 (role, σ, is_response) + 组内去重
+      （落在 training/raca_adv.py）
+- [x] `training/grpo_trainer.py`：新增指标日志（交互率/有效率/选择性/stop 校准）
+- [x] `configs/agentic/default.yaml`：新增 c_int, lambda_int, eps_force, max_hops
+- [x] `train.py`：消融开关（max_hops=0 / lambda_int=0 经 Hydra 覆盖即可）
+
+---
+
+## 12. v2 实施记录（2026-08-16）
+
+### 新增/重写的模块
+
+| 模块 | 职责 | 可测性 |
+|------|------|--------|
+| `agents/parsing.py` | decision/interaction/reasoning/score 解析（纯正则） | 零 torch 依赖 |
+| `agents/raca_rewards.py` | Phase 2 全部奖励（r_int/四格/响应计分/controller） | 零 torch 依赖 |
+| `training/raca_adv.py` | Phase 3 两层优势 + anchor 去重广播 | 零 torch/numpy 依赖 |
+| `envs/blackboard.py` | 事件序号 + `derive_sigma()` | 零依赖 |
+| `agents/agentic_executor.py` | v2 主流程（重写，无 HF-generate 旧路径） | 集成测试用 Fake 引擎 |
+| `test_raca_v2.py` | 15 条单测 + 2 条端到端集成（含在 15 内） | 本地 CPU 可跑 |
+
+### 规格未定死处的实施决策
+
+1. **Critic 真阳性效果量 q 三级解析**（合并 §4.3 与 §4.6 语义）：
+   本轮有后续修正 → q = 轮末正确性；无修正但有下一轮 → q = 下轮 primary；
+   末轮无修正 → 固定 +0.2。
+2. **stop 闸门拦截后强制 continue**（规格两选一中选了简单项，未自动触发 verify），
+   拦截次数记入 `gate_blocked` 监控（对应 §10 风险 4）。
+3. **r_int 只挂在 primary proposer turn**；响应方在链上再发起的下一跳属链机制，
+   不单独计奖（避免响应 turn 的 credit 混叠）。
+4. **forced 只在 u=0 时注入**；被注入轮发起方 r_int=0，响应方正常计分；
+   **eval 时 ε=0**（评测学到的策略本身）。
+5. **响应方 prompt = 标准角色格式 + 请求上下文后缀**，而非 v1 的自由格式
+   interaction_response —— 保证错误分析/分数字段可解析（配合双槽存储根治 Fix 3 类问题）。
+6. **KL 估计器 k1 → k3**（`exp(ref−new) − (ref−new) − 1`，delta clamp≤20）：
+   v1 的 k1 在 on-policy 采样下梯度期望为零，无约束力只加噪声；k3 非负且
+   梯度方向正确。**日志里 kl 数值量纲与旧实验不可比（k3 恒非负）。**
+7. 删除 v1 遗留：HF-generate 无 vLLM 路径（早已不可用）、seq_input_ids/seq_step_ids
+   记账（trainer 不消费）、strategy/focus 解析。`run_episode` 保留为 batch 路径的
+   薄包装；`evaluate.py` 离线评测现需传入 vLLM 引擎才能运行。
+
+### 新增监控指标（wandb）
+
+**RACA v2 证据指标（§8）**：`int_rate` / `int_effectiveness` /
+`int_selectivity`（预期负相关增强）/ `forced_rate` / `stop_rate` /
+`stop_acc` vs `exhaust_acc`（stop 校准）/ `gate_blocked` / `eps_force`；
+eval 侧新增 `eval_int_rate`、`eval_stop_rate`。
+
+**标准 GRPO 看盘项（补齐 v1 缺失项）**：
+
+| 类别 | 指标 | 健康区间 / 危险信号 |
+|------|------|------------------|
+| 策略健康 | `entropy` | 缓降正常；**断崖式下跌 = 熵坍塌**（GRPO 最常见死法） |
+| | `kl`（k3） | 缓慢爬升正常；指数上升 = 漂移失控 |
+| | `clip_frac` | 通常 <0.2；持续走高 = lr 过大或 off-policy 太深 |
+| | `ratio_mean` / `ratio_max` | mean 应 ≈1；max 飞了 = rollout/训练权重脱节 |
+| | `grad_norm`（stdout） | 有界即可；持续打到 clip 阈值是警报 |
+| 信号质量 | `group_keep_rate` | 优势可用组占比（现有） |
+| | `all_pass_frac` / `all_fail_frac` | 组内零方差 ⇒ 无梯度；持续上升 = 信号枯竭 |
+| | `group_reward_std` | 趋零 = 信号枯竭（考虑 DAPO 动态采样） |
+| 行为 | `resp_len` | 暴涨 = reward hacking / 熵坍塌前兆；暴跌 = 学会敷衍 |
+| | `parse_rate` | 「最终答案：」字段输出率；格式崩了 reward 再高也是假的 |
+
+**实施细节**：
+- `entropy` 必须在训练前向内采集（vLLM 只回 top-20 logprobs，算不出全分布熵）；
+  复用 `_compute_loss` 现有 logits，**分块（128 token）累加**——整体 log_softmax
+  会开 (n_resp, 151936) float32（n_resp=1024 时 ≈620MB）再加 exp() 又一份，极易 OOM。
+- 健康指标统一按 **token 加权**（分母 `n_tok`），避免短 turn 被过度加权；
+  均在 `no_grad` 下采集，不入计算图。
+- rollout 行为指标抽到 `training/metrics.py`（零 torch 依赖，可 CPU 单测），
+  统计对象是**全部** rollout（含被优势过滤掉的 episode）。
+- `loss` 本身基本不看（组内 z-normalization 使其期望为零），只在出 NaN 时有信息量。
+
+### 断代提醒
+
+v2 与 v1 实验三重不可比：① Fix 18 判分器变严（eval_acc 旧刻度系统性偏高）；
+② 奖励结构变化（r_int/响应计分/末轮固定分）；③ kl 曲线换 k3 估计器。
+v1 对照基线：用新 grader 重跑 rl-math-grpo_fixed-3 的 step-200 checkpoint eval。

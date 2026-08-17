@@ -57,12 +57,18 @@ def main(cfg: DictConfig):
     model_path = cfg.llm.model_path
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    base = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16, device_map="auto")
+    # 用 torch_dtype 而非 dtype：dtype 是 transformers 4.56+ 的新参数名，较旧版本
+    # 会当成 model_kwargs 透传给 cls(config, **kwargs) 而报 unexpected keyword。
+    # torch_dtype 在新旧版本都可用，也与 llm/trainable_llm.py 保持一致。
+    base = AutoModelForCausalLM.from_pretrained(
+        model_path, torch_dtype=torch.bfloat16, device_map="auto")
     lora_cfg = LoraConfig(r=16, lora_alpha=32, target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM")
     model = get_peft_model(base, lora_cfg)
     model.config.use_cache = False
-    model.gradient_checkpointing_enable()
     model.enable_input_require_grads()
+    # use_reentrant=False：与 RL 路径（trainable_llm.py）一致。reentrant 版本在
+    # LoRA 上易出现梯度不回传且不报错的静默失败。
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
     dataset = SFTDataset(cfg.data.get("sft_path", "data/sft_train.jsonl"), tokenizer,
                          sft_cfg.get("max_len", 512))

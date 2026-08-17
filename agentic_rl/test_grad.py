@@ -5,7 +5,7 @@ from peft import get_peft_model, LoraConfig
 
 model_path = "/scratch/users/k24104674/hf_cache/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218"
 tokenizer = AutoTokenizer.from_pretrained(model_path)
-base = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16, device_map="auto")
+base = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, device_map="auto")
 lora_cfg = LoraConfig(r=16, lora_alpha=32, target_modules=["q_proj","v_proj"], task_type="CAUSAL_LM")
 model = get_peft_model(base, lora_cfg)
 model.config.use_cache = False

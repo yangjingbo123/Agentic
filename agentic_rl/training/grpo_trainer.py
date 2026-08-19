@@ -184,7 +184,7 @@ class GRPOAgenticTrainer:
     ) -> tuple:
         """Per-turn GRPO clip loss with KL penalty.
 
-        Reference model = base model without LoRA (via as_ref()).
+        Reference model = frozen SFT snapshot per role (via as_ref(role)).
         Backward after each turn to keep peak memory minimal.
         per_turn_adv: maps turn_id → RACA advantage scalar.
         Returns (mean_loss, n_valid_turns, diag) — diag 为健康指标的 token 加权和，
@@ -250,8 +250,8 @@ class GRPOAgenticTrainer:
             ).unsqueeze(0)
             resp_labels = torch.tensor(resp_ids, dtype=torch.long, device=device)
 
-            # Reference forward (base model, no LoRA, no grad)
-            with self.model.as_ref():
+            # Reference forward (frozen SFT snapshot for this role, no grad)
+            with self.model.as_ref(role):
                 with torch.no_grad():
                     ref_logits = self.model._model(input_ids, use_cache=False).logits[0]
                     _ref_rl = ref_logits[p_len - 1: p_len + n_resp - 1].float().contiguous()

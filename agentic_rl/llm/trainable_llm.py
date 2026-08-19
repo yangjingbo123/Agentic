@@ -21,13 +21,32 @@ class RoleModel:
         self.device = next(peft_model.parameters()).device
 
     @contextmanager
-    def as_ref(self):
-        """禁用所有 adapter，使用 base 权重作参考模型。"""
-        self._model.disable_adapter_layers()
-        try:
-            yield self._model
-        finally:
-            self._model.enable_adapter_layers()
+    def as_ref(self, role: str = "proposer"):
+        """切换到冻结的 SFT 快照 adapter（ref_{role}）作参考模型。
+
+        v2.0 曾 disable_adapter_layers() 用裸 base 作参考：KL 惩罚把策略持续
+        拉向从未学过 <interaction>/decision: stop 格式的 base，系统性抹除 SFT
+        行为（v2.0 全量日志：kl 0.75→0.18 单调下降，与 int/stop 坍塌同步）。
+        KL 锚定 SFT 起点才是 trust region 的本意。
+        无 ref adapter 时回退旧行为（兼容未建 ref 的旧 checkpoint 脚本）。
+        """
+        ref_name = f"ref_{ROLE_ADAPTER.get(role, 'proposer')}"
+        if ref_name in self._model.peft_config:
+            self._model.set_adapter(ref_name)
+            try:
+                yield self._model
+            finally:
+                # set_adapter 会把 ref 参数 requires_grad 置 True，回滚冻结状态；
+                # 训练 adapter 由调用方随后 set_adapter 恢复（与 as_role 同约定）。
+                for n, p in self._model.named_parameters():
+                    if f".{ref_name}." in n:
+                        p.requires_grad_(False)
+        else:
+            self._model.disable_adapter_layers()
+            try:
+                yield self._model
+            finally:
+                self._model.enable_adapter_layers()
 
     @contextmanager
     def as_role(self, role: str):
@@ -56,14 +75,18 @@ class RoleModel:
         set_adapter 的那个 adapter」会进入优化器，其余 adapter 永远不会被
         优化器更新，也不会被 zero_grad() 清零——梯度持续累加。
         因此优化器和 clip_grad_norm_ 都应使用此方法。
+        ref_* adapter 是冻结的 KL 参考快照，永远不进优化器。
         """
-        return [p for n, p in self._model.named_parameters() if "lora_" in n]
+        return [p for n, p in self._model.named_parameters()
+                if "lora_" in n and ".ref_" not in n]
 
     def named_parameters(self):
         return self._model.named_parameters()
 
     def save_pretrained(self, path):
-        self._model.save_pretrained(path)
+        # 只保存训练 adapter；ref_* 是 SFT 快照，load 时从 SFT ckpt 重建即可
+        trainable = [n for n in self._model.peft_config if not n.startswith("ref_")]
+        self._model.save_pretrained(path, selected_adapters=trainable)
 
 
 def load_trainable_models(model_path: str, lora_rank: int = 16, sft_checkpoint: str = None):
@@ -132,6 +155,24 @@ def load_trainable_models(model_path: str, lora_rank: int = 16, sft_checkpoint: 
                     loaded += 1
             print(f"  [sft] {adapter_name}: loaded {loaded} params from {ckpt}", flush=True)
         print(f"Loaded SFT checkpoint into all adapters from {sft_checkpoint}", flush=True)
+
+    # ── KL 参考 = 冻结的 SFT 快照（ref_* adapter） ─────────────────────────
+    # 每个角色克隆一份训练起点权重并冻结，as_ref(role) 切换到 ref_{role}。
+    # 无 SFT ckpt 时 LoRA B 为零初始化，ref 等价于 base，行为与旧实现一致。
+    # 注意必须在 resume 覆盖 role adapter 之前克隆（train.py 的 resume 只回填
+    # role adapter），保证 ref 始终是 SFT 起点而非 RL 中间态。
+    params_by_name = dict(model.named_parameters())
+    for role_name in ROLE_ADAPTER.values():
+        ref_name = f"ref_{role_name}"
+        model.add_adapter(ref_name, lora_cfg)
+        for name, param in model.named_parameters():
+            if "lora_" not in name or f".{ref_name}." not in name:
+                continue
+            src = params_by_name[name.replace(f".{ref_name}.", f".{role_name}.")]
+            param.data = src.data.clone()   # clone 同时对齐 dtype（bf16）
+            param.requires_grad_(False)
+    model.set_adapter("proposer")   # add_adapter 会激活新 adapter，切回训练态
+    print("Created frozen ref_* adapters (KL anchor = SFT snapshot)", flush=True)
 
     model.config.use_cache = False
     model.enable_input_require_grads()

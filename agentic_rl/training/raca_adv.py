@@ -1,8 +1,12 @@
 """RACA v2 Phase 3：两层优势计算（纯 Python，零 torch/numpy 依赖，可单测）。
 
 - Layer 1（Controller）：episode 级组内归一化，零方差组丢弃（继承 v1.x Fix 7）
-- Layer 2（Prop/Crit/Verif）：anchor key = (role, σ, is_response)
-  组内去重（v2 §5.2）：同一 episode 同一轮的同角色多 turn 携带相同 reward 时，
+- Layer 2（Prop/Crit/Verif）：anchor key = (role, σ, is_response, layer_key)
+  layer_key 仅 proposer 主 turn 非 None（= p_t）：v2.1 新增的分层。主 turn 奖励
+  是 r_prop(0或1) + λ·r_int(±0.3) 的混合，不分层时归一化后的优势主要反映
+  “答对了吗”（差异 1.0），交互决策（差异 ≤0.35）只是噪声；按 p_t 分层后组内
+  r_prop 相同、被均值消掉，优势纯粹反映交互决策的优劣。
+- 组内去重（v2 §5.2）：同一 episode 同一轮的同角色多 turn 携带相同 reward 时，
   只以一个代表样本参与 μ/σ 计算，优势再广播回全部 turn——防止重复样本
   人为压低组内方差。
 """
@@ -39,14 +43,16 @@ def compute_raca_advantages(turn_data_list: list, delta: float = 1e-4) -> list:
         [(r - mu_c) / sig_c for r in ctrl_rewards] if sig_c > delta else None
     )
 
-    # ── Layer 2: anchor (role, σ, is_response) + 组内去重 ────────────────────
+    # ── Layer 2: anchor (role, σ, is_response, layer_key) + 组内去重 ────────
     # entry: (ep_idx, tid, reward, dedup_key)
     anchor_groups: dict = defaultdict(list)
     for ep_idx, td in enumerate(turn_data_list):
         for tid, v in td.items():
             if v["role"] == "controller":
                 continue
-            key = (v["role"], v.get("sigma", "explore"), bool(v.get("is_response", False)))
+            key = (v["role"], v.get("sigma", "explore"),
+                   bool(v.get("is_response", False)),
+                   v.get("layer_key"))          # None 除 proposer 主 turn 外
             dedup_key = (ep_idx, v.get("round", 0), v["role"],
                          bool(v.get("is_response", False)), v["reward"])
             anchor_groups[key].append((ep_idx, tid, v["reward"], dedup_key))

@@ -682,6 +682,8 @@ commit 3611725 对该函数**只添加了解释性 docstring**（说明为何不
 - **备注**：修复后日志中 kl 从 0.032 漂到 0.167（200 步）。大部分漂移发生在
   轮次坍塌期（step 30～60）；Fix 1/2 生效后 KL 压力应自然减小。
   若仍偏高可考虑 kl_coef → 0.1 或自适应 KL。
+- **v2.1 更新**：参考模型从裸 base 改为冻结的 SFT 快照（见 §14.4），
+  本条的 `disable_adapter_layers()` 实现仅作为无 ref adapter 时的回退路径保留。
 
 ### Fix 15：LoRA adapter dtype 不统一（F32 混入 bf16）
 
@@ -1138,10 +1140,11 @@ A_total[k,    i, t] = A_S[k, i, σ_t, is_resp]     # k ∈ {prop, crit, verif}
 
 ---
 
-## 6. Phase 4：策略更新（不变）
+## 6. Phase 4：策略更新
 
-PPO clip loss + KL(对 base model) 惩罚，per-turn 立即 backward，
-梯度按 total_valid 归一化，4 adapter 经 set_adapter() 天然隔离。同 v1。
+PPO clip loss + KL 惩罚，per-turn 立即 backward，
+梯度按 total_valid 归一化，4 adapter 经 set_adapter() 天然隔离。
+KL 参考：v2.0 对裸 base model；v2.1 起改为对冻结的 SFT 快照（见 §14.4）。
 
 ---
 
@@ -1384,7 +1387,7 @@ r_int 矩阵使发起永远不划算
 熵从 1.233 跌到 0.445（−64%）是上述行为收敛的伴生现象——策略正确地收敛到
 "永远输出 action: none"，属激励结构导致的合理收敛，而非独立的熵坍塌病症。
 
-## 14. v2.1 修正（三处，同属一条失效链，必须同时改）
+## 14. v2.1 修正（14.1–14.3 同属一条失效链，必须同时改；14.4 为复查追加）
 
 ### 14.1 r_int 矩阵重设计（经期望值校准）
 
@@ -1425,16 +1428,46 @@ v2.0 的 ε 注入固定注 critic，verifier 无任何被动调用通道，而�
    直接解锁终止路径（对应 §2.1 原文"或自动触发一次 verify"分支）
 2. 其余 ε 注入按 `eps_verifier_share=0.5` 在 critic/verifier 间随机选
 
+### 14.4 KL 锚定修正：参考模型从裸 base 改为冻结 SFT 快照（复查追加）
+
+**证据**：v2.0 日志里 k3 KL 从 0.748（step 1）**单调**降到 0.178（step 79）——
+策略在被 `kl_coef=0.04` 持续拉向 base，而 base 从未学过 `<interaction>`、
+`decision: stop`、`分数:` 格式——KL 惩罚在系统性抹除恰好是 v2 赖以运转的
+SFT 行为，与 int/stop 坍塌高度同步。这是独立于 r_int 矩阵缺陷的第二条
+压力通路：即使 14.1 矩阵正确，KL 锚错位也会把交互格式磨掉。
+
+**实现**（`trainable_llm.py` / `grpo_trainer.py`）：
+- `load_trainable_models` 在 SFT 权重加载后为每个角色克隆冻结的
+  `ref_{role}` adapter（= 训练起点快照）；克隆发生在 resume 回填之前，
+  断点续训时 ref 仍是 SFT 起点而非 RL 中间态。
+- `as_ref(role)` 切到 `ref_{role}` 做参考前向；无 ref adapter 时回退旧的
+  `disable_adapter_layers()`（兼容旧脚本）。
+- `lora_parameters()` 排除 `.ref_`：优化器 / clip_grad_norm_ / NaN guard
+  都不碰 ref；`save_pretrained` 不存 ref（load 时从 SFT ckpt 重建），
+  checkpoint 目录结构不变，`sync_lora` 只认四个角色名也不受影响。
+- 无 SFT ckpt 时 LoRA B 零初始化，ref 等价 base，行为与旧实现一致。
+
+**验收信号**：step 1 的 `kl` 应 ≈ 0（策略=SFT 起点=参考），之后缓慢爬升；
+v2.0 是 0.75 起步单调下降。若首步 kl 仍在 0.5+，说明 ref 没挂上。
+
+**配套观测修复**：stdout step 行补齐 `eff=`（int_effectiveness，即 q 的在线
+估计）、`sel=`（int_selectivity）、`parse=`、`gate=`；缺失时打 `--` 而非 0，
+区分“无自发求助样本”与“求助全部无效”——v2.0 日志正因缺这几项无法
+事后验证 q（q > c_int/int_gain ≈ 6.7% 是 14.1 矩阵成立的前提）。
+
 ## 15. 熵指标的处理决定
 
-不动 `kl_coef`、不加 entropy bonus。理由：熵下降是 13.3 中行为退化的**结果**
+不动 `kl_coef`、不加 entropy bonus（KL 参考的更换见 §14.4，那是锚点纠错
+而非旋钮调参）。理由：熵下降是 13.3 中行为退化的**结果**
 而非独立病因，修复激励结构后交互决策重新具备价值，熵应自然回升。同时改多个
 耦合旋钮会破坏归因能力（既有教训）。观察点：v2.1 首跑若 int_rate 回升而 entropy
 仍单调跌向 0.2 以下，再考虑独立干预。
 
 ## 16. v2.1 与 v2.0 的可比性
 
-奖励矩阵改变 → `reward` 曲线绝对值不可比；`int_rate` / `stop_rate` /
-`entropy` / `eval_acc` 可比（同一 grader、同一 SFT 起点 `checkpoints/sft_v2`）。
+奖励矩阵改变 → `reward` 曲线绝对值不可比；KL 锚更换（§14.4）→ `kl` 曲线
+不可比（v2.1 应从 ≈0 起步缓升，v2.0 是 0.75 起步单降）；`int_rate` /
+`stop_rate` / `entropy` / `eval_acc` 可比（同一 grader、同一 SFT 起点
+`checkpoints/sft_v2`）。
 v2.0 那 79 步的价值在于**证伪**：它是"交互奖励设计错误会导致机制空转"的
 反面证据，可作为论文中 r_int 设计必要性的实证支撑（比单纯的 λ=0 消融更有力）。

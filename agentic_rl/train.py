@@ -316,6 +316,10 @@ def main(cfg: DictConfig):
 
         consecutive_skips = 0
         step += 1
+        # int_effectiveness/selectivity 可能缺失（无自发求助样本时），缺失时打 "--"
+        # 而非 0，避免与真实零值混淆（v2.0 日志正因缺这几项无法事后验证 q）。
+        _eff = stats.get("int_effectiveness")
+        _sel = stats.get("int_selectivity")
         print(
             f"step={step} reward={stats['mean_reward']:.3f} acc={stats['accuracy']:.2f} "
             f"loss={stats['loss']:.4f} kl={stats['kl']:.4f} "
@@ -324,6 +328,10 @@ def main(cfg: DictConfig):
             f"len={stats.get('resp_len', 0.0):.0f} "
             f"groups={_g_kept}/{_g_total} "
             f"int_rate={stats.get('int_rate', 0.0):.2f} "
+            f"eff={'--' if _eff is None else f'{_eff:.2f}'} "
+            f"sel={'--' if _sel is None else f'{_sel:+.2f}'} "
+            f"parse={stats.get('parse_rate', 1.0):.2f} "
+            f"gate={stats.get('gate_blocked', 0)} "
             f"stop_rate={stats.get('stop_rate', 0.0):.2f} eps={eps_force:.2f}",
             flush=True,
         )

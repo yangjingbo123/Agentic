@@ -42,6 +42,13 @@ def rollout_metrics(batch_rollouts: list) -> dict:
         # 答案可解析率：格式崩了 reward 再高也是假的
         out["parse_rate"] = float(np.mean(
             [1.0 if m.get("primary_parsed", True) else 0.0 for m in rounds]))
+        # ── 修正漏斗（v2.2）：flag → correction → flip ──────────────────
+        # v2.1 实测 eff≈0 的定位工具。计入全部轮（含 forced 注入）：
+        # flag 高而 corr 低 = 修正跳断（hop 预算/机制）；
+        # corr 高而 flip 低 = proposer 拿着反馈也修不对（反馈质量/能力上限）。
+        out["funnel_flag"] = int(sum(m.get("n_flagged", 0) for m in rounds))
+        out["funnel_corr"] = int(sum(m.get("n_corrections", 0) for m in rounds))
+        out["funnel_flip"] = int(sum(1 for m in rounds if m.get("flip")))
 
     # ── stop 校准：P(correct | stop) vs P(correct | 耗尽轮次) ────────────────
     stopped   = [ep["is_correct"] for ep in eps if ep.get("stopped")]

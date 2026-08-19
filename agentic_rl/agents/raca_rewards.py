@@ -185,6 +185,11 @@ def compute_turn_data(
             "gate_blocked": bool(rnd.get("gate_blocked", False)),
             # 格式健康（可解析率监控）；缺失时保守计为已解析
             "primary_parsed": bool(rnd.get("primary_parsed", True)),
+            # 修正漏斗（v2.2）：flag → correction → flip。计入全部轮
+            # （含 forced 注入），比 eff（仅自发求助）覆盖更广。
+            "n_flagged":     sum(1 for ct in rnd["critic_turns"] if ct["flagged"]),
+            "n_corrections": len(rnd["correction_turns"]),
+            "flip":          (not p_prim) and p_end,
         })
 
     # ── Controller episode 结果奖励（§4.5，公式与 v1 一致） ─────────────────

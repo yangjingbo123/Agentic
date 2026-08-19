@@ -423,7 +423,10 @@ def test_integration_forced_injection_and_ablation():
     # test_integration_gate_blocked_injects_verifier 与 下方 share=1 用例覆盖）
     script = {
         "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>"] * 4,
-        "proposer":   [INTER.format(a="none", t="none") + "推理过程：x\n最终答案：5"] * 4,
+        # v2.2 机械触发：critic 标错（即使不输出 <interaction>）→ 自动生成修正跳，
+        # 故 proposer 脚本为「主 turn、修正」交替 ×4
+        "proposer":   [INTER.format(a="none", t="none") + "推理过程：x\n最终答案：5",
+                       INTER.format(a="none", t="none") + "推理过程：fix\n最终答案：5"] * 4,
         "critic":     [INTER.format(a="none", t="none") + "错误分析：有错"] * 4,
     }
     eng = FakeEngine(script)
@@ -435,6 +438,13 @@ def test_integration_forced_injection_and_ablation():
     prop_main = [v for v in res["raca_turn_data"].values()
                  if v["role"] == "proposer" and not v["is_response"]]
     assert all(approx(v["reward"], 0.0) for v in prop_main)
+    # v2.2 机械触发：critic 无 <interaction> 也产生修正跳（漏斗 corr 不再恒 0）
+    corr_turns = [v for v in res["raca_turn_data"].values()
+                  if v["role"] == "proposer" and v["is_response"]]
+    assert len(corr_turns) == 4
+    m0 = res["raca_round_meta"][0]
+    assert m0["n_flagged"] == 1 and m0["n_corrections"] == 1
+    assert m0["flip"] is False   # 修了但仍错 → 未翻转
 
     # eps_verifier_share=1.0：强制注入改选 verifier（保障 verifier 有训练数据）
     script = {

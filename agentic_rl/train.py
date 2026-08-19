@@ -332,6 +332,8 @@ def main(cfg: DictConfig):
             f"sel={'--' if _sel is None else f'{_sel:+.2f}'} "
             f"parse={stats.get('parse_rate', 1.0):.2f} "
             f"gate={stats.get('gate_blocked', 0)} "
+            f"fnl={stats.get('funnel_flag', 0)}/{stats.get('funnel_corr', 0)}"
+            f"/{stats.get('funnel_flip', 0)} "
             f"stop_rate={stats.get('stop_rate', 0.0):.2f} eps={eps_force:.2f}",
             flush=True,
         )
@@ -350,7 +352,8 @@ def main(cfg: DictConfig):
                     "parse_rate",
                     "int_rate", "int_effectiveness", "int_selectivity",
                     "forced_rate", "stop_rate", "stop_acc", "exhaust_acc",
-                    "gate_blocked"):
+                    "gate_blocked",
+                    "funnel_flag", "funnel_corr", "funnel_flip"):
             if _mk in stats:
                 log_data[_mk] = stats[_mk]
         if _g_total:

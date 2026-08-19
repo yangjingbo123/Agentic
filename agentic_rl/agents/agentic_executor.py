@@ -234,6 +234,7 @@ class AgenticExecutor:
                     out = record(i, target, sys, usr, res, tid)
                     st = ep_st[i]
                     bb = blackboards[i]
+                    flagged = False
 
                     if target == "critic":
                         flagged = critic_found_errors(out)
@@ -261,9 +262,20 @@ class AgenticExecutor:
                         for ct in st["critic_turns"]:
                             ct["correction_followed"] = True
 
-                    # 响应方可再发起下一跳（受 hop 预算约束）
+                    # 响应方的下一跳（受 hop 预算约束）。
+                    # v2.2：critic 标错 → 机械触发 proposer 修正，不再依赖 critic
+                    # 自己学会输出 <interaction>。v2.1 实测 eff≈0：修正跳由“未学会
+                    # 的行为”把守，correction_turns 几乎恒空 → q≈0 → 发起恒负期望
+                    # → int_rate 塌。与 gate_blocked 强注 verifier 同一设计哲学：
+                    # 关键因果通路由机制保证，角色只学“判断”，不学“走流程”。
                     a2, t2, r2 = parse_interaction(out)
-                    if a2 != "none" and t2 != target:
+                    if target == "critic" and flagged:
+                        bb.add_message(Message(
+                            list(ROLE_NAMES).index(target), MessageType.INTERACTION,
+                            {"from": target, "action": "request",
+                             "target": "proposer", "reason": r2}))
+                        st["pending"].append((target, out, "request", "proposer", r2, False))
+                    elif a2 != "none" and t2 != target:
                         bb.add_message(Message(
                             list(ROLE_NAMES).index(target), MessageType.INTERACTION,
                             {"from": target, "action": a2, "target": t2, "reason": r2}))

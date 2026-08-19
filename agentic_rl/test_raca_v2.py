@@ -520,6 +520,58 @@ def test_parse_rate_metric():
     assert all(m["primary_parsed"] is True for m in res["raca_round_meta"])
 
 
+def test_ref_adapter_naming_avoids_peft_substring_trap():
+    """ref adapter 名必须与角色名互不为子串（v2.1 首启即崩的根因）。
+
+    PEFT 的 get_peft_model_state_dict 用**子串匹配**筛选 adapter 权重：
+        {k: v for k, v in sd.items() if ("lora_" in k and adapter_name in k) or ...}
+    旧命名 `ref_controller` 含 `controller` 子串，导出 controller 时 ref 权重
+    被误纳入；而后续 key 清理用 `k.replace(f".{adapter_name}", "")`，
+    `.ref_controller.` 中 `controller` 前面是 `_` 而非 `.`，替换不生效，
+    于是 `lora_A.ref_controller.weight` 原样写入 safetensors，vLLM 报
+    `ValueError: ... is unsupported LoRA weight`。
+    """
+    from llm.adapter_names import ADAPTER_NAMES, REF_ADAPTER, REF_PREFIX
+
+    refs = list(REF_ADAPTER.values())
+    assert len(refs) == len(ADAPTER_NAMES) == 4
+    assert len(set(refs)) == 4, f"ref 名重复: {refs}"
+
+    # 核心：任一角色名不得是任一 ref 名的子串（反之亦然）
+    for role in ADAPTER_NAMES:
+        for ref in refs:
+            assert role not in ref, f"ref {ref!r} 含角色名 {role!r} → PEFT 导出会混入"
+            assert ref not in role, f"角色名 {role!r} 含 ref 名 {ref!r}"
+    # 旧命名作为反例：必须被上述规则判为非法
+    for role in ADAPTER_NAMES:
+        assert role in f"ref_{role}", "反例自洽失败"
+
+    # 模拟 PEFT 的筛选 + key 清理，验证新命名下导出干净
+    def peft_export(sd_keys, adapter_name):
+        picked = [k for k in sd_keys if "lora_" in k and adapter_name in k]
+        return [k.replace(f".{adapter_name}", "") for k in picked]
+
+    for role in ADAPTER_NAMES:
+        ref = REF_ADAPTER[role]
+        sd = [f"base.layers.0.q_proj.lora_A.{r}.weight" for r in ADAPTER_NAMES] + \
+             [f"base.layers.0.q_proj.lora_A.{r}.weight" for r in refs]
+        out = peft_export(sd, role)
+        assert out == ["base.layers.0.q_proj.lora_A.weight"], \
+            f"导出 {role} 时 key 不干净: {out}"
+        # 旧命名下的对照：会泄出带 ref 后缀的 key（vLLM 崩溃的直接原因）
+        sd_old = [f"base.layers.0.q_proj.lora_A.{r}.weight" for r in ADAPTER_NAMES] + \
+                 [f"base.layers.0.q_proj.lora_A.ref_{r}.weight" for r in ADAPTER_NAMES]
+        out_old = peft_export(sd_old, role)
+        assert any("ref_" in k for k in out_old), "旧命名应复现泄露问题"
+
+    # lora_parameters / save_pretrained 的过滤条件与命名一致
+    for ref in refs:
+        assert ref.startswith(REF_PREFIX)
+        assert f".{REF_PREFIX}" in f"x.lora_A.{ref}.weight"
+    for role in ADAPTER_NAMES:
+        assert f".{REF_PREFIX}" not in f"x.lora_A.{role}.weight"
+
+
 def test_signal_quality_metrics():
     """信号质量统计：全对组/全错组占比 + 组内 std（零 torch 依赖）。"""
     from training.metrics import rollout_metrics as T_metrics

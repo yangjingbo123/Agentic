@@ -4,13 +4,7 @@ from contextlib import contextmanager
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import get_peft_model, LoraConfig, PeftModel
 
-
-ROLE_ADAPTER = {
-    "proposer":   "proposer",
-    "controller": "controller",
-    "critic":     "critic",
-    "verifier":   "verifier",
-}
+from llm.adapter_names import ADAPTER_NAMES, REF_ADAPTER, REF_PREFIX, ROLE_ADAPTER
 
 
 class RoleModel:
@@ -22,22 +16,27 @@ class RoleModel:
 
     @contextmanager
     def as_ref(self, role: str = "proposer"):
-        """切换到冻结的 SFT 快照 adapter（ref_{role}）作参考模型。
+        """切换到冻结的 SFT 快照 adapter（klref{i}）作参考模型。
 
         v2.0 曾 disable_adapter_layers() 用裸 base 作参考：KL 惩罚把策略持续
         拉向从未学过 <interaction>/decision: stop 格式的 base，系统性抹除 SFT
         行为（v2.0 全量日志：kl 0.75→0.18 单调下降，与 int/stop 坍塌同步）。
         KL 锚定 SFT 起点才是 trust region 的本意。
-        无 ref adapter 时回退旧行为（兼容未建 ref 的旧 checkpoint 脚本）。
+
+        注意 ref 名不能叫 `ref_{role}`：PEFT 的 get_peft_model_state_dict 用
+        子串匹配筛选，导致导出 controller 时把 ref_controller 权重误纳入
+        → sync_lora 给 vLLM 的 safetensors 里带上 `.ref_controller.`后缀
+        → vLLM 报 unsupported LoRA weight 而崩。新命名见 adapter_names.py。
+        无 ref adapter 时回退旧行为（兼容未建 ref 的旧 checkpoint）。
         """
-        ref_name = f"ref_{ROLE_ADAPTER.get(role, 'proposer')}"
+        ref_name = REF_ADAPTER.get(ROLE_ADAPTER.get(role, "proposer"),
+                                   REF_ADAPTER["proposer"])
         if ref_name in self._model.peft_config:
             self._model.set_adapter(ref_name)
             try:
                 yield self._model
             finally:
-                # set_adapter 会把 ref 参数 requires_grad 置 True，回滚冻结状态；
-                # 训练 adapter 由调用方随后 set_adapter 恢复（与 as_role 同约定）。
+                # set_adapter 会把 ref 参数 requires_grad 置 True，回滚冻结状态
                 for n, p in self._model.named_parameters():
                     if f".{ref_name}." in n:
                         p.requires_grad_(False)
@@ -75,17 +74,20 @@ class RoleModel:
         set_adapter 的那个 adapter」会进入优化器，其余 adapter 永远不会被
         优化器更新，也不会被 zero_grad() 清零——梯度持续累加。
         因此优化器和 clip_grad_norm_ 都应使用此方法。
-        ref_* adapter 是冻结的 KL 参考快照，永远不进优化器。
+        klref* adapter 是冻结的 KL 参考快照，永远不进优化器。
         """
         return [p for n, p in self._model.named_parameters()
-                if "lora_" in n and ".ref_" not in n]
+                if "lora_" in n and f".{REF_PREFIX}" not in n]
 
     def named_parameters(self):
         return self._model.named_parameters()
 
     def save_pretrained(self, path):
-        # 只保存训练 adapter；ref_* 是 SFT 快照，load 时从 SFT ckpt 重建即可
-        trainable = [n for n in self._model.peft_config if not n.startswith("ref_")]
+        # 只保存训练 adapter；klref* 是 SFT 快照，load 时从 SFT ckpt 重建即可。
+        # 关键：ref 名与角色名互不为子串（adapter_names.py 保证），否则 PEFT
+        # 子串匹配会将 ref 权重混入导出→ vLLM 加载崩。
+        trainable = [n for n in self._model.peft_config
+                     if not n.startswith(REF_PREFIX)]
         self._model.save_pretrained(path, selected_adapters=trainable)
 
 
@@ -157,13 +159,13 @@ def load_trainable_models(model_path: str, lora_rank: int = 16, sft_checkpoint: 
         print(f"Loaded SFT checkpoint into all adapters from {sft_checkpoint}", flush=True)
 
     # ── KL 参考 = 冻结的 SFT 快照（ref_* adapter） ─────────────────────────
-    # 每个角色克隆一份训练起点权重并冻结，as_ref(role) 切换到 ref_{role}。
+    # 每个角色克隆一份训练起点权重并冻结，as_ref(role) 切换到 klref{i}。
     # 无 SFT ckpt 时 LoRA B 为零初始化，ref 等价于 base，行为与旧实现一致。
     # 注意必须在 resume 覆盖 role adapter 之前克隆（train.py 的 resume 只回填
     # role adapter），保证 ref 始终是 SFT 起点而非 RL 中间态。
     params_by_name = dict(model.named_parameters())
-    for role_name in ROLE_ADAPTER.values():
-        ref_name = f"ref_{role_name}"
+    for role_name in ADAPTER_NAMES:
+        ref_name = REF_ADAPTER[role_name]
         model.add_adapter(ref_name, lora_cfg)
         for name, param in model.named_parameters():
             if "lora_" not in name or f".{ref_name}." not in name:
@@ -172,7 +174,8 @@ def load_trainable_models(model_path: str, lora_rank: int = 16, sft_checkpoint: 
             param.data = src.data.clone()   # clone 同时对齐 dtype（bf16）
             param.requires_grad_(False)
     model.set_adapter("proposer")   # add_adapter 会激活新 adapter，切回训练态
-    print("Created frozen ref_* adapters (KL anchor = SFT snapshot)", flush=True)
+    print(f"Created frozen ref adapters {list(REF_ADAPTER.values())} "
+          f"(KL anchor = SFT snapshot)", flush=True)
 
     model.config.use_cache = False
     model.enable_input_require_grads()

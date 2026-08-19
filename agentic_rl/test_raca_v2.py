@@ -14,7 +14,8 @@ from training.raca_adv import compute_raca_advantages
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 CFG = {"ctrl_alpha": 0.3, "ctrl_beta": 0.2, "ctrl_gamma": 0.3,
-       "c_int": 0.05, "lambda_int": 1.0}
+       "c_int": 0.02, "lambda_int": 1.0,
+       "int_gain": 0.3, "int_overkill": 0.05}
 
 
 def make_round(t, sigma="explore", primary="4", corrected=None, u=False,
@@ -81,45 +82,68 @@ def test_parse_interaction():
 # ── 奖励矩阵 ─────────────────────────────────────────────────────────────────
 
 def test_r_int_effective_help():
-    """u=1、primary 错、修正对：r_prop=0，r_int=−0.05+0.3=0.25。"""
+    """u=1、primary 错、修正对：r_prop=0，r_int=−0.02+0.3=0.28。"""
     rounds = [make_round(0, primary="5", corrected="4", u=True, target="critic",
                          critic_turns=[{"tid": 2, "flagged": True,
                                         "reviewed_answer": "5",
                                         "correction_followed": True}],
                          correction_turns=[{"tid": 3, "answer": "4"}])]
     td, meta = compute_turn_data(rounds, "4", True, 4, CFG)
-    assert approx(td[1]["reward"], 0.25)                     # proposer 主 turn
+    assert approx(td[1]["reward"], 0.28)                     # proposer 主 turn
     assert approx(td[2]["reward"], 0.3)                      # critic 真阳性、本轮修对 q=1
     assert approx(td[3]["reward"], 1.0)                      # 修正响应：新答案对
     assert td[2]["is_response"] and td[3]["is_response"]
     assert not td[1]["is_response"]
+    assert td[1]["layer_key"] == 0                           # p_t=0 分层
     assert meta[0]["u"] and not meta[0]["p_primary"] and meta[0]["p_end"]
 
 
 def test_r_int_useless_and_overkill():
-    # 无效求助：错→仍错，r_int=−0.05+0 → reward=−0.05
+    # 无效求助：错→仍错，r_int=−0.02+0 → reward=−0.02
     rounds = [make_round(0, primary="5", u=True, target="verifier",
                          verifier_turns=[{"tid": 2, "score": 0.2,
                                           "reviewed_answer": "5"}])]
     td, _ = compute_turn_data(rounds, "4", False, 4, CFG)
-    assert approx(td[1]["reward"], -0.05)
-    # 画蛇添足：对还求助，1.0 + (−0.05−0.2) = 0.75
+    assert approx(td[1]["reward"], -0.02)
+    # 画蛇添足：对还求助，1.0 + (−0.02−0.05) = 0.93
     rounds = [make_round(0, primary="4", u=True, target="critic",
                          critic_turns=[{"tid": 2, "flagged": False,
                                         "reviewed_answer": "4",
                                         "correction_followed": False}])]
     td, _ = compute_turn_data(rounds, "4", True, 4, CFG)
-    assert approx(td[1]["reward"], 0.75)
+    assert approx(td[1]["reward"], 0.93)
     assert approx(td[2]["reward"], 0.1)                      # critic 真阴性
 
 
-def test_r_int_no_initiation_and_forced():
-    # 不发起 + 对：1.0 + 0.1（正确的自信）
+def test_r_int_no_unconditional_subsidy():
+    """v2.1 核心回归：不发起一律 0，不得给无条件补贴。
+
+    v2.0 给“不发起+答对”+0.1，这笔补贴与画蛇添足惩罚共同使 p>0.5 时
+    发起的边缘期望恒为负（即使 q=1.0）→ int_rate 必然塌到 0。
+    """
+    # 不发起 + 对：只有 r_prop=1.0，无额外奖励
     td, _ = compute_turn_data([make_round(0, primary="4")], "4", True, 4, CFG)
-    assert approx(td[1]["reward"], 1.1)
-    # 不发起 + 错：0（机会成本不双计）
+    assert approx(td[1]["reward"], 1.0)
+    assert td[1]["layer_key"] == 1
+    # 不发起 + 错：0（机会成本已由 r_prop=0 体现，不双重计罚）
     td, _ = compute_turn_data([make_round(0, primary="5")], "4", False, 4, CFG)
     assert approx(td[1]["reward"], 0.0)
+
+    # 期望值校准：模型已知自身对错时的条件最优选择必须正确
+    c, A, B = CFG["c_int"], CFG["int_gain"], CFG["int_overkill"]
+    assert -c + A * 0.5 > 0.0, "p_t=0 且求助半数有效时，发起必须划算"
+    assert -c - B < 0.0, "p_t=1 时发起必须不划算"
+    # 边缘期望：p=0.6、q=0.5 时应跨越零点（而非恒负）
+    p, q = 0.6, 0.5
+    marginal = p * (-c - B) + (1 - p) * (-c + A * q)
+    assert marginal > 0, f"p=0.6/q=0.5 边缘期望应为正，实测 {marginal:+.4f}"
+    # 强模型（p=0.85）应不求助
+    p = 0.85
+    marginal = p * (-c - B) + (1 - p) * (-c + A * 1.0)
+    assert marginal < 0, f"p=0.85 时即使 q=1 也不应求助，实测 {marginal:+.4f}"
+
+
+def test_r_int_no_initiation_and_forced():
     # forced 注入：发起方不计 r_int → reward = r_prop
     rounds = [make_round(0, primary="5", forced=True,
                          critic_turns=[{"tid": 2, "flagged": True,
@@ -128,6 +152,12 @@ def test_r_int_no_initiation_and_forced():
     td, meta = compute_turn_data(rounds, "4", False, 4, CFG)
     assert approx(td[1]["reward"], 0.0)
     assert meta[0]["forced"] and not meta[0]["u"]
+    # forced 且答对：仍只有 r_prop，不因被强制调用而被罚
+    rounds = [make_round(0, primary="4", forced=True,
+                         verifier_turns=[{"tid": 2, "score": 0.9,
+                                          "reviewed_answer": "4"}])]
+    td, _ = compute_turn_data(rounds, "4", True, 4, CFG)
+    assert approx(td[1]["reward"], 1.0)
 
 
 def test_critic_matrix():
@@ -252,6 +282,41 @@ def test_layer2_dedup_broadcast():
     assert approx(adv[1][5], -1.0)
 
 
+def test_layer2_p_t_stratification():
+    """v2.1：proposer 主 turn 按 p_t 分层，隔离 r_prop 对交互信号的淹没。
+
+    不分层时：奖励 [1.0(对/不求助), 0.93(对/求助), 0.28(错/求助修对), 0(错/不求助)]
+    归一化后优势主要由“对/错”驱动，交互决策的 0.07 差异被 1.0 的差异淹没。
+    分层后：p_t=1 组内比 [1.0, 0.93] → 不求助胜；p_t=0 组内比 [0.28, 0]
+    → 有效求助胜。两个结论都是“交互决策对不对”，而非“答对了吗”。
+    """
+    def prop(reward, p_t):
+        v = mk_turn("proposer", 0, "explore", False, reward)
+        v["layer_key"] = p_t
+        return v
+
+    eps = [
+        {1: prop(1.00, 1)},   # 对 + 不求助（正确行为）
+        {1: prop(0.93, 1)},   # 对 + 求助（画蛇添足）
+        {1: prop(0.28, 0)},   # 错 + 求助且修对（正确行为）
+        {1: prop(0.00, 0)},   # 错 + 不求助（错过机会）
+    ]
+    adv = compute_raca_advantages(eps)
+    # p_t=1 组：不求助得正优势、求助得负优势
+    assert adv[0][1] > 0 > adv[1][1]
+    # p_t=0 组：有效求助得正优势、不求助得负优势
+    assert adv[2][1] > 0 > adv[3][1]
+    # 关键：两组优势量级相当（都是±1）——交互信号未被 r_prop 淹没
+    assert approx(abs(adv[0][1]), abs(adv[2][1]))
+
+    # 对照：若不分层（layer_key 全 None），同样四个样本的优势会被“对/错”主导
+    eps_flat = [{1: mk_turn("proposer", 0, "explore", False, r)}
+                for r in (1.00, 0.93, 0.28, 0.00)]
+    adv_flat = compute_raca_advantages(eps_flat)
+    # 不分层时，“对+求助”(0.93) 仍获正优势——画蛇添足没被惩罚
+    assert adv_flat[1][1] > 0, "不分层时画蛇添足会被错误地奖励（这正是 v2.0 的问题）"
+
+
 def test_end_to_end_rewards_to_advantages():
     """完整链路：两个 rollout 的 round_records → 奖励 → 优势。"""
     # rollout A：求助并修对；rollout B：不求助、答错
@@ -337,11 +402,11 @@ def test_integration_full_episode():
     td = res["raca_turn_data"]
     rewards = {(v["role"], v["round"], v["is_response"]): v["reward"]
                for v in td.values()}
-    assert approx(rewards[("proposer", 0, False)], 0.25)   # 0 + (−0.05+0.3)
+    assert approx(rewards[("proposer", 0, False)], 0.28)   # 0 + (−0.02+0.3)
     assert approx(rewards[("critic", 0, True)], 0.3)       # 真阳性且本轮修对
     assert approx(rewards[("proposer", 0, True)], 1.0)     # 修正响应
     assert approx(rewards[("verifier", 1, True)], 0.9)     # 审的是"4"（对）：1−|0.9−1|
-    assert approx(rewards[("proposer", 1, False)], 0.75)   # 画蛇添足：1+(−0.05−0.2)
+    assert approx(rewards[("proposer", 1, False)], 0.93)   # 画蛇添足：1+(−0.02−0.05)
     # stop turn：t_stop=2, rem=0.5, 答对 → 1.15
     stop_r = [v["reward"] for v in td.values()
               if v["role"] == "controller" and v["round"] == 2]
@@ -353,19 +418,37 @@ def test_integration_full_episode():
 
 
 def test_integration_forced_injection_and_ablation():
-    # eps_force=1.0：proposer 不求助也会被强制注入 critic 审查
+    # eps_force=1.0：proposer 不求助也会被强制注入审查
+    # eps_verifier_share=0 固定注 critic，使本例确定性（verifier 注入由
+    # test_integration_gate_blocked_injects_verifier 与 下方 share=1 用例覆盖）
     script = {
         "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>"] * 4,
         "proposer":   [INTER.format(a="none", t="none") + "推理过程：x\n最终答案：5"] * 4,
         "critic":     [INTER.format(a="none", t="none") + "错误分析：有错"] * 4,
     }
-    ex = _mk_executor(FakeEngine(script))
+    eng = FakeEngine(script)
+    ex = _mk_executor(eng, eps_verifier_share=0.0)
     res = ex.run_episodes_batch(["q"], ["4"], eps_force=1.0)[0]
     assert all(m["forced"] and not m["u"] for m in res["raca_round_meta"])
+    assert "critic" in eng.calls and "verifier" not in eng.calls
     # 强制轮：发起方 r_int=0 → proposer 主 turn 奖励 = 0.0
     prop_main = [v for v in res["raca_turn_data"].values()
                  if v["role"] == "proposer" and not v["is_response"]]
     assert all(approx(v["reward"], 0.0) for v in prop_main)
+
+    # eps_verifier_share=1.0：强制注入改选 verifier（保障 verifier 有训练数据）
+    script = {
+        "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>"] * 4,
+        "proposer":   [INTER.format(a="none", t="none") + "推理过程：x\n最终答案：5"] * 4,
+        "verifier":   [INTER.format(a="none", t="none") + "分数: 0.3\n验证说明：可疑"] * 4,
+    }
+    eng = FakeEngine(script)
+    ex = _mk_executor(eng, eps_verifier_share=1.0)
+    res = ex.run_episodes_batch(["q"], ["4"], eps_force=1.0)[0]
+    assert "verifier" in eng.calls and "critic" not in eng.calls
+    # verifier 响应 turn 获得校准奖励（审的是错答案 → 1−|0.3−0|=0.7）
+    vt = [v for v in res["raca_turn_data"].values() if v["role"] == "verifier"]
+    assert vt and all(approx(v["reward"], 0.7) for v in vt)
 
     # 消融A：max_hops=0 彻底禁用交互（求助被忽略，u=False，无响应 turn）
     script = {
@@ -377,6 +460,44 @@ def test_integration_forced_injection_and_ablation():
     res = ex.run_episodes_batch(["q"], ["4"], eps_force=1.0)[0]
     assert all(not m["u"] and not m["forced"] for m in res["raca_round_meta"])
     assert "critic" not in eng.calls and "verifier" not in eng.calls
+
+
+def test_integration_gate_blocked_injects_verifier():
+    """v2.1：controller 想停但黑板无分数时，强制注入 verifier 解锁终止路径。
+
+    v2.0 的 ε 注入只注 critic，verifier 无任何兜底通道：一旦 int_rate→0，
+    黑板永无 verifier 分数 → stop_gate 拦下所有 stop → episode 全部跑满
+    max_rounds（实测：eval 侧 stop_rate 恒 0、avg_turns 恒 8.0）。
+    """
+    script = {
+        "controller": [
+            "<meta-plan>\ndecision: stop\nreason: r\n</meta-plan>",   # 无分数→被拦
+            "<meta-plan>\ndecision: stop\nreason: r\n</meta-plan>",   # 此时已有分数→生效
+        ],
+        "proposer": [
+            INTER.format(a="none", t="none") + "推理过程：x\n最终答案：4",
+        ],
+        "verifier": [
+            INTER.format(a="none", t="none") + "分数: 0.9\n验证说明：ok",
+        ],
+    }
+    eng = FakeEngine(script)
+    # eps_force=0：证明 verifier 注入是由 gate_blocked 触发，而非 ε 概率
+    ex = _mk_executor(eng)
+    res = ex.run_episodes_batch(["q"], ["4"], eps_force=0.0)[0]
+
+    m0 = res["raca_round_meta"][0]
+    assert m0["gate_blocked"] is True          # 首轮 stop 被闸门拦下
+    assert m0["forced"] and not m0["u"]        # 强制注入、非自发
+    assert "verifier" in eng.calls             # 注入的是 verifier 而非 critic
+    assert "critic" not in eng.calls
+    # 分数入板后，第二轮 stop 生效 → episode 不再跑满 max_rounds=4
+    assert res["stopped"] is True
+    assert len(res["raca_round_meta"]) == 1
+    # 被强制注入的轮次，发起方不计 r_int（奖励 = r_prop = 1.0）
+    prop_main = [v for v in res["raca_turn_data"].values()
+                 if v["role"] == "proposer" and not v["is_response"]]
+    assert len(prop_main) == 1 and approx(prop_main[0]["reward"], 1.0)
 
 
 def test_parse_rate_metric():

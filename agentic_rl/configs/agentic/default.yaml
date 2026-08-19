@@ -18,13 +18,20 @@ ctrl_beta: 0.2
 # bonus when it is right). Early stopping pays off only when p(correct) exceeds
 # gamma/(alpha+gamma) = 0.5 at these defaults. Raise to discourage stopping.
 ctrl_gamma: 0.3
-# ── RACA v2: interaction-as-action ──
-c_int: 0.05          # 交互固定成本（每次自发发起扣除）
+# ── RACA v2.1: interaction-as-action（奖励矩阵经期望值校准，见 §13）──
+c_int: 0.02          # 交互固定成本（每次自发发起扣除）
+int_gain: 0.3        # 有效求助收益（错 → 对）
+int_overkill: 0.05   # 画蛇添足惩罚（本来就对还求助）
+# 不发起一律 0：v2.0 给“不发起+答对”+0.1 是无条件补贴，与 −0.2 画蛇添足
+# 惩罚共同使 p>0.5 时发起的边缘期望恒为负 → int_rate 必然塌到 0。
 lambda_int: 1.0      # 交互奖励合成权重；0 = 消融B（有交互不训练交互，即 v1 行为）
 max_hops: 2          # 每轮交互链响应跳数上限；0 = 消融A（完全禁用交互）
 stop_gate: true      # stop 需黑板存在 verifier 分数；消融A 时建议关闭
-eps_force_init: 0.3  # 强制注入 critic 审查的初始概率（冷启动保护，随 step 线性衰减）
+eps_force_init: 0.3  # 强制注入审查/验证的初始概率（冷启动保护，随 step 线性衰减）
 eps_force_min: 0.05
+# 强制注入时选 verifier 的概率；v2.0 固定注 critic 导致 verifier 零训练数据，
+# 而它恰好是 stop 闸门的看门人 → stop_rate 跟着塌。
+eps_verifier_share: 0.5
 # RACA variance threshold: groups whose reward std is <= this are treated as
 # degenerate and dropped (they carry no comparative signal).
 raca_delta: 1.0e-4

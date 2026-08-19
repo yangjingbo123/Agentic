@@ -26,20 +26,33 @@ from agents.grader import math_equal
 
 
 def _r_int(u: bool, forced: bool, p_primary: bool, p_end: bool,
-           c_int: float) -> float:
-    """§4.2 交互发起奖励矩阵。"""
+           c_int: float, gain: float, overkill: float) -> float:
+    """§4.2 交互发起奖励矩阵（v2.1 重设计，见 RACA_ALGORITHM.md §13）。
+
+    v2.0 的矩阵有数学缺陷：「不发起+答对」给 +0.1 是一笔**无条件补贴**，
+    与「发起+答对」的 −0.2 共同制造了 0.3p 的固定 gap，而有效求助最多只能
+    赚 0.3(1−p)。p>0.5 时无论求助有效率 q 多高，发起的边缘期望恒为负
+    —— int_rate→0 是数学必然。实测：step 20 交互率就从 0.58 塔到 0.02。
+
+    v2.1 修正：
+    - 删除不发起的无条件补贴（penalty-only 原则：不为“什么都不做”发奖）
+    - 画蛇添足惩罚 −0.2 → −overkill(0.05)，交互成本 0.05 → c_int(0.02)
+    使边缘期望在现实区间跨越零点：弱（p≈0.3）时求助划算、强（p≈0.85）时不划算，
+    模型的自我置信度成为决定因素（即“选择性交互”）。
+    """
     if forced:
         return 0.0                        # 决策不是发起方做的，不奖不罚
     if u:
         if not p_primary and p_end:
-            gain = 0.3                    # 有效求助：错 → 对
+            g = gain                      # 有效求助：错 → 对
         elif not p_primary:
-            gain = 0.0                    # 无效求助：错 → 仍错
+            g = 0.0                       # 无效求助：错 → 仍错（只付成本）
         else:
-            gain = -0.2                   # 画蛇添足：本来就对
-        return -c_int + gain
-    # 不发起
-    return 0.1 if p_primary else 0.0     # 正确的自信 / 机会成本已含在 r_prop
+            g = -overkill                 # 画蛇添足：本来就对
+        return -c_int + g
+    # 不发起：一律 0。给“正确的自信”发奖会造成不发起的无条件补贴，
+    # 把交互压到零；错而不求助的机会成本已由 r_prop=0 体现，不需双重计罚。
+    return 0.0
 
 
 def _r_critic(flagged: bool, p_reviewed: bool, q: float | None) -> float:
@@ -80,8 +93,10 @@ def compute_turn_data(
     alpha      = cfg.get("ctrl_alpha", 0.3)
     beta       = cfg.get("ctrl_beta", 0.2)
     gamma      = cfg.get("ctrl_gamma", 0.3)
-    c_int      = cfg.get("c_int", 0.05)
+    c_int      = cfg.get("c_int", 0.02)
     lambda_int = cfg.get("lambda_int", 1.0)
+    gain       = cfg.get("int_gain", 0.3)        # 有效求助收益
+    overkill   = cfg.get("int_overkill", 0.05)   # 画蛇添足惩罚（正数，内部取负）
 
     def eq(ans: str | None) -> bool:
         return bool(ans) and math_equal(ans, correct_answer)
@@ -112,10 +127,16 @@ def compute_turn_data(
 
         # ── proposer 主 turn：r_prop + λ·r_int ────────────────────────────
         r_prop = 1.0 if p_prim else 0.0
-        r_int = _r_int(rnd["u"], rnd["forced"], p_prim, p_end, c_int)
+        r_int = _r_int(rnd["u"], rnd["forced"], p_prim, p_end,
+                       c_int, gain, overkill)
         turn_data[rnd["primary_tid"]] = {
             "role": "proposer", "round": t, "sigma": sigma,
             "is_response": False, "reward": r_prop + lambda_int * r_int,
+            # layer_key：仅主 turn 需按 p_t 分层。主 turn 奖励 = r_prop(0或1) +
+            # λ·r_int(±0.3)；不分层时组内归一化后优势主要反映“答对了吗”，
+            # 交互决策信号被 r_prop 淹没；按 p_t 分层后组内 r_prop 相同、被均值
+            # 消掉，优势纯粹反映交互决策的优劣。
+            "layer_key": int(p_prim),
         }
 
         # ── critic 响应 turn（四格矩阵，三级 q 解析） ─────────────────────

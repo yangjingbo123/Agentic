@@ -36,6 +36,9 @@ class AgenticExecutor:
         self.max_rounds = config.get("max_rounds", 4)
         self.max_hops = config.get("max_hops", 2)        # 0 = 消融A：禁用交互
         self.stop_gate = config.get("stop_gate", True)   # stop 需存在 verifier 分数
+        # ε 强制注入时选 verifier 的概率（其余选 critic）。v2.0 固定注 critic，
+        # 导致 verifier 零训练数据且 stop 闸门永不解锁。
+        self.eps_verifier_share = config.get("eps_verifier_share", 0.5)
         self.vllm_engine = vllm_engine
         # eval_mode：greedy 解码 + 不做 ε 强制注入（评测学到的策略本身）
         self.eval_mode = eval_mode
@@ -189,9 +192,19 @@ class AgenticExecutor:
                         0, MessageType.INTERACTION,
                         {"from": "proposer", "action": action,
                          "target": target, "reason": reason}))
-                elif self.max_hops > 0 and self._rng.random() < eps_force:
-                    # ε 强制注入 critic 审查（冷启动保护，§2.4）
-                    forced, action, target, reason = True, "request", "critic", ""
+                elif self.max_hops > 0:
+                    # ── 强制注入（§2.4 冷启动保护 + §2.1 闸门解锁） ─────────
+                    # v2.0 只注 critic，verifier 没有任何兜底调用通道：一旦
+                    # int_rate→0，黑板永远拿不到 verifier 分数 → stop_gate 拦下
+                    # 所有 stop → 每个 episode 跑满 max_rounds（实测连锁失效）。
+                    # 因此：本轮 controller 想停但被闸门拦下时优先注 verifier（直接
+                    # 解锁终止路径），否则按 ε 概率在 critic/verifier 间随机选。
+                    if st["gate_blocked"]:
+                        forced, action, target, reason = True, "request", "verifier", ""
+                    elif self._rng.random() < eps_force:
+                        tgt = "verifier" if self._rng.random() < self.eps_verifier_share \
+                              else "critic"
+                        forced, action, target, reason = True, "request", tgt, ""
                 st["u"] = u
                 st["forced"] = forced
                 st["target"] = target if u else None

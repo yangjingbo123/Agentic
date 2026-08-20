@@ -40,6 +40,8 @@ def main():
     ap.add_argument("--max_wrong",  type=int, default=200)
     ap.add_argument("--vllm_gpu",   default="1")
     ap.add_argument("--max_tokens", type=int, default=1024)
+    ap.add_argument("--rpc_timeout_s", type=int, default=1800)
+    ap.add_argument("--gen_chunk",     type=int, default=256)   # 单次 RPC 请求数
     ap.add_argument("--seed",       type=int, default=0)
     args = ap.parse_args()
 
@@ -49,7 +51,7 @@ def main():
     engine = VLLMInferenceEngine(
         args.model_path, max_tokens=args.max_tokens,
         gpu_memory_utilization=0.65, max_model_len=4096,
-        vllm_gpu=args.vllm_gpu,
+        vllm_gpu=args.vllm_gpu, rpc_timeout_s=args.rpc_timeout_s,
     )
     print(f"vLLM ready: {engine.ping()}", flush=True)
     engine.sync_lora(model)
@@ -63,11 +65,19 @@ def main():
         )
 
     def gen(role, pairs, temperature=1.0):
-        """pairs: [(system, user)] → [text]，按角色挂对应 LoRA。"""
-        res = engine.generate_batch(
-            [{"role": role, "prompt": make_prompt(s, u),
-              "temperature": temperature} for s, u in pairs])
-        return [r[0] for r in res]
+        """pairs: [(system, user)] → [text]，按角色挂对应 LoRA。
+        分块发送，避免单个巨型 RPC 撞 rpc_timeout。"""
+        outs = []
+        for i in range(0, len(pairs), args.gen_chunk):
+            part = pairs[i: i + args.gen_chunk]
+            res = engine.generate_batch(
+                [{"role": role, "prompt": make_prompt(s, u),
+                  "temperature": temperature} for s, u in part])
+            outs.extend(r[0] for r in res)
+            if len(pairs) > args.gen_chunk:
+                print(f"  [gen:{role}] {min(i + args.gen_chunk, len(pairs))}"
+                      f"/{len(pairs)}", flush=True)
+        return outs
 
     rng = random.Random(args.seed)
     with open(args.data) as f:

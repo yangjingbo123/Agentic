@@ -166,6 +166,9 @@ def main(cfg: DictConfig):
             [it["answer"]   for it in _eval_items],
         )
         acc = sum(ep["is_correct"] for ep in episodes) / len(episodes)
+        # §19.3 判据①：同批 episode 上朴素计票的 acc（加权投票的在线消融）
+        acc_uni = sum(ep.get("is_correct_uniform", ep["is_correct"])
+                      for ep in episodes) / len(episodes)
         # reward_mean: mean total RACA reward per episode (sum of all turn rewards)
         reward_mean = float(np.mean([
             sum(v["reward"] for v in ep.get("raca_turn_data", {}).values())
@@ -179,10 +182,13 @@ def main(cfg: DictConfig):
         _rounds = [m for ep in episodes for m in ep.get("raca_round_meta", [])]
         eval_int_rate  = float(np.mean([m["u"] for m in _rounds])) if _rounds else 0.0
         eval_stop_rate = float(np.mean([1.0 if ep.get("stopped") else 0.0 for ep in episodes]))
-        print(f"  [eval] step={step} eval_acc={acc:.3f} reward={reward_mean:.3f} "
+        print(f"  [eval] step={step} eval_acc={acc:.3f} "
+              f"acc_uniform={acc_uni:.3f} d_vote={acc - acc_uni:+.3f} "
+              f"reward={reward_mean:.3f} "
               f"avg_turns={avg_turns:.1f} int_rate={eval_int_rate:.2f} "
               f"stop_rate={eval_stop_rate:.2f} (n={len(_eval_items)})", flush=True)
-        wandb.log({"eval_accuracy": acc, "eval_reward": reward_mean,
+        wandb.log({"eval_accuracy": acc, "eval_accuracy_uniform": acc_uni,
+                   "eval_vote_gain": acc - acc_uni, "eval_reward": reward_mean,
                    "eval_avg_turns": avg_turns, "eval_int_rate": eval_int_rate,
                    "eval_stop_rate": eval_stop_rate}, step=step)
     batch_size = cfg.agentic.batch_size

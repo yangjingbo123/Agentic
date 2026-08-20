@@ -1581,3 +1581,42 @@ critic 回 SFT；分辨力 ≤ 0 → 加权投票不成立，verifier 先回 SFT
 （双通道生效，对照 v2.0 斜率）；③ eff 向 qF 靠拢（选择性形成）；
 ④ eval：weighted 相对 uniform 的 Δacc ≥ 0（通道①兑现）。
 最终目标不变：完整系统 eval_acc > v2.0 的 0.863（投票-only 基线）。
+
+## 19. SFT v3 二测与止损线执行（2026-08-20）
+
+### 19.1 二测结果（checkpoints/sft_v3，n=300）
+
+| 指标 | SFT v2（一测） | SFT v3（二测） | 判据 | 判决 |
+|------|------|------|------|------|
+| verifier 分辨力 Δ | +0.012 | **+0.312** | >0.2 | ✅ 通道①解锁 |
+| critic flag_rate | 0.12 | **0.47** | — | 检错能力 ×4 |
+| b) 修正 − a | −0.062 | −0.018 | b>a | ❌ 收窄但仍负 |
+| c) 带 FLAW 下一轮 − a | −0.085 | −0.055 | c>a | ❌ 锚定效应仍在 |
+
+特权蒸馏数据（generate_sft_v3.py，~1400 turns）对判别类能力（verifier/
+critic 检错）有效，对生成类能力（拿着批评修对）收效有限——与置信度
+预判一致（判断易、生成难）。
+
+### 19.2 按预设止损线执行的三个决定（均留消融开关）
+
+1. **加权投票开启**：`vote_mode: weighted`（Δ=0.312 达标；一测时橡皮图章
+   下有害、曾紧急关闭）。
+2. **修正票退出投票池**：`correction_in_vote: false`。修正 trace 仍进黑板
+   （上下文/σ/r_int 因果信用保留），但不计票——两次测量证明它在稀释
+   投票质量。按止损线不再第四次调 r_int 矩阵。
+3. **FLAW 不进下一轮 primary prompt**：`flaw_in_primary_prompt: false`
+   （Blackboard.to_text(include_flaws=False)）。批评的作用收敛到轮内修正
+   链与 σ 推导；锚定伤害线剪断。
+
+叙事收敛：**验证型交互有效（买信息给聚合器），纠错型交互受限于同底座
+生成能力**——两个结论都有两轮测量支撑，可直接进论文。
+
+### 19.3 RL 重启配置与探针判据
+
+重启：新 exp_name，`sft_checkpoint=checkpoints/sft_v3`（KL ref 锚到 v3 起点）。
+step 30 探针（替代 §18.5）：
+① eval：weighted vs uniform 的 Δacc > 0（通道①在线兑现，核心判决）；
+② acc 恢复上升斜率（双通道 r_prop 生效，len 回到 120+ 量级）；
+③ int_rate 不归零且 tgtC 下降（验证型求助占比上升——verify 求助零成本
+且通过加权投票影响 episode 结果，应成为主流）；
+④ 最终目标：eval_acc > 0.863（v2.0 投票-only）且 > 同 ckpt 的 uniform 消融。

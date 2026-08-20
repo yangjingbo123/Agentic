@@ -317,6 +317,68 @@ def test_layer2_p_t_stratification():
     assert adv_flat[1][1] > 0, "不分层时画蛇添足会被错误地奖励（这正是 v2.0 的问题）"
 
 
+def test_dual_channel_advantage():
+    """v2.3（§18）：主 turn 优势 = z(r_prop，不分层) + z(λ·r_int，p_t 分层)。
+
+    四样本：对/不求助、对/求助(画蛇添足)、错/求助修对、错/不求助。
+    prop 通道：{1,1,0,0} → 对的 +1、错的 −1；
+    int 通道（p1 层 {0,−0.07} / p0 层 {0.28,0}）：决策对的 +1、错的 −1。
+    叠加后：对+不求助 = +2；对+求助 = 0；错+修对 = 0；错+不求助 = −2。
+    解题信号（v2.1 分层误删）与交互隔离（v2.1 的目的）同时成立。"""
+    def prop(r_prop, r_int_w, p_t):
+        v = mk_turn("proposer", 0, "explore", False, r_prop + r_int_w)
+        v["r_prop"], v["r_int_w"], v["layer_key"] = r_prop, r_int_w, p_t
+        return v
+
+    eps = [
+        {1: prop(1.0, 0.00, 1)},    # 对 + 不求助
+        {1: prop(1.0, -0.07, 1)},   # 对 + 求助（画蛇添足）
+        {1: prop(0.0, 0.28, 0)},    # 错 + 求助且修对
+        {1: prop(0.0, 0.00, 0)},    # 错 + 不求助
+    ]
+    adv = compute_raca_advantages(eps)
+    assert approx(adv[0][1], 2.0) and approx(adv[1][1], 0.0)
+    assert approx(adv[2][1], 0.0) and approx(adv[3][1], -2.0)
+
+
+def test_dual_channel_no_absorbing_state():
+    """v2.3：int_rate=0（r_int 全 0）时 int 通道失活，但 r_prop 通道仍供梯度。
+
+    v2.1/v2.2 的全量分层在此场景下组内零方差 → 主 turn 整组被丢 →
+    解题能力停训（v2.2 首跑实测 acc 横盘、len 组成坍缩）。"""
+    def prop(r_prop, p_t):
+        v = mk_turn("proposer", 0, "explore", False, r_prop)
+        v["r_prop"], v["r_int_w"], v["layer_key"] = r_prop, 0.0, p_t
+        return v
+
+    eps = [{1: prop(1.0, 1)}, {1: prop(1.0, 1)},
+           {1: prop(0.0, 0)}, {1: prop(0.0, 0)}]
+    adv = compute_raca_advantages(eps)
+    # 主 turn 仍有优势（来自 prop 通道）：对的 +1、错的 −1
+    assert approx(adv[0][1], 1.0) and approx(adv[1][1], 1.0)
+    assert approx(adv[2][1], -1.0) and approx(adv[3][1], -1.0)
+
+
+def test_weighted_vote():
+    """v2.3（§18 通道①）：verifier 分数加权投票 vs 朴素多数投票。"""
+    from envs.blackboard import Blackboard, Message, MessageType
+    bb = Blackboard()
+    for ans in ("5", "5", "4"):
+        bb.add_message(Message(0, MessageType.TRACE, ("r", ans)))
+    bb.add_message(Message(2, MessageType.SCORE, ("4", 0.9)))
+    bb.add_message(Message(2, MessageType.SCORE, ("5", 0.2)))
+
+    ex_u = _mk_executor(None)                        # 默认 uniform
+    ex_w = _mk_executor(None, vote_mode="weighted")
+    assert ex_u._majority_vote(bb) == "5"            # 2 票 > 1 票
+    assert ex_w._majority_vote(bb) == "4"            # 1×0.9 > 2×0.2
+    # 无分数时 weighted 回退朴素投票
+    bb2 = Blackboard()
+    for ans in ("5", "5", "4"):
+        bb2.add_message(Message(0, MessageType.TRACE, ("r", ans)))
+    assert ex_w._majority_vote(bb2) == "5"
+
+
 def test_end_to_end_rewards_to_advantages():
     """完整链路：两个 rollout 的 round_records → 奖励 → 优势。"""
     # rollout A：求助并修对；rollout B：不求助、答错

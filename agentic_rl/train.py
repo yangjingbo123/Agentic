@@ -316,10 +316,12 @@ def main(cfg: DictConfig):
 
         consecutive_skips = 0
         step += 1
-        # int_effectiveness/selectivity 可能缺失（无自发求助样本时），缺失时打 "--"
-        # 而非 0，避免与真实零值混淆（v2.0 日志正因缺这几项无法事后验证 q）。
+        # int_effectiveness/selectivity/q_forced 可能缺失（无对应样本时），
+        # 缺失时打 "--" 而非 0，避免与真实零值混淆。
         _eff = stats.get("int_effectiveness")
         _sel = stats.get("int_selectivity")
+        _qf  = stats.get("q_forced")
+        _tc  = stats.get("int_critic_share")
         print(
             f"step={step} reward={stats['mean_reward']:.3f} acc={stats['accuracy']:.2f} "
             f"loss={stats['loss']:.4f} kl={stats['kl']:.4f} "
@@ -329,6 +331,8 @@ def main(cfg: DictConfig):
             f"groups={_g_kept}/{_g_total} "
             f"int_rate={stats.get('int_rate', 0.0):.2f} "
             f"eff={'--' if _eff is None else f'{_eff:.2f}'} "
+            f"qF={'--' if _qf is None else f'{_qf:.2f}'} "
+            f"tgtC={'--' if _tc is None else f'{_tc:.2f}'} "
             f"sel={'--' if _sel is None else f'{_sel:+.2f}'} "
             f"parse={stats.get('parse_rate', 1.0):.2f} "
             f"gate={stats.get('gate_blocked', 0)} "
@@ -351,6 +355,7 @@ def main(cfg: DictConfig):
                     "all_pass_frac", "all_fail_frac", "group_reward_std",
                     "parse_rate",
                     "int_rate", "int_effectiveness", "int_selectivity",
+                    "q_forced", "int_critic_share",
                     "forced_rate", "stop_rate", "stop_acc", "exhaust_acc",
                     "gate_blocked",
                     "funnel_flag", "funnel_corr", "funnel_flip"):

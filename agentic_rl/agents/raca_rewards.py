@@ -132,10 +132,12 @@ def compute_turn_data(
         turn_data[rnd["primary_tid"]] = {
             "role": "proposer", "round": t, "sigma": sigma,
             "is_response": False, "reward": r_prop + lambda_int * r_int,
-            # layer_key：仅主 turn 需按 p_t 分层。主 turn 奖励 = r_prop(0或1) +
-            # λ·r_int(±0.3)；不分层时组内归一化后优势主要反映“答对了吗”，
-            # 交互决策信号被 r_prop 淹没；按 p_t 分层后组内 r_prop 相同、被均值
-            # 消掉，优势纯粹反映交互决策的优劣。
+            # v2.3 双通道（§18）：优势阶段 r_prop 与 λ·r_int 各自组内归一化后
+            # 相加。r_prop 通道不分层（恢复解题信号：v2.1 的全量分层使
+            # int_rate=0 后主 turn 组内零方差、解题能力停训）；r_int 通道
+            # 仍按 layer_key=p_t 分层（v2.1 的隔离目的不变）。
+            "r_prop": r_prop,
+            "r_int_w": lambda_int * r_int,
             "layer_key": int(p_prim),
         }
 

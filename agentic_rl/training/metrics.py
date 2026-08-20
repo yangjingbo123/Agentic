@@ -32,10 +32,20 @@ def rollout_metrics(batch_rollouts: list) -> dict:
         out["int_rate"]     = float(np.mean(us))
         out["forced_rate"]  = float(np.mean([m["forced"] for m in rounds]))
         out["gate_blocked"] = int(sum(m["gate_blocked"] for m in rounds))
-        # 交互有效率：P(轮末修对 | 自发求助且 primary 错)
+        # 交互有效率：P(轮末修对 | 自发求助且 primary 错)（即 q_spont）
         eff = [m["p_end"] for m in rounds if m["u"] and not m["p_primary"]]
         if eff:
             out["int_effectiveness"] = float(np.mean(eff))
+        # v2.3 拆分：forced 注入轮的 q（随机干预，无选择偏差）与自发求助的
+        # critic 占比。v2.2 首跑：q_forced≈9% 而 q_spont≈0 —— 能力存在但
+        # “何时求助”选反了；两者的 gap 是选择性质量的直接度量。
+        fw = [m["p_end"] for m in rounds if m["forced"] and not m["p_primary"]]
+        if fw:
+            out["q_forced"] = float(np.mean(fw))
+        us_tgt = [m.get("target") for m in rounds if m["u"]]
+        if us_tgt:
+            out["int_critic_share"] = float(np.mean(
+                [1.0 if t == "critic" else 0.0 for t in us_tgt]))
         # 选择性：corr(u, p_primary)，预期随训练负相关增强（错的时候才求助）
         if np.std(us) > 0 and np.std(ps) > 0:
             out["int_selectivity"] = float(np.corrcoef(us, ps)[0, 1])

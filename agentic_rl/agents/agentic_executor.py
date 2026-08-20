@@ -43,6 +43,9 @@ class AgenticExecutor:
         # eval_mode：greedy 解码 + 不做 ε 强制注入（评测学到的策略本身）
         self.eval_mode = eval_mode
         self.temperature = 0.0 if eval_mode else 1.0
+        # v2.3：投票模式。weighted = verifier 分数加权（交互产出直接参与聚合，
+        # 交互与投票从替代关系变互补关系）；uniform = 朴素多数投票（消融）。
+        self.vote_mode = config.get("vote_mode", "uniform")
         self._rng = random.Random()
 
     # ── batch entry point（N episodes 并行，逐 turn-slot 批量调 vLLM） ───────
@@ -207,7 +210,8 @@ class AgenticExecutor:
                         forced, action, target, reason = True, "request", tgt, ""
                 st["u"] = u
                 st["forced"] = forced
-                st["target"] = target if u else None
+                # target 对 forced 轮也落盘（v2.3：q_spont/q_forced 拆分需要）
+                st["target"] = target if (u or forced) else None
                 if u or forced:
                     st["pending"].append(("proposer", out, action, target, reason, forced))
 
@@ -333,4 +337,15 @@ class AgenticExecutor:
     def _majority_vote(self, blackboard: Blackboard) -> str:
         if not blackboard.traces:
             return ""
-        return Counter(ans for _, ans in blackboard.traces).most_common(1)[0][0]
+        counts = Counter(ans for _, ans in blackboard.traces)
+        if self.vote_mode != "weighted" or not blackboard.scores:
+            return counts.most_common(1)[0][0]
+        # 加权投票（v2.3 §18 通道①）：被 verifier 验证过的答案用其平均分数
+        # 加权，未验证的用先验 0.5；票权 = 票数 × 权重。verifier 的校准奖励
+        # 1−|v−p| 本就在训练它，加权投票把这个能力直接兑换成 acc。
+        scored = {a for a, _ in blackboard.scores}
+        weight = {
+            ans: n * (blackboard.get_avg_score(ans) if ans in scored else 0.5)
+            for ans, n in counts.items()
+        }
+        return max(weight, key=weight.get)

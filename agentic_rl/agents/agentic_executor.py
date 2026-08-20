@@ -46,6 +46,12 @@ class AgenticExecutor:
         # v2.3：投票模式。weighted = verifier 分数加权（交互产出直接参与聚合，
         # 交互与投票从替代关系变互补关系）；uniform = 朴素多数投票（消融）。
         self.vote_mode = config.get("vote_mode", "uniform")
+        # v3 测量（§19）：修正正确率两次 ≤ 裸重采样 → 修正票退出投票池
+        # （仍进黑板供上下文/σ/r_int 因果信用，只是不计票）。
+        self.correction_in_vote = config.get("correction_in_vote", True)
+        # v3 测量（§19）：旧错解+批评的上下文对下一轮重答有锚定伤害
+        # （通道② Δ=−0.085/−0.055）；False = FLAW 不进 primary prompt。
+        self.flaw_in_primary = config.get("flaw_in_primary_prompt", True)
         self._rng = random.Random()
 
     # ── batch entry point（N episodes 并行，逐 turn-slot 批量调 vLLM） ───────
@@ -65,6 +71,7 @@ class AgenticExecutor:
         log_probs_list = [[] for _ in range(n)]
         turn_counters  = [0] * n
         round_records  = [[] for _ in range(n)]
+        corr_answers   = [[] for _ in range(n)]   # 修正票（可能被投票排除）
         stop_ctrl_tids = [None] * n
         stop_sigmas    = [None] * n
         active         = list(range(n))
@@ -167,7 +174,8 @@ class AgenticExecutor:
             prop_info = []
             for i in active:
                 sys = PromptTemplates.proposer_system()
-                usr = f"问题：{questions[i]}\n当前状态：{blackboards[i].to_text()}"
+                usr = (f"问题：{questions[i]}\n当前状态："
+                       f"{blackboards[i].to_text(include_flaws=self.flaw_in_primary)}")
                 prop_info.append((i, next_tid(i), sys, usr))
 
             prop_res = self.vllm_engine.generate_batch(
@@ -257,11 +265,12 @@ class AgenticExecutor:
                         st["verifier_turns"].append({
                             "tid": tid, "score": score, "reviewed_answer": reviewed,
                         })
-                    else:  # proposer 修正：新 trace 进入多数投票（因果通路）
+                    else:  # proposer 修正：新 trace 进黑板（上下文/σ/因果通路）
                         reasoning, answer = parse_reasoning(out)
                         bb.add_message(Message(0, MessageType.TRACE, (reasoning, answer)))
                         st["correction_turns"].append({"tid": tid, "answer": answer})
                         st["corrected_answer"] = answer
+                        corr_answers[i].append(answer)
                         # 本轮内此前的 critic flag 得到了修正响应 → 因果窗口在本轮
                         for ct in st["critic_turns"]:
                             ct["correction_followed"] = True
@@ -306,8 +315,16 @@ class AgenticExecutor:
         # ── finalise ─────────────────────────────────────────────────────────
         results = []
         for i in range(n):
-            final_answer = self._majority_vote(blackboards[i])
+            exclude = None if self.correction_in_vote else corr_answers[i]
+            final_answer = self._majority_vote(blackboards[i], exclude)
             is_correct = math_equal(final_answer, correct_answers[i])
+            # 消融对照（§19.3 判据①）：同一批 episode 上朴素计票的正确性，
+            # 免二次 rollout 即可在线量化加权投票的 Δacc。
+            uni_correct = is_correct
+            if self.vote_mode == "weighted":
+                uni_ans = self._majority_vote(blackboards[i], exclude,
+                                              mode="uniform")
+                uni_correct = math_equal(uni_ans, correct_answers[i])
             turn_data, round_meta = compute_turn_data(
                 round_records[i], correct_answers[i], is_correct,
                 self.max_rounds, self.cfg,
@@ -322,6 +339,7 @@ class AgenticExecutor:
                 "raca_round_meta": round_meta,
                 "final_answer":    final_answer,
                 "is_correct":      is_correct,
+                "is_correct_uniform": uni_correct,
                 "stopped":         stop_ctrl_tids[i] is not None,
             })
         return results
@@ -334,11 +352,18 @@ class AgenticExecutor:
     def _critic_found_errors(self, critic_output: str) -> bool:
         return critic_found_errors(critic_output)
 
-    def _majority_vote(self, blackboard: Blackboard) -> str:
+    def _majority_vote(self, blackboard: Blackboard, exclude_answers=None,
+                       mode=None) -> str:
         if not blackboard.traces:
             return ""
         counts = Counter(ans for _, ans in blackboard.traces)
-        if self.vote_mode != "weighted" or not blackboard.scores:
+        # v3（§19）：修正票退出投票池（修正正确率两次测量 ≤ 裸重采样，
+        # 留在池内是在稀释投票质量）；全排空时回退全量计票。
+        if exclude_answers:
+            counts = counts - Counter(exclude_answers)
+            if not counts:
+                counts = Counter(ans for _, ans in blackboard.traces)
+        if (mode or self.vote_mode) != "weighted" or not blackboard.scores:
             return counts.most_common(1)[0][0]
         # 加权投票（v2.3 §18 通道①）：被 verifier 验证过的答案用其平均分数
         # 加权，未验证的用先验 0.5；票权 = 票数 × 权重。verifier 的校准奖励

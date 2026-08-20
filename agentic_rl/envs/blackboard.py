@@ -63,11 +63,13 @@ class Blackboard:
         vals = [s for a, s in self.scores if a == answer]
         return sum(vals) / len(vals) if vals else 0.0
 
-    def to_text(self) -> str:
+    def to_text(self, include_flaws: bool = True) -> str:
+        """include_flaws=False：供下一轮 primary 用（v3 测量：旧错解+批评的
+        上下文对重答有锚定伤害，通道②两次测量 Δ=−0.085/−0.055）。"""
         lines = []
         if self.traces:
             lines.append(f"已有{len(self.traces)}个解法，答案：{self.get_distinct_answers()}")
-        if self.flaws:
+        if self.flaws and include_flaws:
             lines.append(f"发现问题：{self.flaws[-1]['content'][:80]}")
         if self.scores:
             distinct = self.get_distinct_answers()

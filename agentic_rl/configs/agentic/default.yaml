@@ -29,10 +29,15 @@ int_overkill: 0.0    # 画蛇添足惩罚（v2.1：0.05）
 lambda_int: 1.0      # 交互奖励合成权重；0 = 消融B（有交互不训练交互，即 v1 行为）
 max_hops: 2          # 每轮交互链响应跳数上限；0 = 消融A（完全禁用交互）
 stop_gate: true      # stop 需黑板存在 verifier 分数；消融A 时建议关闭
-# v2.3 测量（§18.4，2026-08-20）：verifier 分辨力Δ=+0.012（橡皮图章，见解就给
-# ~1.0）。此时加权投票有害：被验证的错答案拿 ~1.0 权重压过未验证的对答案
-# （0.5）。verifier 判别力经 SFT 修复并实测 Δ>0.2 后再切 weighted。
-vote_mode: uniform
+# v3 二测（§19，2026-08-20，sft_v3）：verifier 分辨力 Δ=+0.312 > 0.2 → 加权
+# 投票解锁（一测 Δ=0.012 时有害，已修复）。uniform = 消融。
+vote_mode: weighted
+# 修正正确率两次测量 ≤ 裸重采样（Δ=−0.062/−0.018）→ 修正票退出投票池，
+# 仍进黑板供 r_int 因果信用与上下文；true = 消融（v2 行为）。
+correction_in_vote: false
+# 旧错解+批评上下文对下一轮重答有锚定伤害（通道②两次 Δ=−0.085/−0.055）
+# → FLAW 不进 primary prompt（σ 推导与轮内修正链不受影响）；true = 消融。
+flaw_in_primary_prompt: false
 eps_force_init: 0.3  # 强制注入审查/验证的初始概率（冷启动保护，随 step 线性衰减）
 # v2.3：ε 底数 0.05→0.25 基本不衰减——它不给发起决策梯度（forced 轮 r_int=0，
 # 正确），但保证 critic/修正链与 q 测量始终有数据供给。

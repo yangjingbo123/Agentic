@@ -379,6 +379,33 @@ def test_weighted_vote():
     assert ex_w._majority_vote(bb2) == "5"
 
 
+def test_correction_vote_exclusion():
+    """v3（§19）：修正票退出投票池（修正正确率两次测量 ≤ 裸重采样）。"""
+    from envs.blackboard import Blackboard, Message, MessageType
+    bb = Blackboard()
+    # traces：primary "5"、修正 "4"、修正 "4"（修正刷票场景）
+    for ans in ("5", "4", "4"):
+        bb.add_message(Message(0, MessageType.TRACE, ("r", ans)))
+    ex = _mk_executor(None)
+    assert ex._majority_vote(bb) == "4"                       # 不排除：修正胜
+    assert ex._majority_vote(bb, ["4", "4"]) == "5"           # 排除：primary 胜
+    # 全排空回退全量计票（不致空答案）
+    bb3 = Blackboard()
+    bb3.add_message(Message(0, MessageType.TRACE, ("r", "7")))
+    assert ex._majority_vote(bb3, ["7"]) == "7"
+
+
+def test_flaw_excluded_from_primary_prompt():
+    """v3（§19）：include_flaws=False 时 FLAW 不出现在黑板文本，σ 推导不变。"""
+    from envs.blackboard import Blackboard, Message, MessageType
+    bb = Blackboard()
+    bb.add_message(Message(0, MessageType.TRACE, ("r", "5")))
+    bb.add_message(Message(1, MessageType.FLAW, {"content": "第二步符号错"}))
+    assert "发现问题" in bb.to_text()
+    assert "发现问题" not in bb.to_text(include_flaws=False)
+    assert bb.derive_sigma() == "refine"   # σ 机制不受 include_flaws 影响
+
+
 def test_end_to_end_rewards_to_advantages():
     """完整链路：两个 rollout 的 round_records → 奖励 → 优势。"""
     # rollout A：求助并修对；rollout B：不求助、答错

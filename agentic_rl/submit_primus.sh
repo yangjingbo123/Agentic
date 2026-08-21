@@ -2,7 +2,7 @@
 # Agentic RL v3 训练 —— Primus 作业启动脚本
 #
 # Primus 作业命令（单行）：
-#   bash /root/code/Agentic/agentic_rl/submit_primus.sh
+#   bash /root/code/med-mul/agentic_rl/submit_primus.sh
 #
 # 作业配置约定（参照 med_rl recipe/uni_sgs 的 Primus 模式）：
 #   - 资源：单机 1×8 GPU（A100-80G / H100）。本框架是「cuda:0 训练 +

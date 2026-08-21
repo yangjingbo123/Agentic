@@ -2,7 +2,7 @@
 # Agentic SFT v3（v23 数据）—— Primus 作业启动脚本
 #
 # Primus 作业命令（单行）：
-#   bash /root/code/Agentic/agentic_rl/submit_primus_sft.sh
+#   bash /root/code/med-mul/agentic_rl/submit_primus_sft.sh
 #
 # 作业配置约定：
 #   - 资源：单机 1 GPU（A100-80G/H100 一张即可；8B bf16 + LoRA + grad-ckpt

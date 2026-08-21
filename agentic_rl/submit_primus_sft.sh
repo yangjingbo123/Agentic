@@ -24,6 +24,27 @@ cd "$(dirname "$0")" || exit 1
 echo "REPO = $(pwd)"
 
 # ---------------------------------------------------------------------------
+# 依赖自举：镜像缺包时从 pypi 镜像安装（ALLOW_PIP=0 关闭）。
+# 首选仍是直接选带齐依赖的镜像（如 med_rl BT-RM 作业同款）；本段是兑底。
+# flash-attn 故意不在列表：pip 安装需编译半小时，代码已回退 sdpa。
+# ---------------------------------------------------------------------------
+if [[ "${ALLOW_PIP:-1}" == "1" ]]; then
+    PIP_INDEX=${PIP_INDEX:-https://mirrors.aliyun.com/pypi/simple}
+    MISSING=$(python - <<'EOF'
+import importlib.util
+mods = {"torch": "torch", "transformers": "transformers", "hydra": "hydra-core",
+        "omegaconf": "omegaconf", "wandb": "wandb", "peft": "peft",
+        "safetensors": "safetensors", "accelerate": "accelerate", "numpy": "numpy"}
+print(" ".join(p for m, p in mods.items() if importlib.util.find_spec(m) is None))
+EOF
+)
+    if [[ -n "${MISSING// /}" ]]; then
+        echo "== 镜像缺依赖: ${MISSING} → pip 安装（index=${PIP_INDEX}） =="
+        pip install --no-cache-dir -i "${PIP_INDEX}" ${MISSING}
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # 单卡约束（见头部说明）
 # ---------------------------------------------------------------------------
 export CUDA_VISIBLE_DEVICES=0

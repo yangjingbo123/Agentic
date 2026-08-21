@@ -31,6 +31,28 @@ cd "$(dirname "$0")" || exit 1
 echo "REPO = $(pwd)"
 
 # ---------------------------------------------------------------------------
+# 依赖自举：镜像缺包时从 pypi 镜像安装（ALLOW_PIP=0 关闭）。
+# RL 额外需要 vllm 0.9.x（代码强制 V0 引擎，≥0.10 已删 V0）与 bitsandbytes。
+# flash-attn 故意不在列表：pip 安装需编译半小时，代码已回退 sdpa。
+# ---------------------------------------------------------------------------
+if [[ "${ALLOW_PIP:-1}" == "1" ]]; then
+    PIP_INDEX=${PIP_INDEX:-https://mirrors.aliyun.com/pypi/simple}
+    MISSING=$(python - <<'EOF'
+import importlib.util
+mods = {"torch": "torch", "transformers": "transformers", "hydra": "hydra-core",
+        "omegaconf": "omegaconf", "wandb": "wandb", "peft": "peft",
+        "safetensors": "safetensors", "accelerate": "accelerate",
+        "numpy": "numpy", "vllm": "vllm==0.9.2", "bitsandbytes": "bitsandbytes"}
+print(" ".join(p for m, p in mods.items() if importlib.util.find_spec(m) is None))
+EOF
+)
+    if [[ -n "${MISSING// /}" ]]; then
+        echo "== 镜像缺依赖: ${MISSING} → pip 安装（index=${PIP_INDEX}） =="
+        pip install --no-cache-dir -i "${PIP_INDEX}" ${MISSING}
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # 资源（Primus 注入）
 # ---------------------------------------------------------------------------
 NUM_GPUS=${NUM_ACCELERATORS:-8}

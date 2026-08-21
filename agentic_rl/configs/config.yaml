@@ -7,3 +7,7 @@ defaults:
 exp_name: "default"
 sft_checkpoint: null
 no_vllm: false
+# checkpoint 输出目录；null = checkpoints/rl-{exp_name}（本地默认）。
+# Primus 等平台上应指向持久化挂载（如 $PRIMUS_SAVE_CHECKPOINT_DIR/rl-xxx），
+# 否则容器重建后 checkpoint 丢失、抢占后无法 resume。
+ckpt_dir: null

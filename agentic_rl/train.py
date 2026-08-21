@@ -195,7 +195,9 @@ def main(cfg: DictConfig):
     max_steps = cfg.agentic.get("max_steps", 500)
     print(f"Dataset: {len(dataset)} items, batch_size={batch_size}, max_steps={max_steps}", flush=True)
 
-    ckpt_dir = f"checkpoints/rl-{cfg.exp_name}"
+    # checkpoint 目录：本地默认相对路径；Primus 等平台用 ckpt_dir=... 指向持久化
+    # 挂载（抢占重排后 resume 依赖同一路径下的 trainer_state.json）。
+    ckpt_dir = cfg.get("ckpt_dir") or f"checkpoints/rl-{cfg.exp_name}"
     save_freq = cfg.agentic.get("save_freq", 50)
 
     # resume from checkpoint if exists

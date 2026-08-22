@@ -66,10 +66,13 @@ class VLLMInferenceEngine:
         # V0/V1 交由 worker 自己根据 --vllm-use-v1 设置（auto 时不设）；
         # 这里先清掉继承值，避免外层 shell 的 VLLM_USE_V1 默默生效。
         env.pop("VLLM_USE_V1", None)
-        # V1 引擎的 ZMQ IPC socket 必须建在本地文件系统：TMPDIR 常被指向
-        # OSS/NAS 挂载（防 /tmp 写满），而网络挂载不支持 socket，bind() 会报
-        # ZMQError: Input/output error。未显式指定时回退 /tmp，不跟随 TMPDIR。
+        # V1 引擎的 ZMQ IPC socket 与 Triton JIT 产物都必须落在**本地**文件系统：
+        # 前者需 socket 语义，后者要 gcc 编译并 dlopen .so。若 TMPDIR/HOME 被指向
+        # OSS/NAS（平台常见），会分别报 ZMQError: Input/output error 与 gcc
+        # non-zero exit。这里不跟随 TMPDIR，未显式指定时钉在 /tmp。
         env.setdefault("VLLM_RPC_BASE_PATH", "/tmp")
+        env.setdefault("TRITON_CACHE_DIR", "/tmp/triton-cache")
+        os.makedirs(env["TRITON_CACHE_DIR"], exist_ok=True)
         env["PYTHONPATH"] = project_root + os.pathsep + env.get("PYTHONPATH", "")
 
         cmd = [

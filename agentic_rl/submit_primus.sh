@@ -127,19 +127,29 @@ SAVE_ROOT="${PRIMUS_SAVE_CHECKPOINT_DIR:-$(pwd)/checkpoints}"
 CKPT_DIR="${SAVE_ROOT}/rl-${EXP_NAME}"
 mkdir -p "${CKPT_DIR}"
 
-# vLLM LoRA sync 每个 step 都写临时目录；容器 /tmp 常为小 rootfs/内存盘，
-# 长跑必然写满 → 重定向到挂载盘（tempfile 遵循 TMPDIR）。
-export TMPDIR="${SAVE_ROOT}/tmp-${EXP_NAME}"
-mkdir -p "${TMPDIR}"
+# 临时目录：必须留在**本地**文件系统。
+# 曾经为防 /tmp 写满把 TMPDIR 指向 OSS 挂载，引发两次连环故障：
+#   ① vLLM V1 的 ZMQ IPC socket bind() → Input/output error
+#   ② Triton JIT 在该目录 gcc 编译 cuda_utils.so → exit status 1
+# 网络挂载不支持 socket 语义与可执行映射，这类需求必须本地盘。
+# 而 LoRA sync 的占用实际是常数级：vllm_engine 每次同步后 rmtree 旧目录，
+# 同时最多两份（4 adapter × ~50MB × 2 ≈ 400MB），不会累积——当初的
+# 重定向属于过度防御。此处只做空间体检，不改路径。
+TMP_AVAIL_MB=$(df -Pm /tmp | awk 'NR==2 {print $4}')
+echo "/tmp 可用 ${TMP_AVAIL_MB}MB（LoRA sync 峰值需约 400MB + Triton 缓存）"
+if (( TMP_AVAIL_MB < 2048 )); then
+    echo "!! /tmp 不足 2GB。不要把 TMPDIR 改到 OSS（会碎 ZMQ/Triton），"
+    echo "   请改用容器内其他本地目录，例如 TMPDIR=/root/tmp 并确保已 mkdir。" >&2
+fi
 
-# 但 vLLM V1 引擎用 ZMQ IPC（Unix domain socket）做进程间通信，socket 文件
-# 必须建在支持 socket 的**本地**文件系统上。OSS/NAS 挂载不支持，bind()
-# 会报 ZMQError: Input/output error。所以临时文件分两类安置：
-#   大文件（LoRA 权重，每 step 写）→ TMPDIR 指挂载盘
-#   IPC socket（小文件，需 socket 语义）→ VLLM_RPC_BASE_PATH 指本地盘
-# V0 不用 IPC socket，所以这个差异只在 V1 上暴露。
-export VLLM_RPC_BASE_PATH="${VLLM_RPC_BASE_PATH:-/tmp/vllm-ipc-${EXP_NAME}}"
+# vLLM V1 的 IPC socket 路径：钉死在本地盘，不跟随外部注入的 TMPDIR。
+export VLLM_RPC_BASE_PATH="${VLLM_RPC_BASE_PATH:-/tmp}"
 mkdir -p "${VLLM_RPC_BASE_PATH}"
+
+# Triton JIT 缓存：同样需本地盘（要 gcc 编译并 dlopen 产物 .so）。
+# 默认在 ~/.triton，如果 HOME 被平台指到网络挂载就会同样碎掉，故显式钉住。
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/triton-cache}"
+mkdir -p "${TRITON_CACHE_DIR}"
 
 # Primus 容器无外网：wandb 离线，run 数据落在工作目录，事后手动 sync
 export WANDB_MODE=${WANDB_MODE:-offline}

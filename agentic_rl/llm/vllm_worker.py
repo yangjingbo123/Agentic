@@ -40,7 +40,16 @@ def _nvidia_smi_lines():
 class VLLMWorker:
     def __init__(self, args):
         os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
-        os.environ["VLLM_USE_V1"] = "0"
+        # V0/V1 引擎选择：
+        #   "0" = 强制 V0（默认，与训练机 vllm 0.9.2 行为一致）
+        #   "1" = 强制 V1（vLLM ≥0.10 已删 V0，高版本镜像必须用这个）
+        #   "auto" = 不设环境变量，交由 vLLM 自己选
+        # 历史上硬编码 "0" 是因为当时 V1 不稳定；它不是本质需求。
+        # 真正的兼容风险只在 logprobs 返回结构（见 _extract_output）。
+        if args.vllm_use_v1 != "auto":
+            os.environ["VLLM_USE_V1"] = args.vllm_use_v1
+        else:
+            os.environ.pop("VLLM_USE_V1", None)
 
         # Import CUDA/vLLM only after CUDA_VISIBLE_DEVICES is fixed for this process.
         import torch
@@ -54,9 +63,16 @@ class VLLMWorker:
         self.lora_version = 0
         self.adapters = {}
 
+        try:
+            import vllm as _vllm
+            self.vllm_version = getattr(_vllm, "__version__", "unknown")
+        except Exception:
+            self.vllm_version = "unknown"
+
         _log(
             f"starting pid={os.getpid()} CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')} "
-            f"torch_device_count={torch.cuda.device_count()}"
+            f"torch_device_count={torch.cuda.device_count()} "
+            f"vllm={self.vllm_version} VLLM_USE_V1={os.environ.get('VLLM_USE_V1', '<unset>')}"
         )
         if torch.cuda.is_available() and torch.cuda.device_count() > 0:
             _log(f"logical cuda:0 name={torch.cuda.get_device_name(0)}")
@@ -86,6 +102,8 @@ class VLLMWorker:
             "torch_device_count": self.torch.cuda.device_count(),
             "device_name": device_name,
             "lora_version": self.lora_version,
+            "vllm_version": self.vllm_version,
+            "vllm_use_v1": os.environ.get("VLLM_USE_V1", "<unset>"),
         }
 
     def sync_lora(self, manifest):
@@ -106,9 +124,18 @@ class VLLMWorker:
         return None
 
     def _extract_output(self, out):
+        """抽取 text / logprobs / token_ids。
+
+        logprobs 结构在 V0 与 V1 下均为 list[dict[token_id -> Logprob]]，但 V1
+        对未命中 token 的填充策略可能不同；这里的三分支兼容（命中 / 取
+        已知最小值减 1 / 缺失记 0.0）对两个引擎都成立。old_lps 是 GRPO
+        importance ratio 的分母，对齐错位会直接体现为首步 kl 不为 0。
+        """
         log_probs = []
         for token_id, lp_dict in zip(out.token_ids, (out.logprobs or [])):
-            if token_id in lp_dict:
+            if lp_dict is None:
+                log_probs.append(0.0)
+            elif token_id in lp_dict:
                 log_probs.append(lp_dict[token_id].logprob)
             elif lp_dict:
                 log_probs.append(min(lp.logprob for lp in lp_dict.values()) - 1.0)
@@ -211,6 +238,9 @@ def parse_args():
     parser.add_argument("--gpu-memory-utilization", required=True, type=float)
     parser.add_argument("--max-model-len", required=True, type=int)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--vllm-use-v1", default="0",
+                        choices=["0", "1", "auto"],
+                        help="0=强制V0（默认） 1=强制V1（vLLM≥0.10 必选） auto=交给 vLLM")
     return parser.parse_args()
 
 

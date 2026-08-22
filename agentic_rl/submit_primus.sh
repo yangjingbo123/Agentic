@@ -53,6 +53,31 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
+# vLLM 引擎选择：根据镜像里的 vllm 版本自动定 V0/V1。
+# 代码默认 V0（训练机 vllm 0.9.2），但 vLLM ≥0.10 已删 V0，高版本
+# 镜像（如 med_rl 的 0.18）必须走 V1。VLLM_USE_V1_OVERRIDE 可手动强制。
+# ⚠️ 首次在 V1 上跑务必先用 SMOKE=1 验收：首步 kl 应 ≈0，不为 0 说明
+# V1 的 logprobs 返回与训练侧对齐有差异（old_lps 是 importance ratio 分母）。
+# ---------------------------------------------------------------------------
+VLLM_V1=$(python - <<'EOF'
+try:
+    import vllm
+    major, minor = (int(x) for x in vllm.__version__.split(".")[:2])
+    print("0" if (major, minor) < (0, 10) else "1")
+except Exception:
+    print("0")
+EOF
+)
+VLLM_V1=${VLLM_USE_V1_OVERRIDE:-${VLLM_V1}}
+VLLM_VER=$(python -c "import vllm; print(vllm.__version__)" 2>/dev/null || echo unknown)
+echo "vLLM ${VLLM_VER} → engine V${VLLM_V1}"
+if [[ "${VLLM_V1}" == "1" && "${SMOKE:-0}" != "1" ]]; then
+    echo "!! 首次在 V1 引擎上跑建议先 SMOKE=1 验收（看首步 kl 是否 ≈0）；"
+    echo "   已验过可设 V1_VERIFIED=1 跳过本提示。" >&2
+    [[ "${V1_VERIFIED:-0}" == "1" ]] || exit 1
+fi
+
+# ---------------------------------------------------------------------------
 # 资源（Primus 注入）
 # ---------------------------------------------------------------------------
 NUM_GPUS=${NUM_ACCELERATORS:-8}
@@ -130,6 +155,7 @@ python train.py \
     sft_checkpoint="${SFT_CKPT}" \
     ckpt_dir="${CKPT_DIR}" \
     agentic.vllm_num_workers="${VLLM_WORKERS}" \
+    agentic.vllm_use_v1="${VLLM_V1}" \
     agentic.max_steps="${MAX_STEPS}" \
     hydra.run.dir=. \
     ${EXTRA_ARGS} \

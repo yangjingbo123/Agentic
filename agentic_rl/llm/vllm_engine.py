@@ -25,6 +25,7 @@ class VLLMInferenceEngine:
         tensor_parallel_size: int = 1,
         startup_timeout_s: float = 300,
         rpc_timeout_s: float = 600,
+        vllm_use_v1: str = "0",
     ):
         if not vllm_gpu:
             raise ValueError("vllm_gpu must be set for the subprocess vLLM worker")
@@ -36,6 +37,7 @@ class VLLMInferenceEngine:
         self.vllm_gpu = str(vllm_gpu)
         self.startup_timeout_s = startup_timeout_s
         self.rpc_timeout_s = rpc_timeout_s
+        self.vllm_use_v1 = str(vllm_use_v1)
         self._lock = threading.Lock()
         self._next_request_id = 0
         self._closed = False
@@ -61,7 +63,9 @@ class VLLMInferenceEngine:
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = self.vllm_gpu
-        env["VLLM_USE_V1"] = "0"
+        # V0/V1 交由 worker 自己根据 --vllm-use-v1 设置（auto 时不设）；
+        # 这里先清掉继承值，避免外层 shell 的 VLLM_USE_V1 默默生效。
+        env.pop("VLLM_USE_V1", None)
         env["PYTHONPATH"] = project_root + os.pathsep + env.get("PYTHONPATH", "")
 
         cmd = [
@@ -85,6 +89,8 @@ class VLLMInferenceEngine:
             str(max_model_len),
             "--tensor-parallel-size",
             str(tensor_parallel_size),
+            "--vllm-use-v1",
+            self.vllm_use_v1,
         ]
         self._proc = subprocess.Popen(cmd, cwd=project_root, env=env, text=True)
         self._worker_cmd = cmd

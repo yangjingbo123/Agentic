@@ -91,6 +91,8 @@ def main():
     ap.add_argument("--max_tokens",  type=int, default=1024)
     ap.add_argument("--rpc_timeout_s", type=int, default=1800)
     ap.add_argument("--gen_chunk",     type=int, default=256)   # 单次 RPC 请求数
+    ap.add_argument("--vllm_use_v1",   default="0", choices=["0", "1", "auto"],
+                    help="0=V0(默认) 1=V1(vLLM≥0.10 必选) auto=交给 vLLM")
     ap.add_argument("--seed",        type=int, default=0)
     args = ap.parse_args()
 
@@ -100,6 +102,7 @@ def main():
         args.model_path, max_tokens=args.max_tokens,
         gpu_memory_utilization=0.65, max_model_len=4096,
         vllm_gpu=args.vllm_gpu, rpc_timeout_s=args.rpc_timeout_s,
+        vllm_use_v1=args.vllm_use_v1,
     )
     print(f"vLLM ready: {engine.ping()}", flush=True)
     engine.sync_lora(model)

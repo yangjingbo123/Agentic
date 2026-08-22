@@ -107,6 +107,10 @@ def main(cfg: DictConfig):
             max_model_len=cfg.agentic.get("vllm_max_model_len", 4096),
             startup_timeout_s=cfg.agentic.get("vllm_start_timeout_s", 300),
             rpc_timeout_s=cfg.agentic.get("vllm_rpc_timeout_s", 600),
+            # "0"=强制V0（默认，同训练机 vllm 0.9.2）"1"=强制V1（高版本镜像
+            # 必选，vLLM ≥0.10 已删 V0）"auto"=交给 vLLM。首次切 V1 请用 SMOKE
+            # 作业验收：首步 kl 应 ≈0，不为 0 则 logprobs 对齐有差异。
+            vllm_use_v1=str(cfg.agentic.get("vllm_use_v1", "0")),
         )
         if num_workers > 1:
             _visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")

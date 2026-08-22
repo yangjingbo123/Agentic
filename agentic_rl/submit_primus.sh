@@ -132,6 +132,15 @@ mkdir -p "${CKPT_DIR}"
 export TMPDIR="${SAVE_ROOT}/tmp-${EXP_NAME}"
 mkdir -p "${TMPDIR}"
 
+# 但 vLLM V1 引擎用 ZMQ IPC（Unix domain socket）做进程间通信，socket 文件
+# 必须建在支持 socket 的**本地**文件系统上。OSS/NAS 挂载不支持，bind()
+# 会报 ZMQError: Input/output error。所以临时文件分两类安置：
+#   大文件（LoRA 权重，每 step 写）→ TMPDIR 指挂载盘
+#   IPC socket（小文件，需 socket 语义）→ VLLM_RPC_BASE_PATH 指本地盘
+# V0 不用 IPC socket，所以这个差异只在 V1 上暴露。
+export VLLM_RPC_BASE_PATH="${VLLM_RPC_BASE_PATH:-/tmp/vllm-ipc-${EXP_NAME}}"
+mkdir -p "${VLLM_RPC_BASE_PATH}"
+
 # Primus 容器无外网：wandb 离线，run 数据落在工作目录，事后手动 sync
 export WANDB_MODE=${WANDB_MODE:-offline}
 export VLLM_USE_FLASHINFER_SAMPLER=0

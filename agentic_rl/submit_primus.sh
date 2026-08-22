@@ -59,18 +59,26 @@ fi
 # ⚠️ 首次在 V1 上跑务必先用 SMOKE=1 验收：首步 kl 应 ≈0，不为 0 说明
 # V1 的 logprobs 返回与训练侧对齐有差异（old_lps 是 importance ratio 分母）。
 # ---------------------------------------------------------------------------
-VLLM_V1=$(python - <<'EOF'
+# 一次 import 同时拿版本与引擎判定：vLLM import 开销大（初始化 CUDA/
+# 扩展，可达分钟级），分两次跑会白等一倍并多一份超时/OOM 风险。
+VLLM_PROBE=$(python - <<'EOF'
 try:
     import vllm
-    major, minor = (int(x) for x in vllm.__version__.split(".")[:2])
-    print("0" if (major, minor) < (0, 10) else "1")
-except Exception:
-    print("0")
+    ver = vllm.__version__
+    major, minor = (int(x) for x in ver.split(".")[:2])
+    print(f"{ver} {'0' if (major, minor) < (0, 10) else '1'}")
+except Exception as e:
+    print(f"unknown 0  # probe failed: {type(e).__name__}: {e}")
 EOF
 )
+VLLM_VER=$(echo "${VLLM_PROBE}" | awk '{print $1}')
+VLLM_V1=$(echo "${VLLM_PROBE}" | awk '{print $2}')
 VLLM_V1=${VLLM_USE_V1_OVERRIDE:-${VLLM_V1}}
-VLLM_VER=$(python -c "import vllm; print(vllm.__version__)" 2>/dev/null || echo unknown)
 echo "vLLM ${VLLM_VER} → engine V${VLLM_V1}"
+if [[ "${VLLM_VER}" == "unknown" ]]; then
+    echo "!! 无法 import vllm（探测详情：${VLLM_PROBE}）——镜像缺 vllm 或安装损坏" >&2
+    exit 1
+fi
 if [[ "${VLLM_V1}" == "1" && "${SMOKE:-0}" != "1" ]]; then
     echo "!! 首次在 V1 引擎上跑建议先 SMOKE=1 验收（看首步 kl 是否 ≈0）；"
     echo "   已验过可设 V1_VERIFIED=1 跳过本提示。" >&2

@@ -59,6 +59,11 @@ vllm_gpu_memory_utilization: 0.65
 # 首次切 V1 用 SMOKE=1 作业验收：首步 kl 应 ≈0（策略=参考=SFT 起点），
 # 不为 0 说明 V1 的 logprobs 返回与训练侧对齐有差异，不可直接用。
 vllm_use_v1: "0"
+# enforce_eager=true 禁用 CUDA graph（默认，与训练机历史行为一致）。
+# V1 引擎把 piecewise CUDA graph 当核心优化，小 batch + 中等生成长度下
+# kernel launch 开销占比高，设 false 开启 graph 可能大幅提速；代价是每个
+# worker 额外几 GB 显存与首次建图耗时。改前后用 2 步 SMOKE 对比 t=耗时。
+vllm_enforce_eager: true
 vllm_num_workers: 3
 vllm_max_model_len: 4096
 vllm_start_timeout_s: 300

@@ -2,6 +2,7 @@ import json
 import os
 import random
 import subprocess
+import time
 
 import numpy as np
 import torch
@@ -111,6 +112,9 @@ def main(cfg: DictConfig):
             # 必选，vLLM ≥0.10 已删 V0）"auto"=交给 vLLM。首次切 V1 请用 SMOKE
             # 作业验收：首步 kl 应 ≈0，不为 0 则 logprobs 对齐有差异。
             vllm_use_v1=str(cfg.agentic.get("vllm_use_v1", "0")),
+            # enforce_eager=False 开启 CUDA graph。V1 下 kernel launch 开销占比高，
+            # 实测每步耗时可差数倍；代价是每 worker 额外几 GB 显存与首次建图耗时。
+            enforce_eager=bool(cfg.agentic.get("vllm_enforce_eager", True)),
         )
         if num_workers > 1:
             _visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
@@ -276,6 +280,7 @@ def main(cfg: DictConfig):
         eps_force = max(_epsm, _eps0 - (_eps0 - _epsm) * step / max(max_steps, 1))
 
         # Run all batch_size * n_samples rollouts in one batched vLLM call
+        _t_roll0 = time.time()
         questions = [item["question"] for item in batch]
         answers   = [item["answer"]   for item in batch]
         n_s = trainer.n_samples
@@ -301,6 +306,7 @@ def main(cfg: DictConfig):
                     all_eps[_ei + _j * _k] = _ep
         else:
             all_eps = trainer.executor.run_episodes_batch(all_q, all_a, eps_force=eps_force)
+        _dt_rollout = time.time() - _t_roll0
         # group by question — each group is the list of N rollouts for that question
         batch_rollouts = []
         for qi in range(len(batch)):
@@ -312,6 +318,7 @@ def main(cfg: DictConfig):
             note_skip("no group had >=2 valid episodes")
             continue
 
+        _t_train0 = time.time()
         try:
             stats = trainer.update(batch_rollouts)
         except Exception:
@@ -335,7 +342,8 @@ def main(cfg: DictConfig):
         _qf  = stats.get("q_forced")
         _tc  = stats.get("int_critic_share")
         print(
-            f"step={step} reward={stats['mean_reward']:.3f} acc={stats['accuracy']:.2f} "
+            f"step={step} t={_dt_rollout:.0f}+{time.time() - _t_train0:.0f}s "
+            f"reward={stats['mean_reward']:.3f} acc={stats['accuracy']:.2f} "
             f"loss={stats['loss']:.4f} kl={stats['kl']:.4f} "
             f"ent={stats.get('entropy', 0.0):.3f} "
             f"clip={stats.get('clip_frac', 0.0):.3f} "

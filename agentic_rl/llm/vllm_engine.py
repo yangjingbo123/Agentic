@@ -26,6 +26,7 @@ class VLLMInferenceEngine:
         startup_timeout_s: float = 300,
         rpc_timeout_s: float = 600,
         vllm_use_v1: str = "0",
+        enforce_eager: bool = True,
     ):
         if not vllm_gpu:
             raise ValueError("vllm_gpu must be set for the subprocess vLLM worker")
@@ -38,6 +39,7 @@ class VLLMInferenceEngine:
         self.startup_timeout_s = startup_timeout_s
         self.rpc_timeout_s = rpc_timeout_s
         self.vllm_use_v1 = str(vllm_use_v1)
+        self.enforce_eager = bool(enforce_eager)
         self._lock = threading.Lock()
         self._next_request_id = 0
         self._closed = False
@@ -99,6 +101,9 @@ class VLLMInferenceEngine:
             "--vllm-use-v1",
             self.vllm_use_v1,
         ]
+        if not self.enforce_eager:
+            # 开启 CUDA graph：V1 下小 batch 场景提速明显
+            cmd.append("--no-enforce-eager")
         self._proc = subprocess.Popen(cmd, cwd=project_root, env=env, text=True)
         self._worker_cmd = cmd
         self._sock = None

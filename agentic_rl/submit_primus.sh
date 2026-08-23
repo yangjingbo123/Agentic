@@ -183,6 +183,7 @@ python train.py \
     ckpt_dir="${CKPT_DIR}" \
     agentic.vllm_num_workers="${VLLM_WORKERS}" \
     agentic.vllm_use_v1="${VLLM_V1}" \
+    agentic.vllm_enforce_eager="${ENFORCE_EAGER:-true}" \
     agentic.max_steps="${MAX_STEPS}" \
     hydra.run.dir=. \
     ${EXTRA_ARGS} \

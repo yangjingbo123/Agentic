@@ -86,11 +86,16 @@ class VLLMWorker:
             max_lora_rank=16,
             gpu_memory_utilization=args.gpu_memory_utilization,
             max_model_len=args.max_model_len,
-            enforce_eager=True,
+            # enforce_eager 禁用 CUDA graph。V0 时代损失有限，但 V1 把 piecewise
+            # CUDA graph 当核心优化，小 batch + 中等生成长度（本项目典型工况）
+            # 下 kernel launch 开销占比高，关掉 graph 可能慢数倍。默认保持 True
+            # 与历史行为一致；用 --no-enforce-eager 开启 graph（额外占几 GB 显存，
+            # 且首次捕获有建图耗时）。vLLM 官方支持 enable_lora 与 CUDA graph 共存。
+            enforce_eager=args.enforce_eager,
             tensor_parallel_size=args.tensor_parallel_size,
             distributed_executor_backend="mp",
         )
-        _log("vLLM initialized")
+        _log(f"vLLM initialized (enforce_eager={args.enforce_eager})")
 
     def ping(self):
         device_name = None
@@ -241,6 +246,9 @@ def parse_args():
     parser.add_argument("--vllm-use-v1", default="0",
                         choices=["0", "1", "auto"],
                         help="0=强制V0（默认） 1=强制V1（vLLM≥0.10 必选） auto=交给 vLLM")
+    parser.add_argument("--no-enforce-eager", dest="enforce_eager",
+                        action="store_false", default=True,
+                        help="开启 CUDA graph（V1 下测到显著提速，代价是额外显存）")
     return parser.parse_args()
 
 

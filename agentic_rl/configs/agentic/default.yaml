@@ -29,9 +29,20 @@ int_overkill: 0.0    # 画蛇添足惩罚（v2.1：0.05）
 lambda_int: 1.0      # 交互奖励合成权重；0 = 消融B（有交互不训练交互，即 v1 行为）
 max_hops: 2          # 每轮交互链响应跳数上限；0 = 消融A（完全禁用交互）
 stop_gate: true      # stop 需黑板存在 verifier 分数；消融A 时建议关闭
+# v3.1：闸门解锁。v2.0 的解锁通道只在“proposer 未自发起交互”分支里，被
+# v3 的 int_rate=0.78 遮蔽 → gate 拦停 10→193 → 跑满轮数 → prompt 膨胀
+# 致 step 151 崩（§20）。true = 想停但黑板无分数时，本轮末独立补一次
+# verifier 打分（不占 hop 预算，不进 r_int 因果归因）。false = 消融。
+gate_unlock: true
 # v3 二测（§19，2026-08-20，sft_v3）：verifier 分辨力 Δ=+0.312 > 0.2 → 加权
-# 投票解锁（一测 Δ=0.012 时有害，已修复）。uniform = 消融。
-vote_mode: weighted
+# 投票解锁。但 v3 首跑 150 步实测证伪：15 次 eval 中 14 次 d_vote<0，均值
+# −0.0126（符号检验 p≈0.001）。根因两层：① Δ 是全覆盖打分下测的，
+# episode 内 verifier 覆盖率仅 ~32%，未验证答案的先验 0.5 低于“已验证的
+# 错答案”，系统性压制未验证的正确答案；② parse 0.95→0.80 使长文本垃圾
+# 答案各占一票，而 n×score 让“单票高分”能压过“多票中性”——weighted 比
+# uniform 对污染更敏感。v3.1 已堵死②并用 gate_unlock 抬高覆盖率，待下轮
+# d_vote 重新转正再评估重开。
+vote_mode: uniform
 # 修正正确率两次测量 ≤ 裸重采样（Δ=−0.062/−0.018）→ 修正票退出投票池，
 # 仍进黑板供 r_int 因果信用与上下文；true = 消融（v2 行为）。
 correction_in_vote: false

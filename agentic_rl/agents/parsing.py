@@ -49,8 +49,16 @@ def parse_interaction(text: str) -> tuple[str, str, str]:
     return action, target, reason
 
 
+# 无界文本上限（v3.1）。v3 实测：parse 0.95→0.80 后，兜底抽取的 answer 可能
+# 是整段文本，reasoning 缺失时更是直接返回全部输出；两者都会进 responder
+# prompt 与黑板文本，随轮数累积后撑破 max_model_len（step 151 实测 5036>4096）。
+# 另：answer 是投票池的键，长文本 answer 彼此各不相同→各占一票稀释投票。
+MAX_ANSWER_CHARS = 64      # 数学答案（含 LaTeX）远不到此长度；超出即视为解析失败
+MAX_REASONING_CHARS = 1500  # 完整推理保留上限（够容纳正常多步解题）
+
+
 def parse_reasoning(text: str) -> tuple[str, str]:
-    """proposer 输出 → (推理过程, 最终答案)。"""
+    """proposer 输出 → (推理过程, 最终答案)。两路返回值均有硬上限。"""
     reasoning = re.search(r"推理过程：(.+?)(?=最终答案：|<|$)", text, re.S)
     answer = re.search(r"最终答案：(.+)", text)
     if not answer:
@@ -58,7 +66,13 @@ def parse_reasoning(text: str) -> tuple[str, str]:
         ans_str = nums[-1] if nums else ""
     else:
         ans_str = answer.group(1).strip()
-    return (reasoning.group(1).strip() if reasoning else text, ans_str)
+        # 「最终答案：」后又接着展开论述 → 不是答案，当解析失败处理，
+        # 而非截断后当真（截断会造出一个“看上去像答案”的假票污染投票池）。
+        if len(ans_str) > MAX_ANSWER_CHARS:
+            nums = re.findall(r"-?\d+\.?\d*", ans_str)
+            ans_str = nums[-1] if nums else ""
+    reasoning_str = reasoning.group(1).strip() if reasoning else text
+    return (reasoning_str[:MAX_REASONING_CHARS], ans_str)
 
 
 def parse_score(text: str) -> float | None:

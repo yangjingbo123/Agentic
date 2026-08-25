@@ -1620,3 +1620,112 @@ step 30 探针（替代 §18.5）：
 ③ int_rate 不归零且 tgtC 下降（验证型求助占比上升——verify 求助零成本
 且通过加权投票影响 episode 结果，应成为主流）；
 ④ 最终目标：eval_acc > 0.863（v2.0 投票-only）且 > 同 ckpt 的 uniform 消融。
+
+## 20. v3 首跑复盘：三项修复兑现、通道①被证伪、step 151 崩（2026-08-20）
+
+跑 150 步后崩于 `ValueError: The decoder prompt (length 5036) is longer than
+the maximum model length of 4096`。150 步的曲线本身有效，可用。
+
+### 20.1 §18.3 三项工程修复全部兑现
+
+| 修复 | 判据 | 实测 | 判决 |
+|------|------|------|------|
+| KL 锚到冻结 SFT 快照（§14） | step1 kl≈0 | 0.0000 → 0.0130 缓升 | ✅ |
+| 零成本冷启动 | int_rate 不归零 | 全程 0.77–0.87（第四次没塌） | ✅ |
+| 主 turn 双通道优势 | groups 不被 floor 丢弃、len 不塌 | 32/32 全程；len 133→251 | ✅ |
+
+`acc_uniform` 0.823 → 0.863（step 90 峰）→ 0.850，**+4.0 点**是真实收益，
+且已追平 v2.0 投票-only 基线 0.863。选择性仍未形成（sel 全程 −0.11~+0.04
+震荡），但 eff 0.03→0.09 首次追上 qF——§18.5 判据③首次接近。
+
+### 20.2 通道①被在线消融证伪（核心负结果）
+
+15 次 eval 的 d_vote：14 次为负、1 次 +0.007，均值 **−0.0126**，
+符号检验 p≈0.001 —— 不是噪声，是系统性有害。与 §19.1 的 Δ=+0.312 矛盾。
+
+两层根因：
+
+1. **覆盖率**：Δ 是 measure_channels.py 在**给每个答案都打分**的条件下测的；
+   episode 内 verifier 只被稀疏调用，覆盖率约 32%。未验证答案吃先验 0.5，
+   于是「已验证的错答案（score≈0.6）」系统性压过「未验证的正确答案（0.5）」。
+2. **投票池污染**：parse 0.95→0.80（见 20.3），长文本垃圾答案各占一票；
+   而票权 = 票数×分数让「单票高分」能压过「多票中性」——**weighted 比
+   uniform 对污染更敏感**，同一批污染下 weighted 亏得更多。
+
+可直接进论文的结论：**聚合器分辨力 ≠ 聚合器可用性，中间隔着覆盖率。**
+离线全覆盖测得的判别力，不能外推到策略自主决定是否调用的在线场景。
+
+### 20.3 step 151 崩溃链
+
+```
+parse 0.95→0.80（长 answer / reasoning 缺失时返回整个输出）
+  ├→ 无界文本进 responder prompt 与黑板 → 随轮数累积 → 5036>4096 崩
+  └→ 垃圾答案各占一票 → 加剧 20.2 的 d_vote 为负
+
+tgtC 0.48→0.75（求助偏向 critic）
+  → gate 解锁被 int_rate=0.78 遮蔽 → 黑板永无分数 → gate 拦停 10→193
+  → 跑满 max_rounds → 加剧 prompt 膨胀，且压低 verifier 覆盖率
+```
+
+**闸门解锁被遮蔽**是这轮最值得记的教训。v2.0 的解锁代码写在
+`elif`（proposer 未自发起）分支里：
+
+```python
+if u:                       # 自发起：用 proposer 自己选的 target（75% 是 critic）
+    ...
+elif self.max_hops > 0:     # 解锁逻辑只在这里
+    if st["gate_blocked"]: forced, target = True, "verifier"
+```
+
+写它时 int_rate→0，所以 `elif` 总能进、解锁总能触发。v3 的零成本冷启动把
+int_rate 救到 0.78，78% 的轮次改走 `if u:` → 解锁静默失效。
+**前一个修复的成功造成了后一个修复的失效**——分支互斥的兜底逻辑，其可达性
+依赖于另一个指标的取值，指标一变兜底就失明。
+
+注：本节初稿曾把 prompt 膨胀归因于 FLAW 累积，错误。`to_text` 只取
+`flaws[-1]` 且截断 80 字符，黑板的 flaw 部分不会膨胀。真凶是三个无界文本点
+（见 20.4 第 1、2 条）。
+
+### 20.4 v3.1 修正（六处）
+
+1. **parse 硬上限**（parsing.py）：`MAX_ANSWER_CHARS=64`、
+   `MAX_REASONING_CHARS=1500`。answer 超限时**回退抽末位数字而非截断**——
+   截断会造出一个「看上去像答案」的假票污染投票池，宁可判解析失败。
+2. **黑板展示层收敛**（blackboard.py）：`get_distinct_answers` 改
+   `dict.fromkeys` 保序（`list(set)` 的顺序依赖字符串 hash，Python 默认
+   随机化 → prompt 内容与 `max(key=)` 的平分 tie-break 跨进程不可复现）；
+   新增 `_answers_for_display()` 滤空串、限长 64、只留最近 6 个。
+3. **prompt 长度保险**（executor `make_prompt`，所有请求的唯一出口）：
+   按 token 精确计数，超 `max_prompt_tokens` 取头尾各半、中段省略；
+   首次触发打警告并计入 `n_prompt_clipped`。**不提 `max_model_len`**——
+   有了 clip 计数，4096 是暴露新无界点的哨兵，抬到 8192 只是把问题推后。
+4. **闸门解锁独立批次**（executor 3.5 步，`gate_unlock: true`）：想停但黑板
+   无分数时，本轮末独立补一次 verifier 打分，**不占 hop 预算**。已确认
+   `verifier_turns` 只用于 verifier 自己的校准奖励 `r = 1 − |score − 对错|`，
+   与 `u`/`forced`/`r_int` 解耦 → 机制触发不污染因果归因，还顺带抬覆盖率。
+   计数 `n_gate_unlocked` 是健康指标：**应随训练下降**（策略自己学会找 verifier）。
+5. **加权投票回退**：`vote_mode: uniform`（20.2 证伪）。同时把消融改成
+   **两路无条件计票**——原实现只在 `vote_mode == "weighted"` 时才真算 uniform，
+   回退后 d_vote 会恒等于 0，重开 weighted 的判据就此失明。现 d_vote 恒为
+   「weighted − uniform」，与生产 mode 无关；weighted 作影子指标持续记录。
+6. **指标接入**（train.py）：step 行 `gate=N→M`、`clip_prompt=N`；
+   wandb 加 `gate_unlocked` / `prompt_clipped` / `eval_accuracy_weighted`。
+
+测试：新增 3 条（26→29 全过），其中
+`test_gate_unlock_when_proposer_self_initiates_to_critic` **带消融对照**——
+`gate_unlock=False` 时精确复现 v3 故障（跑满 4 轮、`stopped=False`、verifier
+从未被调用），证明是该开关在起作用而非测试自证。
+
+### 20.5 重跑判据（替代 §19.3）
+
+| 读数 | 期望 | 异常含义 |
+|------|------|----------|
+| `gate=N→M` | M 接近 N | M 远小于 N → 解锁没生效 |
+| `gate_unlocked` 趋势 | 随训练下降 | 不降 → 策略没学会主动找 verifier |
+| `clip_prompt` | 不出现 | 出现且增长 → 还有文本无界点 |
+| `parse` | 可能低于 0.95 | 正常：长答案现在被诚实判为失败 |
+| `d_vote`（影子） | 转正后再考虑重开 weighted | 仍为负 → 覆盖率或污染没解决 |
+
+重开 weighted 需两个前提同时满足：覆盖率上来（gate 解锁生效且计数下降）+
+污染堵住（parse 稳、clip 不出现），然后 d_vote 连续几次 eval 转正。
+在此之前 weighted 只作影子指标，不进生产路径。

@@ -430,6 +430,14 @@ class FakeTokenizer:
     def apply_chat_template(self, messages, **kw):
         return messages[0]["content"] + "\n---\n" + messages[1]["content"]
 
+    # v3.1 prompt 长度保险需要 encode/decode。按字符切分充当 token（比真
+    # tokenizer 更保守：字符数 ≥ token 数），足以验证截断逻辑。
+    def encode(self, text, add_special_tokens=False):
+        return list(text)
+
+    def decode(self, ids):
+        return "".join(ids)
+
 
 class FakeEngine:
     """按角色出队的脚本引擎；记录调用以便断言。"""
@@ -597,6 +605,104 @@ def test_integration_gate_blocked_injects_verifier():
     prop_main = [v for v in res["raca_turn_data"].values()
                  if v["role"] == "proposer" and not v["is_response"]]
     assert len(prop_main) == 1 and approx(prop_main[0]["reward"], 1.0)
+
+
+def test_gate_unlock_when_proposer_self_initiates_to_critic():
+    """v3.1：自发起交互且选 critic 时，gate 仍能解锁（v3 崩溃场景）。
+
+    v2.1 的解锁通道写在 `elif`（proposer 未自发起）分支里，当时
+    int_rate→0 所以总能触发。v3 零成本冷启动把 int_rate 救到 0.78，
+    78% 的轮次改走 `if u:` 分支 → 解锁被遮蔽；其中 75% 又选 critic
+    （tgtC=0.75）→ 黑板永无分数 → gate 拦停 10→193 → 跑满 max_rounds
+    → prompt 膨胀至 step 151 崩。即“前一个修复的成功造成后一个失效”。
+    """
+    def _script():
+        return {
+            "controller": [
+                "<meta-plan>\ndecision: stop\nreason: r\n</meta-plan>",  # 无分数→拦
+                "<meta-plan>\ndecision: stop\nreason: r\n</meta-plan>",  # 有分数→生效
+                "<meta-plan>\ndecision: stop\nreason: r\n</meta-plan>",
+                "<meta-plan>\ndecision: stop\nreason: r\n</meta-plan>",
+            ],
+            # 自发起交互且 target=critic——这使旧解锁分支永不执行
+            "proposer": [INTER.format(a="request", t="critic")
+                         + "推理过程：x\n最终答案：4"] * 4,
+            # 无错误：不触发修正跳，保证本轮交互链不会附带产出分数
+            "critic": ["错误分析：无错误\n修正建议：无"] * 4,
+            "verifier": ["分数: 0.9\n验证说明：ok"] * 4,
+        }
+
+    # ── 修复后：gate_unlock=True ─────────────────────────────────
+    eng = FakeEngine(_script())
+    ex = _mk_executor(eng, gate_unlock=True)
+    res = ex.run_episodes_batch(["q"], ["4"], eps_force=0.0)[0]
+
+    m0 = res["raca_round_meta"][0]
+    assert m0["gate_blocked"] is True        # stop 被拦
+    assert m0["u"] is True                   # 且是自发起（非强制注入）
+    assert m0["forced"] is False
+    assert m0["target"] == "critic"           # proposer 选的是 critic
+    assert "verifier" in eng.calls            # ← 关键：解锁批次仍补上了 verifier
+    assert res["stopped"] is True             # 第二轮能停
+    assert len(res["raca_round_meta"]) == 1   # 没跑满 max_rounds=4
+    assert ex.n_gate_unlocked == 1
+    # 解锁 turn 领 verifier 自己的校准奖励，不污染 proposer 的 r_int 归因
+    vt = [v for v in res["raca_turn_data"].values() if v["role"] == "verifier"]
+    assert len(vt) == 1 and approx(vt[0]["reward"], 1.0 - abs(0.9 - 1.0))
+
+    # ── 消融：gate_unlock=False 应复现死锁（证明是该开关在起作用） ──────
+    eng2 = FakeEngine(_script())
+    ex2 = _mk_executor(eng2, gate_unlock=False)
+    res2 = ex2.run_episodes_batch(["q"], ["4"], eps_force=0.0)[0]
+    assert "verifier" not in eng2.calls          # 旧分支被遮蔽，永无分数
+    assert res2["stopped"] is False              # stop 永远被拦
+    assert len(res2["raca_round_meta"]) == 4     # 跑满 max_rounds——即 v3 故障
+
+
+def test_unbounded_text_is_capped():
+    """v3.1：三个无界文本点均有硬上限（step 151 崩溃的根因）。
+
+    实测：decoder prompt 5036 > max_model_len 4096。膨胀链：
+    parse 0.95→0.80 → 兜底抽取出长文本 answer / reasoning 缺失时返回
+    整个输出 → 两者进 responder prompt 与黑板文本 → 随轮数累积→撑破上限。
+    另：answer 是投票池的键，长文本 answer 彼此各不相同→各占一票稀释投票。
+    """
+    from agents.parsing import parse_reasoning, MAX_ANSWER_CHARS, MAX_REASONING_CHARS
+
+    # ①「最终答案：」后接大段论述 → 当解析失败，回退抽数字，而非截断后当真
+    _, ans = parse_reasoning("推理过程：x\n最终答案：" + "啦" * 500 + "42")
+    assert len(ans) <= MAX_ANSWER_CHARS and ans == "42"
+    # 正常答案（含 LaTeX）不受影响
+    _, ok = parse_reasoning("推理过程：x\n最终答案：\\frac{\\pi}{2}")
+    assert ok == "\\frac{\\pi}{2}"
+
+    # ②reasoning 缺失时返回整个输出，必须限长
+    reasoning, _ = parse_reasoning("没有任何格式的长输出" + "哦" * 5000)
+    assert len(reasoning) <= MAX_REASONING_CHARS
+
+    # ③黑板文本：答案数量与单个长度均不随轮数无限增长
+    from envs.blackboard import Blackboard, Message, MessageType
+    bb = Blackboard()
+    for k in range(30):
+        bb.add_message(Message(0, MessageType.TRACE, ("r", f"ans{k}" + "垃" * 200)))
+    bb.add_message(Message(0, MessageType.TRACE, ("r", "")))   # 解析失败的空串
+    text = bb.to_text()
+    assert "" not in bb._answers_for_display()      # 空串不进展示
+    assert len(bb._answers_for_display()) <= bb._MAX_SHOWN_ANSWERS
+    assert len(text) < 1000                        # 31 个×200 字本来会过万
+    # 但去重语义不变（投票与奖励仍看到全部答案）
+    assert len(bb.get_distinct_answers()) == 31
+
+
+def test_distinct_answers_order_is_deterministic():
+    """v3.1：保序去重。list(set) 的顺序依赖字符串 hash（Python 默认
+    随机化），会让 prompt 内容与 max(..., key=) 的平分 tie-break 跳进程
+    不可复现——同一 checkpoint 重跑得不到同一结果。"""
+    from envs.blackboard import Blackboard, Message, MessageType
+    bb = Blackboard()
+    for a in ["7", "3", "11", "3", "5"]:
+        bb.add_message(Message(0, MessageType.TRACE, ("r", a)))
+    assert bb.get_distinct_answers() == ["7", "3", "11", "5"]   # 严格插入序
 
 
 def test_parse_rate_metric():

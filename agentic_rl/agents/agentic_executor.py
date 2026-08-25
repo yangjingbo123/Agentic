@@ -36,6 +36,9 @@ class AgenticExecutor:
         self.max_rounds = config.get("max_rounds", 4)
         self.max_hops = config.get("max_hops", 2)        # 0 = 消融A：禁用交互
         self.stop_gate = config.get("stop_gate", True)   # stop 需存在 verifier 分数
+        # v3.1：闸门解锁。想停但黑板无分数时，本轮末独立补一次 verifier
+        # 打分（不占 hop 预算、与 proposer 选不选交互无关）。详见 3.5 步注释。
+        self.gate_unlock = config.get("gate_unlock", True)
         # ε 强制注入时选 verifier 的概率（其余选 critic）。v2.0 固定注 critic，
         # 导致 verifier 零训练数据且 stop 闸门永不解锁。
         self.eps_verifier_share = config.get("eps_verifier_share", 0.5)
@@ -52,6 +55,17 @@ class AgenticExecutor:
         # v3 测量（§19）：旧错解+批评的上下文对下一轮重答有锚定伤害
         # （通道② Δ=−0.085/−0.055）；False = FLAW 不进 primary prompt。
         self.flaw_in_primary = config.get("flaw_in_primary_prompt", True)
+        # ── prompt 长度保险（v3.1） ────────────────────────────────────────
+        # v3 实测 step 151：decoder prompt 5036 > max_model_len 4096 直接崩作业。
+        # 已在 parsing/blackboard 侧堵住已知无界点，但任何嵌入自由文本的 prompt
+        # 都可能再出现新的增长源，故在唯一出口 make_prompt 处兜底：超限则中段
+        # 截断（保头保尾——头是任务指令，尾是格式要求），并计数暴露。
+        # 宁可这一条 prompt 降质，也不能让 200 步的作业在第 151 步整体丢失。
+        _model_len = config.get("vllm_max_model_len", 4096)
+        self.max_prompt_tokens = config.get(
+            "max_prompt_tokens", 0) or max(256, _model_len - self.max_tokens - 64)
+        self.n_prompt_clipped = 0
+        self.n_gate_unlocked = 0    # 本批次闸门解锁次数（健康指标：应随训练下降）
         self._rng = random.Random()
 
     # ── batch entry point（N episodes 并行，逐 turn-slot 批量调 vLLM） ───────
@@ -63,6 +77,7 @@ class AgenticExecutor:
             raise RuntimeError("RACA v2 rollout 需要 vLLM 引擎（no_vllm 路径已移除）")
         if self.eval_mode:
             eps_force = 0.0
+        self.n_gate_unlocked = 0    # 每批次重置；train.py 读到的就是本步值
 
         n = len(questions)
         blackboards    = [Blackboard() for _ in range(n)]
@@ -82,11 +97,30 @@ class AgenticExecutor:
             return tid
 
         def make_prompt(system, user):
+            user = clip_user(system, user)
             return self.tokenizer.apply_chat_template(
                 [{"role": "system", "content": system},
                  {"role": "user",   "content": user}],
                 tokenize=False, add_generation_prompt=True, enable_thinking=False,
             )
+
+        def clip_user(system, user):
+            """prompt 长度保险：按 token 精确计数，超限取头尾各半。"""
+            budget = self.max_prompt_tokens - len(
+                self.tokenizer.encode(system, add_special_tokens=False))
+            if budget < 64:
+                return user
+            ids = self.tokenizer.encode(user, add_special_tokens=False)
+            if len(ids) <= budget:
+                return user
+            head = budget // 2
+            self.n_prompt_clipped += 1
+            if self.n_prompt_clipped == 1:
+                print(f"[warn] prompt 超限已启用中段截断（{len(ids)}>{budget} tokens）"
+                      f"；若 clip 计数持续增长说明仍有文本无界点", flush=True)
+            return (self.tokenizer.decode(ids[:head])
+                    + "\n…（中段已省略）…\n"
+                    + self.tokenizer.decode(ids[-(budget - head):]))
 
         def record(i, role, system, user, result, tid):
             text, turn_lps, token_ids = result
@@ -294,6 +328,43 @@ class AgenticExecutor:
                             {"from": target, "action": a2, "target": t2, "reason": r2}))
                         st["pending"].append((target, out, a2, t2, r2, False))
 
+            # ── 3.5 闸门解锁批次（v3.1，不占 hop 预算） ────────────────
+            # v2.0 写的解锁通道在上文 elif（proposer 未自发起）分支里，当时
+            # int_rate→0 所以总能触发。v3 零成本冷启动把 int_rate 救到 0.78后，
+            # 78% 的轮次走 if u: 分支，解锁逆而被遮蔽；其中 75% 又选 critic
+            # （tgtC=0.75）→ 黑板永远拿不到分数 → stop 被拦（gate 10→193）
+            # → 跑满 max_rounds → prompt 膨胀至 step 151 崩。前一个修复的成功
+            # 造成了后一个修复的失效，故改为与 proposer 选择无关的独立批次：
+            # 想停但没钥匙，系统就发一把。
+            # 该 turn 只领 verifier 自己的校准奖励（r_int 由主 turn 的 u/forced
+            # 定，不受影响），因此不污染因果归因，且顺带抬高 verifier 覆盖率。
+            if self.gate_unlock and self.max_hops > 0:
+                unlock_info = []
+                for i, st in ep_st.items():
+                    if not st["gate_blocked"] or blackboards[i].scores:
+                        continue
+                    bb = blackboards[i]
+                    last = bb.traces[-1] if bb.traces else ("", "")
+                    unlock_info.append((
+                        i, next_tid(i), PromptTemplates.verifier_system(),
+                        f"待验证答案：{last[1]}\n推理：{last[0]}\n"
+                        f"当前状态：{bb.to_text()}", last[1]))
+                if unlock_info:
+                    unlock_res = self.vllm_engine.generate_batch(
+                        [{"role": "verifier", "prompt": make_prompt(s, u),
+                          "temperature": self.temperature}
+                         for _, _, s, u, _ in unlock_info])
+                    for (i, tid, sys, usr, reviewed), res in zip(unlock_info, unlock_res):
+                        out = record(i, "verifier", sys, usr, res, tid)
+                        score = parse_score(out)
+                        blackboards[i].add_message(Message(
+                            2, MessageType.SCORE,
+                            (reviewed, score if score is not None else 0.5)))
+                        ep_st[i]["verifier_turns"].append({
+                            "tid": tid, "score": score, "reviewed_answer": reviewed,
+                        })
+                    self.n_gate_unlocked += len(unlock_info)
+
             # ── 4. round record 落盘 ───────────────────────────────────────
             for i, st in ep_st.items():
                 round_records[i].append({
@@ -318,13 +389,17 @@ class AgenticExecutor:
             exclude = None if self.correction_in_vote else corr_answers[i]
             final_answer = self._majority_vote(blackboards[i], exclude)
             is_correct = math_equal(final_answer, correct_answers[i])
-            # 消融对照（§19.3 判据①）：同一批 episode 上朴素计票的正确性，
-            # 免二次 rollout 即可在线量化加权投票的 Δacc。
-            uni_correct = is_correct
-            if self.vote_mode == "weighted":
-                uni_ans = self._majority_vote(blackboards[i], exclude,
-                                              mode="uniform")
-                uni_correct = math_equal(uni_ans, correct_answers[i])
+            # 消融对照（§19.3 判据①）：同一批 episode 上两种计票各自的正确性，
+            # 免二次 rollout 即可在线量化加权投票的 Δacc。两路都无条件计算，
+            # 使 d_vote 恒为「weighted − uniform」而不随生产 vote_mode 变化——
+            # v3.1 回退 uniform 后若只算生产那一路，d_vote 会恒等于 0，重开
+            # weighted 的判据就此失明。计票是纯本地运算，无额外采样开销。
+            uni_correct = math_equal(
+                self._majority_vote(blackboards[i], exclude, mode="uniform"),
+                correct_answers[i])
+            wt_correct = math_equal(
+                self._majority_vote(blackboards[i], exclude, mode="weighted"),
+                correct_answers[i])
             turn_data, round_meta = compute_turn_data(
                 round_records[i], correct_answers[i], is_correct,
                 self.max_rounds, self.cfg,
@@ -339,7 +414,8 @@ class AgenticExecutor:
                 "raca_round_meta": round_meta,
                 "final_answer":    final_answer,
                 "is_correct":      is_correct,
-                "is_correct_uniform": uni_correct,
+                "is_correct_uniform":  uni_correct,
+                "is_correct_weighted": wt_correct,
                 "stopped":         stop_ctrl_tids[i] is not None,
             })
         return results

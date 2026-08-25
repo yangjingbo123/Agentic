@@ -174,9 +174,13 @@ def main(cfg: DictConfig):
             [it["answer"]   for it in _eval_items],
         )
         acc = sum(ep["is_correct"] for ep in episodes) / len(episodes)
-        # §19.3 判据①：同批 episode 上朴素计票的 acc（加权投票的在线消融）
+        # §19.3 判据①：两种计票各自的 acc。d_vote = weighted − uniform，与当前
+        # 生产 vote_mode 无关——v3.1 跑 uniform 时仍能持续监测加权投票能不能重开。
         acc_uni = sum(ep.get("is_correct_uniform", ep["is_correct"])
                       for ep in episodes) / len(episodes)
+        acc_wt  = sum(ep.get("is_correct_weighted", ep["is_correct"])
+                      for ep in episodes) / len(episodes)
+        d_vote = acc_wt - acc_uni
         # reward_mean: mean total RACA reward per episode (sum of all turn rewards)
         reward_mean = float(np.mean([
             sum(v["reward"] for v in ep.get("raca_turn_data", {}).values())
@@ -191,12 +195,14 @@ def main(cfg: DictConfig):
         eval_int_rate  = float(np.mean([m["u"] for m in _rounds])) if _rounds else 0.0
         eval_stop_rate = float(np.mean([1.0 if ep.get("stopped") else 0.0 for ep in episodes]))
         print(f"  [eval] step={step} eval_acc={acc:.3f} "
-              f"acc_uniform={acc_uni:.3f} d_vote={acc - acc_uni:+.3f} "
+              f"acc_uniform={acc_uni:.3f} acc_weighted={acc_wt:.3f} "
+              f"d_vote={d_vote:+.3f} "
               f"reward={reward_mean:.3f} "
               f"avg_turns={avg_turns:.1f} int_rate={eval_int_rate:.2f} "
               f"stop_rate={eval_stop_rate:.2f} (n={len(_eval_items)})", flush=True)
         wandb.log({"eval_accuracy": acc, "eval_accuracy_uniform": acc_uni,
-                   "eval_vote_gain": acc - acc_uni, "eval_reward": reward_mean,
+                   "eval_accuracy_weighted": acc_wt,
+                   "eval_vote_gain": d_vote, "eval_reward": reward_mean,
                    "eval_avg_turns": avg_turns, "eval_int_rate": eval_int_rate,
                    "eval_stop_rate": eval_stop_rate}, step=step)
     batch_size = cfg.agentic.batch_size
@@ -341,6 +347,9 @@ def main(cfg: DictConfig):
         _sel = stats.get("int_selectivity")
         _qf  = stats.get("q_forced")
         _tc  = stats.get("int_critic_share")
+        # v3.1：gate→unlocked 展示“拦下多少 → 其中多少被解锁”；两者应接近（本轮
+        # 交互链已自带分数的不需解锁）。clip_prompt 非 0 即告警：仍有文本无界点。
+        _n_clip = getattr(trainer.executor, "n_prompt_clipped", 0)
         print(
             f"step={step} t={_dt_rollout:.0f}+{time.time() - _t_train0:.0f}s "
             f"reward={stats['mean_reward']:.3f} acc={stats['accuracy']:.2f} "
@@ -355,10 +364,12 @@ def main(cfg: DictConfig):
             f"tgtC={'--' if _tc is None else f'{_tc:.2f}'} "
             f"sel={'--' if _sel is None else f'{_sel:+.2f}'} "
             f"parse={stats.get('parse_rate', 1.0):.2f} "
-            f"gate={stats.get('gate_blocked', 0)} "
+            f"gate={stats.get('gate_blocked', 0)}"
+            f"→{getattr(trainer.executor, 'n_gate_unlocked', 0)} "
             f"fnl={stats.get('funnel_flag', 0)}/{stats.get('funnel_corr', 0)}"
             f"/{stats.get('funnel_flip', 0)} "
-            f"stop_rate={stats.get('stop_rate', 0.0):.2f} eps={eps_force:.2f}",
+            f"stop_rate={stats.get('stop_rate', 0.0):.2f} eps={eps_force:.2f}"
+            + (f" clip_prompt={_n_clip}" if _n_clip else ""),
             flush=True,
         )
         log_data = {
@@ -381,6 +392,8 @@ def main(cfg: DictConfig):
                     "funnel_flag", "funnel_corr", "funnel_flip"):
             if _mk in stats:
                 log_data[_mk] = stats[_mk]
+        log_data["gate_unlocked"] = getattr(trainer.executor, "n_gate_unlocked", 0)
+        log_data["prompt_clipped"] = _n_clip
         if _g_total:
             # Fraction of question-groups that produced a usable advantage. A
             # sustained drop means rollouts are collapsing to identical rewards

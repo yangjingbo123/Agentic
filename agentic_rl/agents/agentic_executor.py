@@ -331,7 +331,7 @@ class AgenticExecutor:
             # ── 3.5 闸门解锁批次（v3.1，不占 hop 预算） ────────────────
             # v2.0 写的解锁通道在上文 elif（proposer 未自发起）分支里，当时
             # int_rate→0 所以总能触发。v3 零成本冷启动把 int_rate 救到 0.78后，
-            # 78% 的轮次走 if u: 分支，解锁逆而被遮蔽；其中 75% 又选 critic
+            # 78% 的轮次走 if u: 分支，解锁反而被遮蔽；其中 75% 又选 critic
             # （tgtC=0.75）→ 黑板永远拿不到分数 → stop 被拦（gate 10→193）
             # → 跑满 max_rounds → prompt 膨胀至 step 151 崩。前一个修复的成功
             # 造成了后一个修复的失效，故改为与 proposer 选择无关的独立批次：

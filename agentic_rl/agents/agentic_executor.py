@@ -406,6 +406,15 @@ class AgenticExecutor:
                 stop_ctrl_tid=stop_ctrl_tids[i],
                 stop_sigma=stop_sigmas[i] or "verify",
             )
+            # 票池埋点：offline f 臂测出 k=4 等权投票值 +10 点，但那是 k 份独立
+            # 采样；这里的票是同一条 episode 逐轮产生、后轮能看见前轮答案。若
+            # controller 学会「答案稳了就停」，池子会塌成重复票，投票退化为重复
+            # 确认第一个答案——此时 acc 高是 greedy 本身准，与聚合无关。n_distinct
+            # 是唯一能分辨这两种情形的量，缺了它就无法判断加大 k 是不是杠杆。
+            pool = (self._vote_pool(blackboards[i], exclude)
+                    if blackboards[i].traces else Counter())
+            n_votes = sum(pool.values())
+            top2 = pool.most_common(2)
             results.append({
                 "messages":        all_messages[i],
                 "turn_ids":        turn_ids_list[i],
@@ -417,6 +426,11 @@ class AgenticExecutor:
                 "is_correct_uniform":  uni_correct,
                 "is_correct_weighted": wt_correct,
                 "stopped":         stop_ctrl_tids[i] is not None,
+                "n_votes":         n_votes,
+                "n_distinct":      len(pool),
+                # 首位领先幅度（占总票数）。=1.0 意味着全票一致，投票没做任何事。
+                "vote_margin":     ((top2[0][1] - (top2[1][1] if len(top2) > 1 else 0))
+                                    / n_votes) if n_votes else 0.0,
             })
         return results
 
@@ -428,17 +442,24 @@ class AgenticExecutor:
     def _critic_found_errors(self, critic_output: str) -> bool:
         return critic_found_errors(critic_output)
 
-    def _majority_vote(self, blackboard: Blackboard, exclude_answers=None,
-                       mode=None) -> str:
-        if not blackboard.traces:
-            return ""
+    def _vote_pool(self, blackboard: Blackboard, exclude_answers=None) -> Counter:
+        """实际参与计票的票池。计票与埋点共用这一个真相源，避免两处逻辑漂移。
+
+        v3（§19）：修正票退出投票池（修正正确率两次测量 ≤ 裸重采样，留在池内
+        是在稀释投票质量）；全排空时回退全量计票。
+        """
         counts = Counter(ans for _, ans in blackboard.traces)
-        # v3（§19）：修正票退出投票池（修正正确率两次测量 ≤ 裸重采样，
-        # 留在池内是在稀释投票质量）；全排空时回退全量计票。
         if exclude_answers:
             counts = counts - Counter(exclude_answers)
             if not counts:
                 counts = Counter(ans for _, ans in blackboard.traces)
+        return counts
+
+    def _majority_vote(self, blackboard: Blackboard, exclude_answers=None,
+                       mode=None) -> str:
+        if not blackboard.traces:
+            return ""
+        counts = self._vote_pool(blackboard, exclude_answers)
         if (mode or self.vote_mode) != "weighted" or not blackboard.scores:
             return counts.most_common(1)[0][0]
         # 加权投票（v2.3 §18 通道①）：被 verifier 验证过的答案用其平均分数

@@ -379,6 +379,55 @@ def test_weighted_vote():
     assert ex_w._majority_vote(bb2) == "5"
 
 
+def test_vote_pool_instrumentation():
+    """票池埋点：_vote_pool 与 _majority_vote 共用同一真相源，dist/deg/margin 可信。
+
+    deg（dist≤1）是拿来判「加大投票池是不是杠杆」的量，错了会直接误导方向。
+    """
+    from collections import Counter
+    from envs.blackboard import Blackboard, Message, MessageType
+    ex = _mk_executor(None)
+
+    def stats(bb, exclude=None):
+        pool = ex._vote_pool(bb, exclude) if bb.traces else Counter()
+        n = sum(pool.values())
+        top2 = pool.most_common(2)
+        marg = ((top2[0][1] - (top2[1][1] if len(top2) > 1 else 0)) / n) if n else 0.0
+        return n, len(pool), marg
+
+    # 退化池：4 票全相同 → dist=1、margin=1.0（投票没做任何事）
+    bb_deg = Blackboard()
+    for _ in range(4):
+        bb_deg.add_message(Message(0, MessageType.TRACE, ("r", "5")))
+    assert stats(bb_deg) == (4, 1, 1.0)
+
+    # 健全池：3:1 → dist=2、margin=0.5
+    bb_ok = Blackboard()
+    for ans in ("5", "5", "5", "4"):
+        bb_ok.add_message(Message(0, MessageType.TRACE, ("r", ans)))
+    assert stats(bb_ok) == (4, 2, 0.5)
+
+    # 平票 2:2 → margin=0（聚合没有分辨力，不能和退化池混淆）
+    bb_tie = Blackboard()
+    for ans in ("5", "5", "4", "4"):
+        bb_tie.add_message(Message(0, MessageType.TRACE, ("r", ans)))
+    n, dist, marg = stats(bb_tie)
+    assert (n, dist) == (4, 2) and marg == 0.0
+
+    # exclude 后的池才是实际计票池；且与 _majority_vote 的结果一致
+    assert stats(bb_ok, ["5"]) == (3, 2, 1.0 / 3)
+    assert ex._majority_vote(bb_ok, ["5"]) == "5"      # 2 票 > 1 票
+    assert ex._majority_vote(bb_ok, ["5", "5", "5"]) == "4"
+
+    # 全排空回退全量计票：埋点不能报 0 票（否则 deg 会被污染）
+    bb_one = Blackboard()
+    bb_one.add_message(Message(0, MessageType.TRACE, ("r", "7")))
+    assert stats(bb_one, ["7"]) == (1, 1, 1.0)
+
+    # 空黑板：不得抛异常，投票数为 0
+    assert stats(Blackboard()) == (0, 0, 0.0)
+
+
 def test_correction_vote_exclusion():
     """v3（§19）：修正票退出投票池（修正正确率两次测量 ≤ 裸重采样）。"""
     from envs.blackboard import Blackboard, Message, MessageType

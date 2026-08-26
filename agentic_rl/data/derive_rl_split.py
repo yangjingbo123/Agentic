@@ -18,6 +18,7 @@
 """
 import argparse
 import json
+import os
 
 
 def load_jsonl(path: str) -> list:
@@ -31,10 +32,10 @@ def save_jsonl(data: list, path: str):
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
-def sft_questions(sft_path: str) -> set:
-    """收集 SFT 数据中实际出现过的 question（精确文本）。"""
+def question_set(path: str) -> set:
+    """收集一份 jsonl 里出现过的 question（精确文本，strip 后）。"""
     questions = set()
-    for item in load_jsonl(sft_path):
+    for item in load_jsonl(path):
         q = item.get("question", "").strip()
         if q:
             questions.add(q)
@@ -45,14 +46,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train",  default="data/math_train.jsonl")
     parser.add_argument("--sft",    default="data/sft_train.jsonl")
+    # 评测集去重。hendrycks_math 的 train/test 自带 1 题重复，旧版只查 SFT
+    # 没查 test，导致 math_train_rl ∩ math_test = 1（那题在 Level 3/4，不在
+    # eval 取的 Level-5 池里，所以历史 eval 数字未受污染）。
+    parser.add_argument("--test",   default="data/math_test.jsonl")
     parser.add_argument("--output", default="data/math_train_rl.jsonl")
     args = parser.parse_args()
 
     train = load_jsonl(args.train)
-    sft_qs = sft_questions(args.sft)
-    print(f"主训练集: {len(train)} 条；SFT 题目: {len(sft_qs)} 个")
+    sft_qs = question_set(args.sft)
+    test_qs = question_set(args.test) if os.path.isfile(args.test) else set()
+    print(f"主训练集: {len(train)} 条；SFT 题目: {len(sft_qs)} 个；"
+          f"评测题目: {len(test_qs)} 个")
 
-    kept, n_empty, n_leak, n_unbalanced = [], 0, 0, 0
+    kept, n_empty, n_leak, n_unbalanced, n_test = [], 0, 0, 0, 0
     for item in train:
         ans = item.get("answer", "").strip()
         if not ans:
@@ -65,17 +72,22 @@ def main():
         if item["question"].strip() in sft_qs:
             n_leak += 1
             continue
+        if item["question"].strip() in test_qs:
+            n_test += 1
+            continue
         kept.append(item)
 
     save_jsonl(kept, args.output)
-    print(f"剔除: 空答案 {n_empty}，花括号不平衡 {n_unbalanced}，SFT 泄漏 {n_leak}")
+    print(f"剔除: 空答案 {n_empty}，花括号不平衡 {n_unbalanced}，"
+          f"SFT 泄漏 {n_leak}，评测集重复 {n_test}")
     print(f"输出: {len(kept)} 条 → {args.output}")
 
     # 验收自检
     assert all(it["answer"].count("{") == it["answer"].count("}") for it in kept)
     assert all(it["answer"].strip() for it in kept)
     assert not any(it["question"].strip() in sft_qs for it in kept)
-    print("验收通过：无空答案、花括号全平衡、与 SFT 题目零交集")
+    assert not any(it["question"].strip() in test_qs for it in kept)
+    print("验收通过：无空答案、花括号全平衡、与 SFT 及评测集题目零交集")
 
 
 if __name__ == "__main__":

@@ -166,6 +166,14 @@ def main(cfg: DictConfig):
     if _eval_items:
         print(f"Eval subset: {len(_eval_items)} Level-5 items (from {len(eval_dataset)} total)", flush=True)
 
+    # ── 尺子精度（这一段是所有结论的前提，n 与 K 不要随手调小）─────────────
+    # 单点 se = sqrt(p(1-p)/n)：n=300、p≈0.85 时是 2.06 点，跨 run 比较的差值
+    # 2·se ≈ 5.8 点。而交互纠错在这个操作点的理论收益上限只有 1.7 点——等于
+    # 用比效应大三倍的尺子去量，任何机制改动的结果都无法验证。
+    # n=1000（Level-5 池共 1324 题，够取）+ 末 K 点平均把 2·se 压到 1.43 点。
+    _EVAL_TAIL_K = 5
+    _eval_hist = []
+
     def run_eval(step):
         if not _eval_items or vllm_engine is None:
             return
@@ -174,6 +182,18 @@ def main(cfg: DictConfig):
             [it["answer"]   for it in _eval_items],
         )
         acc = sum(ep["is_correct"] for ep in episodes) / len(episodes)
+        # 与历史 n=300 数字对齐的切片。run_episodes_batch 按输入顺序返回，故
+        # episodes[:300] 恒等于扩容前那个固定子集。扩容后 acc 的绝对值不再与
+        # 历史可比（新增的 700 题从没测过，难度分布不保证一致），这一路只为
+        # 对齐旧数字，不用于决策——决策看 acc_tail。
+        _n300 = min(300, len(episodes))
+        acc_300 = sum(ep["is_correct"] for ep in episodes[:_n300]) / _n300
+        # 末 K 点平均。单点最大值带 max-of-k 选择偏差：v2 基线 6 个 eval 点里
+        # 挑 max 比自己均值高 2.42 点，与模拟预期的 2.57 点吻合——报 max 等于
+        # 把选择噪声当成能力。看趋势和下结论都用这一路。
+        _eval_hist.append(acc)
+        _tail = _eval_hist[-_EVAL_TAIL_K:]
+        acc_tail = float(np.mean(_tail))
         # §19.3 判据①：两种计票各自的 acc。d_vote = weighted − uniform，与当前
         # 生产 vote_mode 无关——v3.1 跑 uniform 时仍能持续监测加权投票能不能重开。
         acc_uni = sum(ep.get("is_correct_uniform", ep["is_correct"])
@@ -190,21 +210,38 @@ def main(cfg: DictConfig):
         avg_turns = float(np.mean([
             len(ep.get("raca_turn_data", {})) for ep in episodes
         ]))
+        # 票池埋点：deg（n_distinct≤1 的比例）是判决量。eval 走 greedy、且同一
+        # episode 的后轮能看见前轮答案，deg 高就说明池子塌成了重复票、acc 完全
+        # 由 greedy 单票贡献，聚合收益（offline 实测 +10 点）一点没吃到；deg 低而
+        # margin 高则相反，聚合已经在出力。两种情形对「加大 k 是不是杠杆」的答案相反。
+        pool_votes = float(np.mean([ep.get("n_votes", 0) for ep in episodes]))
+        pool_dist = float(np.mean([ep.get("n_distinct", 0) for ep in episodes]))
+        pool_deg = float(np.mean([1.0 if ep.get("n_distinct", 0) <= 1 else 0.0
+                                  for ep in episodes]))
+        pool_marg = float(np.mean([ep.get("vote_margin", 0.0) for ep in episodes]))
         # RACA v2 行为指标（greedy、无 ε 注入，反映学到的策略本身）
         _rounds = [m for ep in episodes for m in ep.get("raca_round_meta", [])]
         eval_int_rate  = float(np.mean([m["u"] for m in _rounds])) if _rounds else 0.0
         eval_stop_rate = float(np.mean([1.0 if ep.get("stopped") else 0.0 for ep in episodes]))
         print(f"  [eval] step={step} eval_acc={acc:.3f} "
+              f"acc_tail{len(_tail)}={acc_tail:.3f} acc300={acc_300:.3f} "
               f"acc_uniform={acc_uni:.3f} acc_weighted={acc_wt:.3f} "
               f"d_vote={d_vote:+.3f} "
               f"reward={reward_mean:.3f} "
               f"avg_turns={avg_turns:.1f} int_rate={eval_int_rate:.2f} "
-              f"stop_rate={eval_stop_rate:.2f} (n={len(_eval_items)})", flush=True)
-        wandb.log({"eval_accuracy": acc, "eval_accuracy_uniform": acc_uni,
+              f"stop_rate={eval_stop_rate:.2f} "
+              f"pool={pool_votes:.1f}/dist={pool_dist:.2f}/deg={pool_deg:.2f}"
+              f"/marg={pool_marg:.2f} (n={len(_eval_items)})", flush=True)
+        wandb.log({"eval_accuracy": acc, "eval_accuracy_tail": acc_tail,
+                   "eval_accuracy_n300": acc_300,
+                   "eval_accuracy_uniform": acc_uni,
                    "eval_accuracy_weighted": acc_wt,
                    "eval_vote_gain": d_vote, "eval_reward": reward_mean,
                    "eval_avg_turns": avg_turns, "eval_int_rate": eval_int_rate,
-                   "eval_stop_rate": eval_stop_rate}, step=step)
+                   "eval_stop_rate": eval_stop_rate,
+                   "eval_pool_votes": pool_votes, "eval_pool_distinct": pool_dist,
+                   "eval_pool_degenerate": pool_deg,
+                   "eval_vote_margin": pool_marg}, step=step)
     batch_size = cfg.agentic.batch_size
     max_steps = cfg.agentic.get("max_steps", 500)
     print(f"Dataset: {len(dataset)} items, batch_size={batch_size}, max_steps={max_steps}", flush=True)

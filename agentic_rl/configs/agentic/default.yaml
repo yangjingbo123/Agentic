@@ -10,7 +10,13 @@ kl_coef: 0.04  # KL penalty coefficient (reference = frozen SFT snapshot, ref_* 
 max_steps: 200
 save_freq: 20
 eval_freq: 10
-eval_samples: 300
+# 尺子精度（不是实验变量，是测量协议默认值，应对所有实验生效）：
+# n=300 时单点 se=2.06 点、跨 run 差值 2·se≈5.8 点，而交互纠错在 acc≈0.85
+# 处的收益上限只有 1.7 点——尺子比效应大三倍，导致“v3 到底超没超基线”
+# 这类最基本的问题无法回答。改 1000（math_test 的 Level-5 共 1324 题，
+# 仍全在测试集内，不碰训练集）后配末 5 点平均，2·se 降到 1.43 点。
+# 代价：单次 eval 慢 3.3 倍。历史 n=300 数字由 train.py 的 acc300 切片对齐。
+eval_samples: 1000
 # RACA controller reward
 ctrl_alpha: 0.3
 ctrl_beta: 0.2

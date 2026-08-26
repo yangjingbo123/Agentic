@@ -64,6 +64,18 @@ def main():
                     help="f 臂每题的投票池大小（第 1 票复用 phase1，故新增 k-1 次采样）")
     ap.add_argument("--sparse_cov", type=float, default=0.32,
                     help="f 臂稀疏对照的覆盖率，默认 0.32 = 训练时实测值")
+    # ── v3.3：采样条件对齐。e 臂的收益符号取决于基础错误率 p——
+    # precision = TPR·p / (TPR·p + FPR·(1−p))，p 一降 precision 就塌。
+    # 训练 rollout 是 temperature=1.0 + math_train_rl 全难度（p≈0.54），
+    # 而上报的 eval 是 greedy + math_test Level-5（p≈0.15），两者不是同一个
+    # 结论。要在哪个条件下用这个通道，就得在哪个条件下测。
+    ap.add_argument("--temperature", type=float, default=1.0,
+                    help="采样温度。1.0=训练 rollout 条件；0.0=eval 条件（executor "
+                         "eval_mode 走 greedy）")
+    ap.add_argument("--level", default="",
+                    help="只保留该难度，如 'Level 5'。对齐 train.py 的 eval 子集")
+    ap.add_argument("--no_shuffle", action="store_true",
+                    help="不打乱、取前 n 条。配合 --level 可复现 train.py 的固定 eval 子集")
     args = ap.parse_args()
 
     from evaluate import load_finetuned_models
@@ -86,9 +98,10 @@ def main():
             tokenize=False, add_generation_prompt=True, enable_thinking=False,
         )
 
-    def gen(role, pairs, temperature=1.0):
+    def gen(role, pairs, temperature=None):
         """pairs: [(system, user)] → [text]，按角色挂对应 LoRA。
         分块发送，避免单个巨型 RPC 撞 rpc_timeout。"""
+        temperature = args.temperature if temperature is None else temperature
         outs = []
         for i in range(0, len(pairs), args.gen_chunk):
             part = pairs[i: i + args.gen_chunk]
@@ -104,9 +117,14 @@ def main():
     rng = random.Random(args.seed)
     with open(args.data) as f:
         data = [json.loads(line) for line in f]
-    rng.shuffle(data)
+    if args.level:
+        data = [it for it in data if it.get("level") == args.level]
+    if not args.no_shuffle:
+        rng.shuffle(data)
     data = data[: args.n]
-    print(f"Loaded {len(data)} items from {args.data}", flush=True)
+    print(f"Loaded {len(data)} items from {args.data}"
+          f"{f' [{args.level}]' if args.level else ''}"
+          f"  temperature={args.temperature}", flush=True)
 
     # ── Phase 1：primary 生成（与 executor 第一轮完全一致，黑板为空） ────────
     prop_sys = PromptTemplates.proposer_system()
@@ -235,6 +253,15 @@ def main():
         gain = sum(sub_hit[j] for j in tp_idx)            # 错→对，净 +1 票
         loss = n_fp - sum(sub_hit[j] for j in fp_idx)     # 对→错，净 −1 票
         denom = b_tp + 1.0 - b_fp
+        # 敏感度/特异度是检测器自身的性质，不随基础错误率 p 变；precision 会。
+        # 所以把盈亏平衡改写成对 p 的条件，才能从一个分布外推到另一个：
+        #   p·TPR·b_TP > (1−p)·FPR·(1−b_FP)
+        # 解出的 p_break 就是“策略错得多于这个比例时，插手才划得来”。
+        # 推推就知道：策略越准，p 越小，这个通道自动越不划算——自限的。
+        tpr = n_tp / max(n_tp + n_fn, 1)
+        fpr = n_fp / max(n_fp + n_tn, 1)
+        num = tpr * b_tp if n_tp else 0.0
+        odds = (fpr * (1.0 - b_fp) / num) if num > 0 else float("inf")
         e = {
             "n_tp": n_tp, "n_fp": n_fp, "n_fn": n_fn, "n_tn": n_tn,
             "prec": n_tp / max(n_tp + n_fp, 1),
@@ -244,6 +271,9 @@ def main():
             "d_sub": (gain - loss) / max(len(samples), 1),
             # 盈亏平衡所需精度（b_tp/b_fp 固定时）：prec·b_tp = (1−prec)·(1−b_fp)
             "prec_break": ((1.0 - b_fp) / denom) if denom > 0 else float("nan"),
+            "tpr": tpr, "fpr": fpr,
+            "p_now": (n_tp + n_fn) / max(len(samples), 1),
+            "p_break": odds / (1.0 + odds) if odds != float("inf") else 1.0,
         }
 
     # ── f) 全覆盖 vs 稀疏覆盖加权投票（判决 §20.2 覆盖率假说） ───────────
@@ -254,8 +284,13 @@ def main():
     #   全覆盖 > 0 而稀疏 ≈ 0 → 覆盖率确认，verify_all_answers 值得进生产
     # 计票直接调 executor 的 _majority_vote：显式传 mode 时 `mode or self.vote_mode`
     # 短路，不触碰 self，因此可以 self=None 调用，保证与生产同一套语义。
+    # 温度 0 时这个臂无意义：k 票用的是同一个空黑板 prompt，greedy 下会采出
+    # k 份完全相同的答案，投票池退化成单票，两种计票必然同分。
     arm_f = {}
-    if not args.skip_ef:
+    if not args.skip_ef and args.temperature == 0.0:
+        print("\n[f 臂已跳过] temperature=0 下 k 票同 prompt 会采出同一答案，"
+              "投票池退化。加权投票的判决用 temperature=1.0 那次的结果。", flush=True)
+    if not args.skip_ef and args.temperature > 0.0:
         from agents.agentic_executor import AgenticExecutor
         vote = lambda bb, m: AgenticExecutor._majority_vote(None, bb, None, m)
 
@@ -351,7 +386,13 @@ def main():
         print(f"替换收益：真阳救回 {e['gain']} 票  假阳弄坏 {e['loss']} 票  "
               f"→ Δ_sub = {e['d_sub']:+.4f} /样本")
         print(f"盈亏平衡所需 precision = {e['prec_break']:.3f}（实测 {e['prec']:.3f}）")
-        print("判读：Δ_sub > 0 → 修正采用替换语义进投票池（奖励与结果首次对齐）；")
+        print(f"检测器本身（不随基础错误率变）：TPR={e['tpr']:.3f}  FPR={e['fpr']:.3f}")
+        print(f"→ 只有当策略错误率 p > {e['p_break']:.3f} 时插手才划得来（本次 p={e['p_now']:.3f}）")
+        print("⚠ precision 随 p 变：precision = TPR·p/(TPR·p+FPR·(1−p))。本次是训练")
+        print("  rollout 条件（temperature=1.0）；上报的 eval 是 greedy + Level-5，p 更")
+        print("  小，同一个检测器在那里的 precision 会低很多。要在 eval 上用，先拿")
+        print("  --temperature 0 --level 'Level 5' --no_shuffle 重测一次。")
+        print("判读：Δ_sub > 0 且 p > p_break → 修正采用替换语义进投票池；")
         print("      Δ_sub ≤ 0 → critic 精度不够，改走另一条：把 r_int 改成按投票的")
         print("      实际变化计分。acc 不会涨，但不再为不进结果的行为付奖励。")
         print("注：Δ_sub 是单票期望变化，是 episode 级 Δacc 的上界（多数投票会稀释）。")

@@ -63,14 +63,37 @@ echo "MODEL_PATH = ${MODEL_PATH}"
 
 # ---------------------------------------------------------------------------
 # 数据：v23 = v2 + v3 现场派生（派生文件不入库，生成命令即此处）
+# v3.2（M1）：先把 `<interaction>` 块从开头机械搬到末尾，再拼接。
+# 为什么在这里现场重排、而不是把 *_m1.jsonl 提交入库：SFT 数据的 system 字段
+# 必须与 llm/prompt_templates.py **逐字节相同**，一旦模板再改而数据文件是死的，
+# SFT 教的格式就和 RL 推理时给的格式漂移，且这种漂移不报错、只体现为可解析率
+# 缓慢下滑。现场从原始文件派生可以保证两者永远同步。脚本自带逐 turn 校验：
+# 只允许「块位置」与「system」两处变化，实质内容改一个字符就 assert 失败。
 # ---------------------------------------------------------------------------
 for f in data/sft_train_v2.jsonl data/sft_train_v3.jsonl; do
     [[ -f "${f}" ]] || { echo "!! 缺 ${f}（需先提交入仓库）" >&2; exit 1; }
 done
-cat data/sft_train_v2.jsonl data/sft_train_v3.jsonl > data/sft_train_v23.jsonl
-wc -l data/sft_train_v2.jsonl data/sft_train_v3.jsonl data/sft_train_v23.jsonl
+python data/apply_m1_reorder.py \
+    --inputs data/sft_train_v2.jsonl data/sft_train_v3.jsonl \
+    || { echo "!! M1 重排校验失败，勿继续 SFT" >&2; exit 1; }
+cat data/sft_train_v2_m1.jsonl data/sft_train_v3_m1.jsonl > data/sft_train_v23.jsonl
+wc -l data/sft_train_v2_m1.jsonl data/sft_train_v3_m1.jsonl data/sft_train_v23.jsonl
 
 # v23 快速体检：episode 结构、v2 格式可解析率、max_len 截断率
+#
+# M1 的已知副作用（本地实测，chars/2.2 口径，与下面 assert 同一把尺）：
+# train_sft.py 的 `full_ids[:max_length]` 砍的是**尾部**，而 M1 把块搬去了尾部。
+#   截断 turn：30 → 34（1.03% → 1.17%，仍在 2% 阈内，全是 proposer 26/critic 5/verifier 3）
+#   丢 <interaction> 块：5 → 34（+29）      丢「最终答案：」：23 → 22（−1）
+# 即：这 34 条 turn 从此不再监督块的生成。判断是可接受的，理由：
+#   ① 绝对量 34/2030 = 1.7% 的带块 turn，另外 1996 条监督完好，格式学习靠的是
+#      分布主体，不是尾部这几条；
+#   ② 这 34 条里有 22 条**连答案标记一起丢**——它们在 M1 之前就已经是坏样本
+#      （教模型不输出「最终答案：」），M1 只是把坏的方式从「丢答案」换成
+#      「丢答案+丢块」，真正新增的只有 12 条「答案完好、只丢块」；
+#   ③ 更干净的做法是把超长 turn 整条剔除（截断样本无论砍哪头都在教「不输出
+#      EOS」），但那是与 M1 无关的数据卫生改动，混进来会污染 M1 的归因。
+# → 留作后续独立一步：剔除超长 turn，或把 max_len 抬到 1536 后重测。
 python - <<'EOF'
 import json, sys
 sys.path.insert(0, ".")
@@ -98,7 +121,10 @@ EOF
 # 输出目录（持久化挂载，扁平结构）
 # ---------------------------------------------------------------------------
 SAVE_ROOT="${PRIMUS_SAVE_CHECKPOINT_DIR:-$(pwd)/checkpoints}"
-SAVE_DIR="${SAVE_ROOT}/sft_v3"
+# v3.2：M1 的 SFT 产物写**新目录**，绝不覆盖 sft_v3。理由有两条：① sft_v3 是
+# 当前 RL 的 KL 参考快照，覆盖它等于悄悄改掉正在跑的实验的参考分布；② M1 若
+# 不奏效需要能一键回退对照。用 SFT_TAG 覆盖目录名。
+SAVE_DIR="${SAVE_ROOT}/${SFT_TAG:-sft_v3_m1}"
 if [[ -e "${SAVE_DIR}/proposer" ]]; then
     echo "!! ${SAVE_DIR} 存在 role 子目录 —— load_trainable_models 会优先读它导致静默覆盖，请清理" >&2
     exit 1

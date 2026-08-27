@@ -6,6 +6,33 @@ class PromptTemplates:
     - 动作集 {none, request, challenge}，删除 support
     - 响应方使用「标准角色格式 + 请求上下文」，保证输出可解析（根治 v1
       interaction_response 自由格式导致的解析失败）
+
+    v3.2（M1）：`<interaction>` 块从**开头移到末尾**，三个角色一致。两个理由，
+    第一个是决定性的：
+
+    1. **Eq (12) 的良定义性。** $r^{\\rm int}$ 定义在 $(p^{\\rm primary},
+       p^{\\rm end})$ 矩阵上——这个形式预设了「是否求助」的决策是在**已知自己
+       答案**时做出的。块在开头时决策先于答案生成，等于用策略尚未产生的量去给
+       它的动作定价，`sel = corr(u, p_primary) ≈ 0` 是这个结构的必然结果，不是
+       调参问题。这条与交互能否见效无关，属于必须修。
+
+    2. **顺带打开一条被挤掉的信道（实测）。** 块长度固定 68 字符（v2+v3 共
+       2030 个 turn 全部如此，min=max=68）。而 `Blackboard.to_text` 里
+       `发现问题：{flaws[-1]['content'][:80]}` 存的是 critic 的**原始输出**，
+       块在开头时这 80 字窗口只剩 12 字装实质内容。分两种情形看（667 个
+       critic turn）：65% 的输出是「错误分析：无错误」这类 8 字短句，窗口本来
+       就不吃紧；但**真正报了错的 234 个 turn 分析长度中位数 254 字，旧布局只
+       送达 11 字，新布局送达 80 字（7.3×）**。这条 `发现问题` 行会进 critic /
+       verifier / 修正 / controller 每一个 prompt——也就是说过去 critic 报的错
+       传到下游基本只剩「有问题」三个字。`request_context` 与
+       `proposer_correction_user` 的 300 字窗口同理由 231 → 254。
+       （更彻底的做法是存黑板前显式剥离块，那样短分析也不会混进块尾；留作后续
+       独立一步，以免与 M1 混淆 `eff` / `flip` 的归因。）
+
+    注：`parse_interaction` 全文搜索块，不依赖位置；但 `parse_reasoning` 的
+    `最终答案：` 正则原先缺 `<` 的 lookahead，已同步修正（见 parsing.py）。
+    SFT 数据的 `system` 字段与本文件逐字节相同，改这里必须同步重新生成，
+    否则 SFT 与 RL 的 prompt 会漂移。
     """
 
     @staticmethod
@@ -28,14 +55,15 @@ reason: [一句话说明]
 2. 决定是否需要求助其他智能体（求助有通信成本，仅在确实需要时发起）
 
 输出格式：
+推理过程：[逐步推导]
+最终答案：[数值]
 <interaction>
 action: [none|request|challenge]
 target: [critic|verifier|none]
 reason: [一句话]
 </interaction>
-推理过程：[逐步推导]
-最终答案：[数值]
 说明：
+- 必须先完成推理并写出最终答案，再据此决定是否求助——求助的依据是你对这个答案的把握
 - request + critic：请 Critic 审查你的推理是否有错
 - request + verifier：请 Verifier 独立验证并给出置信分数
 - 对自己的答案有把握时用 none，不要滥用求助"""
@@ -47,13 +75,13 @@ reason: [一句话]
 2. 决定是否需要与其他智能体交互
 
 输出格式：
+错误分析：[有错误则描述，无错误则写"无错误"]
 <interaction>
 action: [none|request|challenge]
 target: [proposer|verifier|none]
 reason: [一句话]
 </interaction>
-错误分析：[有错误则描述，无错误则写"无错误"]
-说明：发现错误时可用 request + proposer 要求修正解法。"""
+说明：先写完错误分析，再据此决定是否交互。发现错误时可用 request + proposer 要求修正解法。"""
 
     @staticmethod
     def verifier_system():
@@ -62,14 +90,14 @@ reason: [一句话]
 2. 决定是否需要与其他智能体交互
 
 输出格式：
+分数: [0.0-1.0]
+验证说明：[简要说明]
 <interaction>
 action: [none|request|challenge]
 target: [proposer|critic|none]
 reason: [一句话]
 </interaction>
-分数: [0.0-1.0]
-验证说明：[简要说明]
-说明：分数低时可用 request + proposer 要求改进，或 request + critic 请求审查。"""
+说明：先打分再据此决定是否交互。分数低时可用 request + proposer 要求改进，或 request + critic 请求审查。"""
 
     @staticmethod
     def request_context(initiator: str, action: str, reason: str, initiator_output: str):

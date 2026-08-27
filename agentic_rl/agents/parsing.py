@@ -58,9 +58,18 @@ MAX_REASONING_CHARS = 1500  # 完整推理保留上限（够容纳正常多步�
 
 
 def parse_reasoning(text: str) -> tuple[str, str]:
-    """proposer 输出 → (推理过程, 最终答案)。两路返回值均有硬上限。"""
+    """proposer 输出 → (推理过程, 最终答案)。两路返回值均有硬上限。
+
+    v3.2（M1）：`最终答案：` 的正则加了 `(?=<|\\n|$)` 前瞻。M1 把
+    `<interaction>` 块从开头移到了**答案之后**，若模型把块写在同一行
+    （`最终答案：4<interaction>...`），原来的 `(.+)` 会把块吃进答案——长度常
+    不足 64 字符，于是这个带标签的垃圾串会被当成合法答案进投票池，各自占一票。
+    三个分支缺一不可：`\\n` 覆盖块换行写（最常见），`<` 覆盖同行写，`$` 覆盖
+    答案就是输出末尾。注意光写 `$` 不够：未开 re.M 时 `$` 只匹配串尾，
+    非贪婪的 `.+?` 又跨不过换行，会导致整个匹配失败。
+    """
     reasoning = re.search(r"推理过程：(.+?)(?=最终答案：|<|$)", text, re.S)
-    answer = re.search(r"最终答案：(.+)", text)
+    answer = re.search(r"最终答案：(.+?)(?=<|\n|$)", text)
     if not answer:
         nums = re.findall(r"-?\d+\.?\d*", text)
         ans_str = nums[-1] if nums else ""

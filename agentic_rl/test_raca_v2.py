@@ -79,6 +79,50 @@ def test_parse_interaction():
     assert parse_interaction("没有 interaction 块") == ("none", "none", "")
 
 
+def test_parsers_survive_m1_trailing_interaction_block():
+    """M1：`<interaction>` 移到实质输出之后，三个角色的解析器都不能被带偏。
+
+    这不是可选的兼容性测试——M1 是 Eq (12) 良定义性的前提（决策必须在已知
+    p_primary 时做出），而它一旦落地，块就位于 `最终答案：` 之后。原来的
+    `最终答案：(.+)` 没有 `<` 前瞻，同行书写会把整个块吃进答案；块长 68 字符
+    但答案段可能不足 64，于是这串带标签的垃圾会当成合法答案进投票池占一票。
+    """
+    from agents.parsing import (
+        critic_found_errors, parse_reasoning, parse_score, MAX_ANSWER_CHARS)
+
+    blk = "<interaction>\naction: request\ntarget: critic\nreason: 不确定\n</interaction>"
+
+    # proposer：块换行写（模板规定的形态）
+    rs, ans = parse_reasoning(f"推理过程：先算 6*7=42\n最终答案：42\n{blk}")
+    assert ans == "42"
+    assert "<interaction>" not in rs and rs == "先算 6*7=42"
+    assert parse_interaction(f"推理过程：x\n最终答案：42\n{blk}")[:2] == ("request", "critic")
+
+    # proposer：块紧贴同一行——正则修的就是这一路
+    _, ans_inline = parse_reasoning(f"推理过程：x\n最终答案：42{blk}")
+    assert ans_inline == "42", f"块被吃进答案：{ans_inline!r}"
+
+    # 答案本身就是输出末尾（无块、无换行）仍要能取到
+    assert parse_reasoning("推理过程：x\n最终答案：42")[1] == "42"
+    # LaTeX 答案不含数字时也不能退化成抽末尾数字
+    assert parse_reasoning(f"推理过程：x\n最终答案：\\frac{{\\pi}}{{2}}\n{blk}")[1] \
+        == "\\frac{\\pi}{2}"
+    # 「最终答案：」后接长篇论述仍按解析失败处理（v3.1 行为不受 M1 影响）
+    long_ans = "啦" * (MAX_ANSWER_CHARS + 10) + "42"
+    assert parse_reasoning(f"推理过程：x\n最终答案：{long_ans}\n{blk}")[1] == "42"
+
+    # critic：错误分析在前，块在后；分析文本不得混入块
+    ct = f"错误分析：第二步把 6*7 算成了 41\n{blk}"
+    assert critic_found_errors(ct) is True
+    assert parse_interaction(ct)[:2] == ("request", "critic")
+    assert critic_found_errors(f"错误分析：无错误\n{blk}") is False
+
+    # verifier：分数在前，块在后
+    vt = f"分数: 0.35\n验证说明：第二步可疑\n{blk}"
+    assert parse_score(vt) == 0.35
+    assert parse_interaction(vt)[:2] == ("request", "critic")
+
+
 # ── 奖励矩阵 ─────────────────────────────────────────────────────────────────
 
 def test_r_int_effective_help():

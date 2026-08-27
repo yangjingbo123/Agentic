@@ -71,6 +71,22 @@ def rollout_metrics(batch_rollouts: list) -> dict:
         out["stop_rate"] = float(np.mean(
             [1.0 if ep.get("stopped") else 0.0 for ep in eps]))
 
+    # ── 票池埋点（训练侧） ───────────────────────────────────────────────────
+    # eval 侧早有 pool/dist/deg/marg，但**训练侧一直没报**：两边的采样条件不同
+    # （eval greedy 单样本，训练 temperature 采样 n_samples 份），所以 eval 的
+    # 池子形态不能外推到训练。两个用途：
+    #   ① deg（n_distinct≤1 占比）判断池子是否塌成重复票 —— 塌了就说明 acc 全由
+    #      单票贡献，聚合与交互都没在出力；
+    #   ② vote_margin 是「按分歧触发交互」方案的触发信号，先得知道训练时它的
+    #      分布长什么样，否则阈值只能瞎设。
+    if eps:
+        out["pool_votes"]      = float(np.mean([ep.get("n_votes", 0) for ep in eps]))
+        out["pool_distinct"]   = float(np.mean([ep.get("n_distinct", 0) for ep in eps]))
+        out["pool_degenerate"] = float(np.mean(
+            [1.0 if ep.get("n_distinct", 0) <= 1 else 0.0 for ep in eps]))
+        out["vote_margin"]     = float(np.mean(
+            [ep.get("vote_margin", 0.0) for ep in eps]))
+
     # ── 信号质量（GRPO 命门） ────────────────────────────────────────────────
     # 以 episode 级正确性分组统计（controller 层 Layer 1 信号的直接代理）。
     all_pass = all_fail = 0

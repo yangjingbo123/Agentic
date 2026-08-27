@@ -387,6 +387,9 @@ def main(cfg: DictConfig):
         # v3.1：gate→unlocked 展示“拦下多少 → 其中多少被解锁”；两者应接近（本轮
         # 交互链已自带分数的不需解锁）。clip_prompt 非 0 即告警：仍有文本无界点。
         _n_clip = getattr(trainer.executor, "n_prompt_clipped", 0)
+        # selfT 非 0 说明 proposer 在写 `target: proposer`（自指）。已被归一为
+        # none 且不再计入 int_rate/r_int，但计数本身是 prompt 是否讲清楚的信号。
+        _n_self = getattr(trainer.executor, "n_self_target", 0)
         print(
             f"step={step} t={_dt_rollout:.0f}+{time.time() - _t_train0:.0f}s "
             f"reward={stats['mean_reward']:.3f} acc={stats['accuracy']:.2f} "
@@ -405,8 +408,12 @@ def main(cfg: DictConfig):
             f"→{getattr(trainer.executor, 'n_gate_unlocked', 0)} "
             f"fnl={stats.get('funnel_flag', 0)}/{stats.get('funnel_corr', 0)}"
             f"/{stats.get('funnel_flip', 0)} "
+            f"dist={stats.get('pool_distinct', 0.0):.2f}"
+            f"/deg={stats.get('pool_degenerate', 0.0):.2f}"
+            f"/marg={stats.get('vote_margin', 0.0):.2f} "
             f"stop_rate={stats.get('stop_rate', 0.0):.2f} eps={eps_force:.2f}"
-            + (f" clip_prompt={_n_clip}" if _n_clip else ""),
+            + (f" clip_prompt={_n_clip}" if _n_clip else "")
+            + (f" selfT={_n_self}" if _n_self else ""),
             flush=True,
         )
         log_data = {
@@ -426,11 +433,14 @@ def main(cfg: DictConfig):
                     "q_forced", "int_critic_share",
                     "forced_rate", "stop_rate", "stop_acc", "exhaust_acc",
                     "gate_blocked",
-                    "funnel_flag", "funnel_corr", "funnel_flip"):
+                    "funnel_flag", "funnel_corr", "funnel_flip",
+                    "pool_votes", "pool_distinct", "pool_degenerate",
+                    "vote_margin"):
             if _mk in stats:
                 log_data[_mk] = stats[_mk]
         log_data["gate_unlocked"] = getattr(trainer.executor, "n_gate_unlocked", 0)
         log_data["prompt_clipped"] = _n_clip
+        log_data["self_target"] = _n_self
         if _g_total:
             # Fraction of question-groups that produced a usable advantage. A
             # sustained drop means rollouts are collapsing to identical rewards

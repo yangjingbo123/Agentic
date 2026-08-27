@@ -66,6 +66,7 @@ class AgenticExecutor:
             "max_prompt_tokens", 0) or max(256, _model_len - self.max_tokens - 64)
         self.n_prompt_clipped = 0
         self.n_gate_unlocked = 0    # 本批次闸门解锁次数（健康指标：应随训练下降）
+        self.n_self_target = 0      # proposer 自指 target（被归一为 none）的次数
         self._rng = random.Random()
 
     # ── batch entry point（N episodes 并行，逐 turn-slot 批量调 vLLM） ───────
@@ -78,6 +79,7 @@ class AgenticExecutor:
         if self.eval_mode:
             eps_force = 0.0
         self.n_gate_unlocked = 0    # 每批次重置；train.py 读到的就是本步值
+        self.n_self_target = 0      # 同上
 
         n = len(questions)
         blackboards    = [Blackboard() for _ in range(n)]
@@ -230,6 +232,20 @@ class AgenticExecutor:
                 st["primary_parsed"] = "最终答案：" in out and bool(answer)
 
                 action, target, reason = parse_interaction(out)
+                # 自指归一化：`parse_interaction` 已保证 target ∈ ROLE_NAMES 或
+                # 整体退回 ("none","none","")，所以下面 hop 循环里
+                # `target not in ROLE_NAMES` 实际不可达，**唯一可达的丢弃条件是
+                # target == initiator**（proposer 自己写 `target: proposer`）。
+                # 该情形下 hop 被 continue 掉、交互从未执行，但若仍按 u=True 记账：
+                #   ① INTERACTION 落黑板 → 别的角色以为发生过一次交互
+                #   ② int_rate 计入一次未发生的交互
+                #   ③ r_int 按「发起了求助」定价 → 为没发生的事件付奖励
+                # 三项污染 eff / sel / 漏斗，即用来判断"是否学会何时求助"的那些数。
+                # 因此 u 的判定必须与 hop 的执行条件共用同一个谓词：自指等价于没发起，
+                # 归一为 none 后自然落入下面的 ε 强制注入分支（与解析失败同等对待）。
+                if action != "none" and target == "proposer":
+                    self.n_self_target += 1
+                    action, target, reason = "none", "none", ""
                 u = action != "none" and self.max_hops > 0
                 forced = False
                 if u:
@@ -264,6 +280,10 @@ class AgenticExecutor:
                     if not st["pending"]:
                         continue
                     initiator, init_out, action, target, reason, forced = st["pending"].pop(0)
+                    # 防御性不变量（不再是正常路径）。三个 append 点都已保证
+                    # target 合法且非自指：proposer 起点做了自指归一化、critic 标错
+                    # 硬触发写死 "proposer"、响应方下一跳带 `t2 != target` 守卫。
+                    # 因此这里 continue 掉任何一条都意味着上游回归，而不是模型行为。
                     if target == initiator or target not in ROLE_NAMES:
                         continue
                     sys, usr, reviewed = responder_prompt(

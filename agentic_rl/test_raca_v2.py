@@ -708,6 +708,60 @@ def test_gate_unlock_when_proposer_self_initiates_to_critic():
     assert len(res2["raca_round_meta"]) == 4     # 跑满 max_rounds——即 v3 故障
 
 
+def test_self_target_counts_as_no_interaction():
+    """proposer 自指 target 必须记为「没发起」，而不是发起了一次不执行的交互。
+
+    hop 循环里 `target == initiator` 会被 continue 掉——交互从未执行。但旧代码
+    仍按 u=True 记账：INTERACTION 落黑板、int_rate 计入一次、r_int 按「发起了
+    求助」定价。被污染的恰好是 eff / sel / 修正漏斗，也就是用来判断「是否学会
+    何时求助」的那三组数字。所以 u 的谓词必须与 hop 的执行条件共用同一个判据。
+
+    注：`parse_interaction` 已把非法 target 整体退回 ("none","none","")，所以
+    自指是这条丢弃路径**唯一**可达的情形——本测试即覆盖全部可达面。
+    """
+    def _script(t):
+        return {
+            "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>"],
+            "proposer": [INTER.format(a="request", t=t) + "推理过程：x\n最终答案：5"],
+            "critic":   ["错误分析：无错误\n修正建议：无"],
+            "verifier": ["分数: 0.9\n验证说明：ok"],
+        }
+
+    def _run(t):
+        eng = FakeEngine(_script(t))
+        # max_rounds=1 + continue：单轮自然耗尽，不触发闸门（gate_blocked 会
+        # 强制注入 verifier，那会盖掉本测试要看的 forced=False）
+        ex = _mk_executor(eng, max_rounds=1, gate_unlock=False)
+        res = ex.run_episodes_batch(["q"], ["4"], eps_force=0.0)[0]
+        return eng, ex, res
+
+    eng, ex, res = _run("proposer")
+    m0 = res["raca_round_meta"][0]
+    assert m0["u"] is False                  # ← 核心：不是「发起了但被丢弃」
+    assert m0["forced"] is False             # 也不该被 ε 注入顶替（eps_force=0）
+    assert m0["target"] is None              # 不落 target，q_spont/q_forced 不被稀释
+    assert ex.n_self_target == 1             # 但要留下埋点，好看清模型多久犯一次
+    assert eng.calls == ["controller", "proposer"]   # 交互链一跳都没跑
+
+    # 对照组：显式 action=none。语义上「自指」≡「没发起」，两者的逐 turn 奖励
+    # 必须逐位相同——这比断言某个 r_int 常量更强，因为它锁死了整条归因链。
+    eng_n, ex_n, res_n = _run("none")
+    assert ex_n.n_self_target == 0
+    assert res_n["raca_round_meta"][0]["u"] is False
+    rw   = sorted((v["role"], v["reward"]) for v in res["raca_turn_data"].values())
+    rw_n = sorted((v["role"], v["reward"]) for v in res_n["raca_turn_data"].values())
+    assert len(rw) == len(rw_n)
+    for (r1, v1), (r2, v2) in zip(rw, rw_n):
+        assert r1 == r2 and approx(v1, v2)
+
+    # 阳性对照：合法 target 仍照常发起（证明上面的归一化没有一刀切关掉交互）
+    eng_c, ex_c, res_c = _run("critic")
+    assert res_c["raca_round_meta"][0]["u"] is True
+    assert res_c["raca_round_meta"][0]["target"] == "critic"
+    assert ex_c.n_self_target == 0
+    assert "critic" in eng_c.calls
+
+
 def test_unbounded_text_is_capped():
     """v3.1：三个无界文本点均有硬上限（step 151 崩溃的根因）。
 
@@ -830,9 +884,9 @@ def test_signal_quality_metrics():
     """信号质量统计：全对组/全错组占比 + 组内 std（零 torch 依赖）。"""
     from training.metrics import rollout_metrics as T_metrics
 
-    def ep(correct, stopped=True, meta=None):
+    def ep(correct, stopped=True, meta=None, **pool):
         return {"is_correct": correct, "stopped": stopped,
-                "raca_round_meta": meta if meta is not None else []}
+                "raca_round_meta": meta if meta is not None else [], **pool}
 
     # 4 组：全对 / 全错 / 混合 / 混合
     batch = [
@@ -865,6 +919,24 @@ def test_signal_quality_metrics():
     assert approx(m["parse_rate"], 0.5)
     assert m["gate_blocked"] == 1
     assert approx(m["int_selectivity"], -1.0)    # u 与 p_primary 完全负相关
+
+    # ── 票池埋点（训练侧，v3.2 新增） ────────────────────────────────
+    # deg=1.0 意味着池子塌成单一答案：此时投票只是重复确认第一个答案，
+    # 加大 k 不会有收益。marg 是「按分歧触发交互」方案的触发信号，必须
+    # 先确认它在训练分布下不是常数 1.0，否则那条路一开始就没得选。
+    pool_batch = [[
+        ep(True,  n_votes=4, n_distinct=1, vote_margin=1.0),   # 全票一致 → 退化
+        ep(False, n_votes=4, n_distinct=3, vote_margin=0.25),  # 有分歧
+    ]]
+    m = T_metrics(pool_batch)
+    assert approx(m["pool_votes"], 4.0)
+    assert approx(m["pool_distinct"], 2.0)        # (1+3)/2
+    assert approx(m["pool_degenerate"], 0.5)      # n_distinct<=1 的占比
+    assert approx(m["vote_margin"], 0.625)        # (1.0+0.25)/2
+
+    # 缺字段时按 0 计（老 checkpoint / 评测脚本产的 episode 不能让聚合崩）
+    m = T_metrics([[ep(True)]])
+    assert approx(m["pool_votes"], 0.0) and approx(m["pool_degenerate"], 1.0)
 
     # 空输入不崩
     assert T_metrics([]) == {}

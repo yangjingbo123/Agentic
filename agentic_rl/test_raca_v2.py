@@ -1417,6 +1417,129 @@ def test_cross_role_truncation_is_visible():
     assert "<" not in CLIP_MARK and "当前状态" not in CLIP_MARK
 
 
+def test_answer_cap_admits_the_latex_answers_that_actually_occur():
+    """答案上限要容得下**数据集里真实存在**的长答案（v3.2 第六轮：64 → 192）。
+
+    64 是 v3.1 拍的，实测偏紧到会毁掉正确答案。下面这个矩阵是命中的那一次
+    （v2 SFT 580 个 proposer turn 里唯一一次），原文照抄、68 字、完全正确，
+    旧代码把它兜底抽成 `'4'`：一个对的答案被记成错，还带着 `'4'` 这张假票
+    进投票池。gold 侧同样矛盾——`math_train_rl` 5265 题有 14 题 gold 超 64
+    （最长 159），`math_test` 3669 题有 6 题（最长 81）。
+
+    钉三件事：真实长答案原样返回、上限之上仍然退化（放宽不等于取消）、以及
+    **不要顺手把黑板展示上限也当成同一个数**（两者职责不同，见
+    `Blackboard._MAX_ANSWER_CHARS` 的注释）。
+    """
+    from agents.parsing import parse_reasoning, MAX_ANSWER_CHARS
+    from envs.blackboard import Blackboard
+
+    matrix = r"\begin{pmatrix} 2 & 0 & 7 \\ 3 & 5 & -1 \\ -8 & -2 & 4 \end{pmatrix}"
+    # 不写死 68：只要它落在「旧上限砍掉、新上限放过」这个窗口里就够了，
+    # 这正是本轮改动的语义。
+    assert 64 < len(matrix) <= MAX_ANSWER_CHARS, len(matrix)
+    _, ans = parse_reasoning(f"推理过程：逐项相乘\n最终答案：{matrix}")
+    assert ans == matrix, f"合法矩阵答案又被兜底抽成数字了：{ans!r}"
+
+    # 已观测最长 gold（math_train_rl，159 字）也必须过——上限是按它定的
+    longest_gold = (r"\begin{pmatrix} \frac{4}{9} & -\frac{4}{9} & -\frac{2}{9} "
+                    r"\\ -\frac{4}{9} & \frac{4}{9} & \frac{2}{9} "
+                    r"\\ -\frac{2}{9} & \frac{2}{9} & \frac{1}{9} \end{pmatrix}")
+    assert len(longest_gold) <= MAX_ANSWER_CHARS, (
+        f"最长 gold {len(longest_gold)} 字都过不了上限 {MAX_ANSWER_CHARS}，"
+        "这条上限还在和数据集矛盾")
+    _, ans2 = parse_reasoning(f"推理过程：解方程\n最终答案：{longest_gold}")
+    assert ans2 == longest_gold
+
+    # 上限之上仍退化（`test_unbounded_text_is_capped` 用 500 字，这里贴着边界）
+    _, ans3 = parse_reasoning(
+        "推理过程：x\n最终答案：" + "啦" * MAX_ANSWER_CHARS + "42")
+    assert ans3 == "42"
+
+    # 两个上限**不应**相等。相等时黑板那两处截断永远切不到东西（第六轮之前就是
+    # 这样：两个数都是 64，而解析后答案最长 55），于是「展示层会不会静默截断」
+    # 这个问题被永久隐藏。放宽解析上限正是让它显形的那一步。
+    assert MAX_ANSWER_CHARS > Blackboard._MAX_ANSWER_CHARS, \
+        "两个上限被拉平了——展示层的截断会重新变成不可观测的"
+
+
+def test_blackboard_answer_display_truncation_is_visible():
+    """黑板**答案**信道的截断也必须留标记——第四轮漏掉的两处。
+
+    第四轮把 flaw / request_context / correction 三条信道统一到 `clip_text`，
+    并在记忆文档里写下"clip_text 是跨角色截断的唯一出口"。那句话当时是错的：
+    `to_text` 里还有两处 `a[:self._MAX_ANSWER_CHARS]` 的裸切片（答案列表、
+    最高置信答案）。它们没被发现是因为**当时切不到东西**——解析上限与展示上限
+    都是 64，parse 出来的答案不可能超过 64。第六轮把解析上限放到 192，这两处
+    才第一次真正开始截断。
+    """
+    from agents.parsing import CLIP_MARK
+    from envs.blackboard import Blackboard, Message, MessageType
+
+    long_ans = "x" * (Blackboard._MAX_ANSWER_CHARS + 30)
+    short_ans = "42"
+
+    # ① 答案列表那一行
+    bb = Blackboard()
+    bb.add_message(Message(0, MessageType.TRACE, ("r", long_ans)))
+    assert CLIP_MARK in bb.to_text(), "答案列表被截了却没留痕迹"
+
+    # ② 「最高置信答案」那一行（需要有分数才会出现）
+    bb.add_message(Message(1, MessageType.SCORE, (long_ans, 0.9)))
+    txt = bb.to_text()
+    assert "最高置信答案" in txt
+    assert txt.count(CLIP_MARK) == 2, f"两行各应有一个标记：{txt!r}"
+
+    # ③ 未超限时一字不改（否则接收方会把完整答案当残文对待）
+    bb2 = Blackboard()
+    bb2.add_message(Message(0, MessageType.TRACE, ("r", short_ans)))
+    bb2.add_message(Message(1, MessageType.SCORE, (short_ans, 0.9)))
+    t2 = bb2.to_text()
+    assert CLIP_MARK not in t2 and "最高置信答案：42（分数0.90）" in t2, t2
+
+    # ④ 截断只发生在**展示层**：投票与判分读的是 traces，必须是原文。
+    #    这条是整个改动的安全边界——展示带标记不能污染答案本身。
+    assert bb.get_distinct_answers() == [long_ans]
+    assert all(a == long_ans for _, a in bb.traces)
+
+
+def test_no_bare_channel_slicing_in_blackboard():
+    """源码级不变量：`blackboard.py` 不许再用 `_MAX_*CHARS` 做上界裸切片。
+
+    第四轮的教训是"截断不可见"这一类靠人扫会漏——事实就是漏了两处（本轮补的
+    答案信道）。而它漏得特别隐蔽：那两处当时**切不到东西**，所以任何行为测试
+    都抓不到它们，只有源码级不变量能。这与
+    `test_no_bare_lt_lookahead_in_parsers` 是同一种守法，理由也同一条：写下
+    `a[:64]` 的那一刻看起来完全无害，要到上游某个常量被调大才会显形。
+
+    判据：AST 里任何 `X[:Y]` 形式的切片，其上界不得是名字里带 `_CHARS` 的
+    属性或变量——那种上界一律该走 `clip_text`。
+    """
+    import ast
+    import pathlib
+
+    path = pathlib.Path(__file__).with_name("envs").joinpath("blackboard.py")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+
+    def is_chars_bound(node):
+        if isinstance(node, ast.Attribute):
+            return "_CHARS" in node.attr
+        if isinstance(node, ast.Name):
+            return "_CHARS" in node.id
+        return False
+
+    bad = [ast.unparse(n) for n in ast.walk(tree)
+           if isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Slice)
+           and n.slice.upper is not None and is_chars_bound(n.slice.upper)]
+    assert not bad, ("信道文本被裸切片截断，接收方看不到痕迹——请改用 clip_text："
+                     f"{bad}")
+
+    # 正向：确认这个文件真的在用 clip_text，且真的有 `_CHARS` 常量可供误用。
+    # 否则上面那条断言可能只是因为"文件里什么都没有"而恒真（假绿）。
+    src = path.read_text(encoding="utf-8")
+    assert "clip_text(" in src and "_MAX_ANSWER_CHARS" in src
+
+
+
 def test_parser_label_tolerance():
     """半角冒号与英文别名：解析失败在这三处都不是「安全默认」而是静默污染。
 

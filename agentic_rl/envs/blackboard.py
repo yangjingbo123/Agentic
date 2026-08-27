@@ -71,6 +71,14 @@ class Blackboard:
     # 黑板文本展示上限（v3.1）。答案列表随轮数线性累积，而 to_text 会嵌入
     # controller/proposer/critic/verifier 每一个 prompt，是 prompt 长度的乘数项。
     _MAX_SHOWN_ANSWERS = 6
+    # 展示上限，与 `parsing.MAX_ANSWER_CHARS`（解析上限，v3.2 第六轮 64→192）
+    # 是两个职责：那个管「什么算答案」（投票与判分的输入），这个管 prompt 预算
+    # （答案列表 × 轮数是 to_text 的乘数项，而 to_text 嵌进四个角色每一个 prompt）。
+    # 所以刻意**不**跟着放宽到 192：6×192=1152 字的最坏情形没有测量支撑。
+    # 但要记住大小关系变了：第六轮之前两个数都是 64，下面两处切片因此永远切不到
+    # 东西（实测 580 个 turn 解析后答案最长 55 字）；解析上限放宽到 192 之后，
+    # 64 才第一次真正开始截断——所以同一轮把它们改成了带标记的 `clip_text`，
+    # 否则就是把第四轮扫掉的「静默信道截断」原样请回来。
     _MAX_ANSWER_CHARS = 64
     # flaw 窗口（v3.2：80 → 300）。80 是 v3.1 拍的，当时没量过 critic 到底说多长。
     # 实测（v2+v3 SFT 数据，剥离 <interaction> 块后）：critic **真报了错**的 218 条
@@ -95,7 +103,7 @@ class Blackboard:
     def _answers_for_display(self) -> list[str]:
         """展示层：滤空串（解析失败的占位）+ 限长 + 只留最近 K 个。
         不改 get_distinct_answers 的语义，避免影响投票与奖励计算。"""
-        answers = [a[:self._MAX_ANSWER_CHARS]
+        answers = [clip_text(a, self._MAX_ANSWER_CHARS)
                    for a in self.get_distinct_answers() if a]
         return answers[-self._MAX_SHOWN_ANSWERS:]
 
@@ -113,7 +121,7 @@ class Blackboard:
             distinct = [a for a in self.get_distinct_answers() if a]
             if distinct:
                 best = max(distinct, key=self.get_avg_score)
-                lines.append(f"最高置信答案：{best[:self._MAX_ANSWER_CHARS]}"
+                lines.append(f"最高置信答案：{clip_text(best, self._MAX_ANSWER_CHARS)}"
                              f"（分数{self.get_avg_score(best):.2f}）")
         if self.interactions:
             last = self.interactions[-1]

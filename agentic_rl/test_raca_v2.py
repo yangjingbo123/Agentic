@@ -1755,6 +1755,152 @@ def test_prepare_sft_replays_before_filtering_turns():
     assert "最近交互：proposer→verifier（request）" in ctrl_user
 
 
+def test_parse_failure_is_decomposed_into_two_modes():
+    """`parse_rate` 必须拆成「无标签」与「空答案」两个读数（#23，纯埋点）。
+
+    为什么非拆不可：`primary_parsed = has_answer_label(out) and bool(answer)` 是
+    **合取**，聚合后的一个数无法回答「掉的是标签还是答案」。这不是洁癖——两种
+    失败的下游后果和修法都不同：
+      · 无标签 → 走「取文中最后一个数字」兜底，实测 23 个真实无标签 turn 里 6 个
+        （26%）抽出垃圾数字（gold `\\frac{7}{32}` → `'32'`），**可解析**、与真票
+        在票池里不可分，"过滤不可解析候选"闸不住它；
+      · 空答案 → 空串进票池，实测两票（2×0.5=1.0）压过一票被 verifier 背书的
+        正确答案（0.9×1）。
+    v3 那 150 步只有一个 `parse`（0.95 → 最低 0.76），所以这两种到底各占多少，
+    在这一步之前是**测不出来的**（`train.py` 只 dump `{"step": step}`，答案串从不
+    落盘）。本测试钉住的正是"拆得开"这件事本身。
+    """
+    from agents.parsing import parse_reasoning, has_answer_label
+    from training.metrics import rollout_metrics as T_metrics
+
+    def ep(meta):
+        return {"is_correct": True, "stopped": True, "raca_round_meta": meta}
+
+    base = {"u": False, "forced": False, "p_primary": True, "p_end": True,
+            "target": None, "gate_blocked": False}
+
+    def rnd(no_label, empty):
+        return {**base, "primary_parsed": not (no_label or empty),
+                "no_label": no_label, "empty_answer": empty}
+
+    # ① 同一个 parse_rate，两种完全不同的成因 —— 这就是拆开的全部理由。
+    half_no_label = [rnd(True, False), rnd(False, False)]
+    half_empty    = [rnd(False, True), rnd(False, False)]
+    m_a = T_metrics([[ep(half_no_label)]])
+    m_b = T_metrics([[ep(half_empty)]])
+    assert approx(m_a["parse_rate"], 0.5) and approx(m_b["parse_rate"], 0.5), \
+        "两种成因本应给出相同的 parse_rate，否则这条测试证明不了它分不开"
+    assert approx(m_a["no_label_rate"], 0.5) and approx(m_a["empty_answer_rate"], 0.0)
+    assert approx(m_b["no_label_rate"], 0.0) and approx(m_b["empty_answer_rate"], 0.5)
+
+    # ② 两个标记不是 `primary_parsed` 的换名：无标签那一路答案**非空**
+    #    （兜底抽出了数字），所以 parsed=False 而 empty_answer=False。
+    #    把 empty_answer 写成 `not primary_parsed` 会在这里响。
+    assert approx(m_a["empty_answer_rate"], 0.0), \
+        "空答案率跟着无标签一起涨了——empty_answer 被写成 primary_parsed 的取反？"
+
+    # ③ 标记必须与真实模型输出对得上，按执行器里那两行同样的方式推导。
+    real = [
+        # (输出, 期望 no_label, 期望 empty_answer)
+        ("推理过程：算一下\n最终答案：42",        False, False),  # 正常
+        ("推理过程：算一下\n最终答案：\n42",      False, False),  # 无空格 → 兜底捞回
+        ("推理过程：算一下\n最终答案： \n42",     False, True),   # **一个空格** → 空串
+        ("所以结果是 42",                        True,  False),  # 无标签，兜底有数字
+        ("所以结论显然成立",                     True,  True),   # 无标签且无数字
+    ]
+    for out, exp_no_label, exp_empty in real:
+        _, answer = parse_reasoning(out)
+        no_label = not has_answer_label(out)
+        empty = not answer
+        assert (no_label, empty) == (exp_no_label, exp_empty), (
+            f"{out!r} 的两个标记应为 {(exp_no_label, exp_empty)}，"
+            f"实际 {(no_label, empty)}（answer={answer!r}）")
+    # 第 3 例与第 2 例只差一个空格，却一个丢答案一个不丢。这两行钉的是**当前的
+    # 缺陷行为，不是期望行为**（病灶记录）：`最终答案： \n42` 的答案就在下一行，
+    # 却被整个丢掉。#22 修 `parse_reasoning` 时这两行会翻，翻了就说明修到了；
+    # 不写进测试，下次改正则时没人会记得这条路径存在。
+    assert parse_reasoning("推理过程：x\n最终答案： \n42")[1] == ""
+    assert parse_reasoning("推理过程：x\n最终答案：\n42")[1] == "42"
+
+    # ④ 旧 round record 没这两个键：只能读成 0.0（低报），不许凭空造失败率，
+    #    也不许把 parse_rate 带坏。
+    legacy = [{**base, "primary_parsed": False}, {**base, "primary_parsed": True}]
+    m_old = T_metrics([[ep(legacy)]])
+    assert approx(m_old["parse_rate"], 0.5)
+    assert approx(m_old["no_label_rate"], 0.0) and approx(m_old["empty_answer_rate"], 0.0)
+
+    # ⑤ 走完真实的三跳链路：round_records → compute_turn_data → round_meta →
+    #    rollout_metrics。这一段不是形式主义——`round_meta` 是 `compute_turn_data`
+    #    里**重新拼的白名单 dict**，不是 round_records 的透传。第一版实现就漏在
+    #    这一跳：executor 记了、metrics 读不到，两个指标照样打印且永远 0.00，
+    #    也就是一个**看起来在测量、实际什么都没测**的埋点。
+    rr = [
+        {**make_round(0, primary="4"), "primary_parsed": False,
+         "no_label": True,  "empty_answer": False},   # 无标签，兜底抽到了数字
+        {**make_round(1, primary=""),  "primary_parsed": False,
+         "no_label": False, "empty_answer": True},    # 有标签但答案空
+        {**make_round(2, primary="4"), "primary_parsed": True,
+         "no_label": False, "empty_answer": False},   # 正常
+    ]
+    _, meta = compute_turn_data(rr, "4", True, 4, CFG)
+    assert [m["no_label"] for m in meta] == [True, False, False], \
+        f"no_label 没穿过 round_meta 那一跳：{[m.get('no_label') for m in meta]}"
+    assert [m["empty_answer"] for m in meta] == [False, True, False], \
+        f"empty_answer 没穿过 round_meta 那一跳：{[m.get('empty_answer') for m in meta]}"
+    m_chain = T_metrics([[{"is_correct": True, "stopped": True,
+                           "raca_round_meta": meta}]])
+    assert approx(m_chain["parse_rate"], 1 / 3)
+    assert approx(m_chain["no_label_rate"], 1 / 3)
+    assert approx(m_chain["empty_answer_rate"], 1 / 3)
+    # 并且两种失败确实各占一份，而不是同一份被数了两次
+    assert approx(m_chain["no_label_rate"] + m_chain["empty_answer_rate"],
+                  1 - m_chain["parse_rate"])
+
+
+def test_parse_flags_are_wired_from_source_not_aliased():
+    """源码级不变量：执行器里那两个标记必须各自独立算，不许挂在 `primary_parsed` 上。
+
+    为什么只能用源码级：写这两行的位置在 `run_episodes_batch` 里，那个函数没有
+    vLLM 引擎就跑不起来，**任何行为测试都到不了**。这和第六轮那两处裸切片是同一
+    类问题——上一轮的教训就是"测不到的代码不会被行为测试保护"，所以照同样的办法
+    用 AST 守。
+
+    要守住的具体退化是把 `empty_answer` 写成 `not st["primary_parsed"]`：那样两个
+    计数器就退化成同一个数（`1 - parse_rate`），本步的全部意义归零，而且**看不出
+    来**——两个指标都还在报，只是永远相等。
+    """
+    import ast
+    import pathlib
+
+    path = pathlib.Path(__file__).with_name("agents").joinpath("agentic_executor.py")
+    src = path.read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    rhs = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        tgt = node.targets[0]
+        if (isinstance(tgt, ast.Subscript) and isinstance(tgt.slice, ast.Constant)
+                and tgt.slice.value in ("no_label", "empty_answer")):
+            rhs[tgt.slice.value] = ast.unparse(node.value)
+
+    assert set(rhs) == {"no_label", "empty_answer"}, \
+        f"执行器里没有同时给两个标记赋值：{sorted(rhs)}"
+    assert "has_answer_label" in rhs["no_label"], \
+        f"no_label 不是从 has_answer_label 算的：{rhs['no_label']!r}"
+    for k, v in rhs.items():
+        assert "primary_parsed" not in v, (
+            f"{k} 挂在 primary_parsed 上了 —— 两个计数器会退化成 1−parse_rate，"
+            f"且退化后依然两个都在报、看不出来：{v!r}")
+    assert "answer" in rhs["empty_answer"] and "has_answer_label" not in rhs["empty_answer"], \
+        f"empty_answer 应该只看答案本身空不空：{rhs['empty_answer']!r}"
+
+    # 算出来还得真的带进 round record，否则 metrics 那边永远只能读到默认值 0.0。
+    for key in ("no_label", "empty_answer"):
+        assert f'"{key}":' in src, f"{key} 没进 round record，指标会永远读成 0.0"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

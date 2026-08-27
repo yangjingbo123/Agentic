@@ -187,6 +187,14 @@ def compute_turn_data(
             "gate_blocked": bool(rnd.get("gate_blocked", False)),
             # 格式健康（可解析率监控）；缺失时保守计为已解析
             "primary_parsed": bool(rnd.get("primary_parsed", True)),
+            # 把上面那个合取拆开的两个读数（#23）。**必须在这里显式带一手**：
+            # `round_meta` 是重新拼的白名单 dict，不是 `round_records` 的透传，
+            # 所以在 executor 里记了不等于 `metrics` 读得到——漏掉这两行的后果是
+            # 两个指标照样打印、但永远是 0.00，比不加更坏（假的「没问题」）。
+            # 默认取 False（= 没失败）而不是 `primary_parsed` 的 True：这两个是
+            # **失败计数**，缺键时低报比虚报安全。
+            "no_label":     bool(rnd.get("no_label", False)),
+            "empty_answer": bool(rnd.get("empty_answer", False)),
             # 修正漏斗（v2.2）：flag → correction → flip。计入全部轮
             # （含 forced 注入），比 eff（仅自发求助）覆盖更广。
             "n_flagged":     sum(1 for ct in rnd["critic_turns"] if ct["flagged"]),

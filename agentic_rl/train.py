@@ -414,7 +414,11 @@ def main(cfg: DictConfig):
             f"qF={'--' if _qf is None else f'{_qf:.2f}'} "
             f"tgtC={'--' if _tc is None else f'{_tc:.2f}'} "
             f"sel={'--' if _sel is None else f'{_sel:+.2f}'} "
-            f"parse={stats.get('parse_rate', 1.0):.2f} "
+            f"parse={stats.get('parse_rate', 1.0):.2f}"
+            # 拆开报：nl = 无标签（走数字兜底 → 垃圾票），ea = 空答案（空串进票池）。
+            # `parse` 是两者的合取，单看它分不出掉的是哪一种，而两种的修法不同。
+            f"(nl{stats.get('no_label_rate', 0.0):.2f}"
+            f"/ea{stats.get('empty_answer_rate', 0.0):.2f}) "
             f"gate={stats.get('gate_blocked', 0)}"
             f"→{getattr(trainer.executor, 'n_gate_unlocked', 0)} "
             f"fnl={stats.get('funnel_flag', 0)}/{stats.get('funnel_corr', 0)}"
@@ -439,7 +443,7 @@ def main(cfg: DictConfig):
         # + 行为（reward hacking 侦测）+ RACA v2 证据指标（§8），有则上报
         for _mk in ("entropy", "clip_frac", "ratio_mean", "ratio_max", "resp_len",
                     "all_pass_frac", "all_fail_frac", "group_reward_std",
-                    "parse_rate",
+                    "parse_rate", "no_label_rate", "empty_answer_rate",
                     "int_rate", "int_effectiveness", "int_selectivity",
                     "q_forced", "int_critic_share",
                     "forced_rate", "stop_rate", "stop_acc", "exhaust_acc",

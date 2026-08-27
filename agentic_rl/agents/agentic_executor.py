@@ -249,6 +249,23 @@ class AgenticExecutor:
                 # 格式健康：是否输出了答案标签（而非靠抽末尾数字兜底）。
                 # 格式崩了 reward 再高也是假的，所以进入监控指标。
                 st["primary_parsed"] = has_answer_label(out) and bool(answer)
+                # 同时分开记两个条件。`primary_parsed` 是**合取**，聚合成
+                # `parse_rate` 之后就再也拆不开了——v3 那 150 步只能读出「两种失败
+                # 合计 ≤ 24%」（parse 首步 0.95、均值 0.86、最低 0.76），而这两种
+                # 失败的后果完全不同，混在一个数里等于什么都没测到：
+                #   ① 无标签 → 走「取文中最后一个数字」兜底。实测 23 个真实无标签
+                #      turn 里 6 个（26%）抽出的是垃圾数字（gold `\frac{7}{32}`
+                #      抽成 `'32'`、`45,045` 抽成 `'045'`），这种票**可解析、与真票
+                #      在票池里完全不可分**。
+                #   ② 空答案 → 空串进票池。实测两票空串（加权各 0.5，合 1.0）压过
+                #      一票被 verifier 背书的正确答案（0.9×1），weighted 与 uniform
+                #      **都**被投成 `''`；而 `to_text` 的 `if a` 过滤又把它藏起来，
+                #      黑板会说「已有3个解法」却只列 1 个答案。
+                # 两条都要修（#22），但先得知道运行时各占多少——现有落盘一个字节都
+                # 没有（`train.py` 只 dump `{"step": step}`，答案串从不写盘），所以
+                # 这两个计数器是唯一的测量入口。本步**只加读数、不改任何判定**。
+                st["no_label"] = not has_answer_label(out)
+                st["empty_answer"] = not answer
 
                 action, target, reason = parse_interaction(out)
                 # 自指归一化：`parse_interaction` 已保证 target ∈ ROLE_NAMES 或
@@ -418,6 +435,8 @@ class AgenticExecutor:
                     "primary_tid":      st["primary_tid"],
                     "primary_answer":   st["primary_answer"],
                     "primary_parsed":   st["primary_parsed"],
+                    "no_label":         st["no_label"],
+                    "empty_answer":     st["empty_answer"],
                     "corrected_answer": st["corrected_answer"],
                     "u":                st["u"],
                     "forced":           st["forced"],

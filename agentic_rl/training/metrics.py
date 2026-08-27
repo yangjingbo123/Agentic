@@ -52,6 +52,19 @@ def rollout_metrics(batch_rollouts: list) -> dict:
         # 答案可解析率：格式崩了 reward 再高也是假的
         out["parse_rate"] = float(np.mean(
             [1.0 if m.get("primary_parsed", True) else 0.0 for m in rounds]))
+        # 把上面那个数拆开。`primary_parsed = has_answer_label(out) and bool(answer)`
+        # 是**合取**，所以 `parse_rate` 这一个数结构上答不了「掉的是标签还是答案」。
+        # v3 那 150 步 parse 从 0.95 掉到最低 0.76，此前只能推断「掉的正是标签」——
+        # 推断不是测量。两种失败的下游后果完全不同：无标签走「取末尾数字」兜底，
+        # 实测 23 个真实无标签 turn 里 6 个（26%）抽出垃圾数字，以**合法长相**进
+        # 票池；空答案则是空串进票池，实测两票（加权 2×0.5=1.0）压过一票被 verifier
+        # 背书的正确答案（0.9×1）。修法也不同（见 #22），所以必须分开读。
+        # 默认值与 `parse_rate` 对齐取「没失败」：旧 round record 没这两个键时读成
+        # 0.0，只会低报、不会凭空造出一个失败率。
+        out["no_label_rate"] = float(np.mean(
+            [1.0 if m.get("no_label", False) else 0.0 for m in rounds]))
+        out["empty_answer_rate"] = float(np.mean(
+            [1.0 if m.get("empty_answer", False) else 0.0 for m in rounds]))
         # ── 修正漏斗（v2.2）：flag → correction → flip ──────────────────
         # v2.1 实测 eff≈0 的定位工具。计入全部轮（含 forced 注入）：
         # flag 高而 corr 低 = 修正跳断（hop 预算/机制）；

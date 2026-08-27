@@ -604,21 +604,25 @@ class FakeEngine:
         self.script = {k: list(v) for k, v in script.items()}
         self.calls = []
         self.prompts = []          # (role, prompt) —— 供「下游到底看到了什么」的断言
+        self.temps = []            # 每次请求的 temperature（eval_mode 应恒 0.0）
 
     def generate_batch(self, requests):
         out = []
         for r in requests:
             self.calls.append(r["role"])
             self.prompts.append((r["role"], r["prompt"]))
+            self.temps.append(r.get("temperature"))
             text = self.script[r["role"]].pop(0)
             out.append((text, [-0.5, -0.5, -0.5], [11, 12, 13]))
         return out
 
 
-def _mk_executor(engine, **cfg_over):
+def _mk_executor(engine, eval_mode=False, **cfg_over):
     from agents.agentic_executor import AgenticExecutor
     cfg = {"max_rounds": 4, "max_hops": 2, "stop_gate": True, **CFG, **cfg_over}
-    return AgenticExecutor(None, FakeTokenizer(), cfg, vllm_engine=engine)
+    # eval_mode 是构造函数参数而非 cfg 项，不能混进 cfg_over
+    return AgenticExecutor(None, FakeTokenizer(), cfg, vllm_engine=engine,
+                           eval_mode=eval_mode)
 
 
 INTER = "<interaction>\naction: {a}\ntarget: {t}\nreason: r\n</interaction>\n"
@@ -728,6 +732,116 @@ def test_integration_forced_injection_and_ablation():
     res = ex.run_episodes_batch(["q"], ["4"], eps_force=1.0)[0]
     assert all(not m["u"] and not m["forced"] for m in res["raca_round_meta"])
     assert "critic" not in eng.calls and "verifier" not in eng.calls
+
+
+def test_eval_mode_kills_epsilon_injection_but_not_the_gate():
+    """eval 只准量策略自己的行为：ε 注入必须关，闸门注入必须留。
+
+    两件事写在一个函数里，因为它们的正确答案**相反**，分开放容易只记住一半：
+    ε 注入是给冷启动喂数据的**训练手段**，留在 eval 里等于拿注入出来的交互
+    去报「学会了求助」；闸门注入是**运行时机制**（controller 想停但黑板没
+    verifier 分数），线上一样触发，eval 关掉它就测不到真实终止行为。
+
+    第一段是差分对照：同一份脚本、同一个 `eps_force=1.0`，只切 `eval_mode`。
+    不要只写 eval 一侧——`if self.eval_mode: eps_force = 0.0` 被删掉时，
+    单看 eval 侧的「没发生交互」照样成立（脚本本来也可能不触发），断言不吃劲。
+    """
+    def one(eval_mode):
+        script = {
+            "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>"] * 4,
+            "proposer":   [INTER.format(a="none", t="none") + "推理过程：x\n最终答案：4"] * 4,
+            "verifier":   [INTER.format(a="none", t="none") + "分数: 0.9\n验证说明：ok"] * 4,
+        }
+        eng = FakeEngine(script)
+        # share=1.0 固定注 verifier，使"注没注"这件事确定性可断言
+        ex = _mk_executor(eng, eval_mode=eval_mode, eps_verifier_share=1.0)
+        return eng, ex.run_episodes_batch(["q"], ["4"], eps_force=1.0)[0]
+
+    eng_tr, res_tr = one(False)
+    assert "verifier" in eng_tr.calls, \
+        "训练侧 eps_force=1.0 都没注入——对照组本身失效，eval 侧的断言就没有意义"
+    assert all(m["forced"] and not m["u"] for m in res_tr["raca_round_meta"])
+    assert all(t == 1.0 for t in eng_tr.temps), f"训练侧应采样：{eng_tr.temps}"
+
+    eng_ev, res_ev = one(True)
+    assert "verifier" not in eng_ev.calls, f"eval 仍在做 ε 注入：{eng_ev.calls}"
+    assert all(not m["forced"] and not m["u"] for m in res_ev["raca_round_meta"])
+    # greedy 是同一个开关的另一半，一起钉住：温度漂了，eval 就不是可复现的尺子
+    assert all(t == 0.0 for t in eng_ev.temps), f"eval 应贪心解码：{eng_ev.temps}"
+
+    # ── 第二段：闸门注入在 eval 里必须照常触发 ────────────────────────────
+    script = {
+        "controller": ["<meta-plan>\ndecision: stop\nreason: r\n</meta-plan>"] * 2,
+        "proposer":   [INTER.format(a="none", t="none") + "推理过程：x\n最终答案：4"],
+        "verifier":   [INTER.format(a="none", t="none") + "分数: 0.9\n验证说明：ok"],
+    }
+    eng = FakeEngine(script)
+    # 不传 eps_force：证明这一注入与 ε 无关，纯由 gate_blocked 触发
+    res = _mk_executor(eng, eval_mode=True).run_episodes_batch(["q"], ["4"])[0]
+    m0 = res["raca_round_meta"][0]
+    assert m0["gate_blocked"] and m0["forced"] and not m0["u"]
+    assert "verifier" in eng.calls, "eval 把闸门注入也关了 → stop 永远解不了锁"
+    assert res["stopped"] is True and len(res["raca_round_meta"]) == 1
+
+    # 后果（这是 train.py 的 eval 行必须多印一列的理由）：本轮 forced=True 而
+    # u=False，于是量 u 的 eval_int_rate 报 0.00，可 verifier 确实被调了一次。
+    # 只印 int_rate 的话，「策略没求助」与「策略没求助、机制替它求助了」在日志
+    # 上是同一个 0.00——而这两种情况对"要不要继续加 ε"的答案正好相反。
+    rounds = res["raca_round_meta"]
+    assert sum(m["u"] for m in rounds) == 0
+    assert sum(m["forced"] for m in rounds) == 1
+
+
+def test_offline_eval_uses_the_runtime_parsers():
+    """evaluate.py 的三把尺子必须与运行时同源，否则离线评测量的是另一个系统。
+
+    旧版自己手写 `最终答案：(.+)` / `分数:\\s*([0-9.]+)` / 字面量
+    `"action: none" not in resp`。实测 2864 个 SFT turn：分数 0/748、交互
+    0/1982 一致，但 **答案 3/580 漂移**（模型写半角 `最终答案: 24`）。
+
+    这里钉的是漂移的**后果**而不是正则长相——一个缺口污染两个指标：
+      ① 抓不到答案 → `last_proposer_ans` 空串 → proposer_accuracy 少算；
+      ② 空串使 `math_equal("", gold)` 恒假 → 同一 episode 里 critic 的挑错被
+         记成真阳性 → critic_precision 虚高（本例从 0.00 虚高到 1.00）。
+    所以两个都断；只断第一个的话，第二个漂回去时测试仍然绿。
+    """
+    import evaluate as offline
+    from agents.parsing import critic_found_errors
+
+    ep = {
+        "is_correct": True,
+        "turn_ids": [0, 1, 2, 3],
+        "messages": [
+            # 半角冒号 + 尾部块：旧尺子在这一条上抓空
+            {"role_name": "proposer",
+             "response": "推理过程：算了一遍\n最终答案: 24\n"
+                         + INTER.format(a="request", t="verifier")},
+            # proposer 其实答对了，所以这次挑错是**误报**
+            {"role_name": "critic", "response": "错误分析：第二步系数不对"},
+            {"role_name": "verifier", "response": "分数: 0.9\n验证说明：ok"},
+            # 全角 `action：` 运行时解析不出块 → 不算交互；旧字面量判据会把它
+            # 算成一次交互（`"action: none"` 搜不到 + 有 `<interaction>`）
+            {"role_name": "verifier",
+             "response": "验证说明：没给分\n<interaction>\naction：none\n</interaction>"},
+        ],
+    }
+
+    class FakeEx:
+        def run_episode(self, q, a):
+            return ep
+        _critic_found_errors = staticmethod(critic_found_errors)
+
+    res = offline.evaluate(FakeEx(), [{"question": "q", "answer": "24"}])
+    assert res["proposer_accuracy"] == 1.0, "半角冒号的答案没被认出来"
+    assert res["critic_flag_rate"] == 1.0                      # 确实挑了一次错
+    assert res["critic_precision"] == 0.0, \
+        "唯一一次挑错是误报，precision 必须是 0——非 0 说明答案没解析出来"
+    # verifier：一条有分、一条没分。没分的不能按 0.5 兜底进分母
+    # （0.5 正落在 `score > 0.5` 的边界上，会把"没打分"系统性记成"打了低分"）
+    assert res["verifier_unparsed"] == 1
+    assert res["verifier_consistency"] == 1.0                   # 分母只有那条 0.9
+    # 交互计数走 parse_interaction：唯一的自发求助是 proposer 那次
+    assert res["interaction_rate"] == 1.0
 
 
 def test_integration_gate_blocked_injects_verifier():

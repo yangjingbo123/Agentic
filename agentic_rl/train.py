@@ -219,16 +219,25 @@ def main(cfg: DictConfig):
         pool_deg = float(np.mean([1.0 if ep.get("n_distinct", 0) <= 1 else 0.0
                                   for ep in episodes]))
         pool_marg = float(np.mean([ep.get("vote_margin", 0.0) for ep in episodes]))
-        # RACA v2 行为指标（greedy、无 ε 注入，反映学到的策略本身）
+        # RACA v2 行为指标（greedy 解码；ε 注入已由 eval_mode 关掉）
         _rounds = [m for ep in episodes for m in ep.get("raca_round_meta", [])]
         eval_int_rate  = float(np.mean([m["u"] for m in _rounds])) if _rounds else 0.0
         eval_stop_rate = float(np.mean([1.0 if ep.get("stopped") else 0.0 for ep in episodes]))
+        # forced/gate 两列必须和 int_rate 一起看。eval_mode 只关了 ε 注入，
+        # **闸门注入没关也不该关**（controller 想停但黑板没分数 → 强注 verifier
+        # 解锁，线上一样触发）。而 int_rate 量的是 `u`（自发），闸门注入记在
+        # `forced` 上——只印 int_rate 的话，「策略没求助」和「策略没求助、机制
+        # 替它求助了」在日志上都是 0.00，可这两种情况对「ε 要不要继续加」的答案
+        # 正好相反。fgate 高而 int 低 = 交互全是机制撑的，别把它读成学会了求助。
+        eval_forced_rate = float(np.mean([m["forced"] for m in _rounds])) if _rounds else 0.0
+        eval_gate_rate   = float(np.mean([m["gate_blocked"] for m in _rounds])) if _rounds else 0.0
         print(f"  [eval] step={step} eval_acc={acc:.3f} "
               f"acc_tail{len(_tail)}={acc_tail:.3f} acc300={acc_300:.3f} "
               f"acc_uniform={acc_uni:.3f} acc_weighted={acc_wt:.3f} "
               f"d_vote={d_vote:+.3f} "
               f"reward={reward_mean:.3f} "
               f"avg_turns={avg_turns:.1f} int_rate={eval_int_rate:.2f} "
+              f"forced={eval_forced_rate:.2f} gate={eval_gate_rate:.2f} "
               f"stop_rate={eval_stop_rate:.2f} "
               f"pool={pool_votes:.1f}/dist={pool_dist:.2f}/deg={pool_deg:.2f}"
               f"/marg={pool_marg:.2f} (n={len(_eval_items)})", flush=True)
@@ -238,6 +247,8 @@ def main(cfg: DictConfig):
                    "eval_accuracy_weighted": acc_wt,
                    "eval_vote_gain": d_vote, "eval_reward": reward_mean,
                    "eval_avg_turns": avg_turns, "eval_int_rate": eval_int_rate,
+                   "eval_forced_rate": eval_forced_rate,
+                   "eval_gate_rate": eval_gate_rate,
                    "eval_stop_rate": eval_stop_rate,
                    "eval_pool_votes": pool_votes, "eval_pool_distinct": pool_dist,
                    "eval_pool_degenerate": pool_deg,

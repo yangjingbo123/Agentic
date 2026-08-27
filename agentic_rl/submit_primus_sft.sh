@@ -63,19 +63,25 @@ echo "MODEL_PATH = ${MODEL_PATH}"
 
 # ---------------------------------------------------------------------------
 # 数据：v23 = v2 + v3 现场派生（派生文件不入库，生成命令即此处）
-# v3.2（M1）：先把 `<interaction>` 块从开头机械搬到末尾，再拼接。
-# 为什么在这里现场重排、而不是把 *_m1.jsonl 提交入库：SFT 数据的 system 字段
+# v3.2 派生两件事（见 data/prepare_sft.py 的 docstring）：
+#   ① M1：把 `<interaction>` 块从开头机械搬到末尾；
+#   ② 剔除关键字段解析不出来的 turn —— 实测 44 条，**全在 v2**
+#      （proposer 17 缺「最终答案：」/ critic 12 缺「错误分析|无错误」/
+#      verifier 15 缺「分数：」），其中绝大多数整条是英文输出。v3 一条不剔。
+#      剔除后 2914 → 2870 turn，且 100% 能被 agents/parsing.py 解析。
+# 为什么在这里现场派生、而不是把 *_m1.jsonl 提交入库：SFT 数据的 system 字段
 # 必须与 llm/prompt_templates.py **逐字节相同**，一旦模板再改而数据文件是死的，
 # SFT 教的格式就和 RL 推理时给的格式漂移，且这种漂移不报错、只体现为可解析率
 # 缓慢下滑。现场从原始文件派生可以保证两者永远同步。脚本自带逐 turn 校验：
-# 只允许「块位置」与「system」两处变化，实质内容改一个字符就 assert 失败。
+# 只允许「块位置」「system」「整条剔除」三种变化，实质内容改一个字符就 assert
+# 失败；该剔除哪些 turn 也在校验时独立重算一遍，多删少删都会当场炸掉。
 # ---------------------------------------------------------------------------
 for f in data/sft_train_v2.jsonl data/sft_train_v3.jsonl; do
     [[ -f "${f}" ]] || { echo "!! 缺 ${f}（需先提交入仓库）" >&2; exit 1; }
 done
-python data/apply_m1_reorder.py \
+python data/prepare_sft.py \
     --inputs data/sft_train_v2.jsonl data/sft_train_v3.jsonl \
-    || { echo "!! M1 重排校验失败，勿继续 SFT" >&2; exit 1; }
+    || { echo "!! SFT 派生校验失败，勿继续 SFT" >&2; exit 1; }
 cat data/sft_train_v2_m1.jsonl data/sft_train_v3_m1.jsonl > data/sft_train_v23.jsonl
 wc -l data/sft_train_v2_m1.jsonl data/sft_train_v3_m1.jsonl data/sft_train_v23.jsonl
 
@@ -95,25 +101,50 @@ wc -l data/sft_train_v2_m1.jsonl data/sft_train_v3_m1.jsonl data/sft_train_v23.j
 #      EOS」），但那是与 M1 无关的数据卫生改动，混进来会污染 M1 的归因。
 # → 留作后续独立一步：剔除超长 turn，或把 max_len 抬到 1536 后重测。
 python - <<'EOF'
-import json, sys
+import json, re, sys
 sys.path.insert(0, ".")
-from agents.parsing import parse_decision, parse_interaction
+from agents.parsing import (has_answer_label, parse_decision, parse_reasoning,
+                            parse_score)
 
-n_turn = ok_d = n_d = ok_i = n_i = 0
+# 每个角色只查**下游真正会读**的那个字段。
+# 注意不要用 parse_interaction 来查 worker：它解析失败时返回 "none"，而 "none"
+# 是合法取值，assert 恒真——v3.1 的体检就是这么假绿的。同理 parse_decision 有
+# "解析失败保守 continue" 的兜底，必须显式确认标签在，不能只看返回值合法。
+_CRIT = re.compile(r"错误分析[：:]|无错误|无错")
+
+
+def key_field_ok(role, resp):
+    if role == "controller":
+        return "decision:" in resp and parse_decision(resp) in ("continue", "stop")
+    if role == "proposer":
+        return has_answer_label(resp) and bool(parse_reasoning(resp)[1])
+    if role == "critic":
+        return bool(_CRIT.search(resp))
+    if role == "verifier":
+        return parse_score(resp) is not None
+    raise SystemExit(f"未知角色：{role}")
+
+
+n_turn = 0
 lens = []
+ok = {}
+tot = {}
 for line in open("data/sft_train_v23.jsonl"):
     ep = json.loads(line)
     for t in ep.get("turns", []):
         n_turn += 1
         lens.append(len(t["system"]) + len(t["user"]) + len(t["response"]))
-        if t.get("role_name") == "controller":
-            n_d += 1; ok_d += parse_decision(t["response"]) in ("continue", "stop")
-        else:
-            n_i += 1; ok_i += parse_interaction(t["response"])[0] in ("none", "request", "challenge")
+        role = t["role_name"]
+        tot[role] = tot.get(role, 0) + 1
+        ok[role] = ok.get(role, 0) + key_field_ok(role, t["response"])
 trunc = sum(1 for l in lens if l / 2.2 > 1024) / max(len(lens), 1)
-print(f"v23: {n_turn} turns, controller {ok_d}/{n_d}, worker {ok_i}/{n_i}, "
-      f"max_len=1024 预计截断率 {trunc:.1%}")
-assert ok_d == n_d and ok_i == n_i, "存在不可解析 turn"
+print(f"v23: {n_turn} turns, max_len=1024 预计截断率 {trunc:.1%}")
+for role in sorted(tot):
+    print(f"  {role:11s} 关键字段 {ok[role]}/{tot[role]}")
+# 要求 100%：prepare_sft.py 已经把解析不出来的整条剔除了，这里若还有漏网，说明
+# 两处的判据脱了钩（例如只改了一边的标签），必须停下来查，不能放宽阈值。
+bad = {r: (ok[r], tot[r]) for r in tot if ok[r] != tot[r]}
+assert not bad, f"存在关键字段解析不出来的 turn：{bad}（prepare_sft.py 的判据与此处脱钩了？）"
 assert trunc < 0.02, f"截断率 {trunc:.1%} 超阈"
 EOF
 

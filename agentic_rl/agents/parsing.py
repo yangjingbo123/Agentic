@@ -49,12 +49,41 @@ def parse_interaction(text: str) -> tuple[str, str, str]:
     return action, target, reason
 
 
+_INTER_BLOCK = re.compile(r"\s*<interaction>.*?</interaction>\s*", re.S)
+
+
+def strip_interaction(text: str, *, trim: bool = True) -> str:
+    """剥掉 `<interaction>` 块——**仅用于把一个角色的输出展示给另一个角色**。
+
+    动机（v3.2 实测）：块的长度固定 68 字符，而 `blackboard.to_text()` 给 critic
+    意见留的窗口只有 80 字符，`request_context` / `proposer_correction_user` 是
+    300 字符。块占着窗口 → critic 真正报的错传到下游只剩十几个字。M1 把块移到
+    尾部只是让截断先吃正文；要真正腾出信道，必须把块整个拿掉——它对**接收方**
+    零信息量（发起意图已由 `request_context` 的 action/reason 显式表达）。
+
+    **绝不能用在 `record()` 存下的 `response` 上**：那是训练目标，与 token_ids /
+    log_probs 逐位对齐，改一个字符就会让 per-token ratio 错位。这里只处理展示副本。
+
+    `trim=False` 供 `data/prepare_sft.py` 清洗 SFT 的 `user` 字段用：那是**已经
+    套好模板**的整段 prompt，再 strip 一次会连模板自带的首尾空白一起改掉。两处
+    共用同一个正则字面量是有意的——RL 侧的 prompt 现在是「模板 + 剥过块的输出」，
+    SFT 的 user 必须落到逐字节相同的形状，否则又是一处静默的训练/推理漂移。
+    """
+    out = _INTER_BLOCK.sub("", text)
+    return out.strip() if trim else out
+
+
 # 无界文本上限（v3.1）。v3 实测：parse 0.95→0.80 后，兜底抽取的 answer 可能
 # 是整段文本，reasoning 缺失时更是直接返回全部输出；两者都会进 responder
 # prompt 与黑板文本，随轮数累积后撑破 max_model_len（step 151 实测 5036>4096）。
 # 另：answer 是投票池的键，长文本 answer 彼此各不相同→各占一票稀释投票。
 MAX_ANSWER_CHARS = 64      # 数学答案（含 LaTeX）远不到此长度；超出即视为解析失败
 MAX_REASONING_CHARS = 1500  # 完整推理保留上限（够容纳正常多步解题）
+
+# 标签的容错写法。抽成常量是为了让 reasoning 的**前瞻**与 answer 的**匹配**用
+# 同一套字面量——两处写歧了会造成「reasoning 吃掉答案段」这种极难发现的错位。
+_RSN_LABEL = r"推理过程[：:]"
+_ANS_LABEL = r"(?:最终答案|Final Answer)[：:]"
 
 
 def parse_reasoning(text: str) -> tuple[str, str]:
@@ -67,9 +96,17 @@ def parse_reasoning(text: str) -> tuple[str, str]:
     三个分支缺一不可：`\\n` 覆盖块换行写（最常见），`<` 覆盖同行写，`$` 覆盖
     答案就是输出末尾。注意光写 `$` 不够：未开 re.M 时 `$` 只匹配串尾，
     非贪婪的 `.+?` 又跨不过换行，会导致整个匹配失败。
+
+    v3.2（第二轮）：标签容错扩到 **半角冒号 + 英文别名**。这不是防御性编程，
+    是修实测缺陷——SFT 数据里就有 `最终答案: 24`（半角）这种写法，原正则只认
+    全角 `：`，于是整条答案落进「取文中最后一个数字」的兜底，`45,045` 会被抽成
+    `045` 这类假答案进投票池占一票。**静默污染比解析失败更坏**，所以这里放宽。
+    同理只给「答案」加英文别名、不给「推理过程」加：答案解析失败 → 垃圾投票
+    （污染），而推理解析失败 → 整段输出当推理（仅冗长，无害），按同一条原则
+    只在污染侧放宽。`critic_found_errors` 刻意不加英文别名，理由见该函数。
     """
-    reasoning = re.search(r"推理过程：(.+?)(?=最终答案：|<|$)", text, re.S)
-    answer = re.search(r"最终答案：(.+?)(?=<|\n|$)", text)
+    reasoning = re.search(rf"{_RSN_LABEL}(.+?)(?={_ANS_LABEL}|<|$)", text, re.S)
+    answer = re.search(rf"{_ANS_LABEL}(.+?)(?=<|\n|$)", text)
     if not answer:
         nums = re.findall(r"-?\d+\.?\d*", text)
         ans_str = nums[-1] if nums else ""
@@ -84,16 +121,42 @@ def parse_reasoning(text: str) -> tuple[str, str]:
     return (reasoning_str[:MAX_REASONING_CHARS], ans_str)
 
 
+def has_answer_label(text: str) -> bool:
+    """输出里是否真的写了答案标签（而非靠「取末尾数字」兜底）。
+
+    存在的意义是让 `primary_parsed` 这个格式健康指标与 `parse_reasoning` **共用
+    同一套标签字面量**。此前 executor 里硬编码 `"最终答案：" in out`，只认全角，
+    放宽解析后就会出现「解析成功但指标报格式崩」的自相矛盾读数——而这个指标正是
+    用来判断"reward 高是不是假的"，它自己不准就没有意义。
+    """
+    return bool(re.search(_ANS_LABEL, text))
+
+
 def parse_score(text: str) -> float | None:
-    """verifier 输出 → [0,1] 分数；解析失败返回 None。"""
-    m = re.search(r"分数:\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))", text)
+    """verifier 输出 → [0,1] 分数；解析失败返回 None。
+
+    v3.2：标签容错扩到 `分数：`（全角）与 `Score:`（英文）。原正则只认半角
+    `分数:`，而实测 764 条 verifier SFT turn 里有 15 条整条是英文（`Score: 1.0`），
+    解析失败后 executor 会回落 **0.5 先验**——这不是中性默认，而是把「没验证过」
+    和「验证了但拿不到分」混成同一个值，在 weighted vote 下系统性压制该答案。
+    失败模式是静默污染，故放宽。
+    """
+    m = re.search(r"(?:分数|Score)[：:]\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))", text)
     if not m:
         return None
     return max(0.0, min(1.0, float(m.group(1))))
 
 
 def critic_found_errors(critic_output: str) -> bool:
-    """鲁棒判断 critic 是否报了错（沿用 v1.x Fix 3 的解析逻辑）。"""
+    """鲁棒判断 critic 是否报了错（沿用 v1.x Fix 3 的解析逻辑）。
+
+    **刻意不加英文别名**（与 `parse_reasoning` / `parse_score` 不同）：这里的
+    判据是一对**互补**的启发式——先看有没有「无错误」，再看「错误分析」段是否
+    非空。只给后者加英文别名而前者认不出 "No errors found"，会让每一条英文
+    critic 输出都判成 flag（假阳性），直接污染 `r^critic` 的四格矩阵与 flag→corr
+    漏斗。失败模式在这里是「保守不 flag」（良性），所以宁可失败也不放宽。
+    整条英文的 critic turn 改为在 SFT 派生步剔除（`data/prepare_sft.py`）。
+    """
     if "无错误" in critic_output or "无错" in critic_output:
         return False
     err_match = re.search(r"错误分析[：:]\s*(.+?)(?=<|$)", critic_output, re.S)

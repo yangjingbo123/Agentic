@@ -70,6 +70,17 @@ class Blackboard:
     # controller/proposer/critic/verifier 每一个 prompt，是 prompt 长度的乘数项。
     _MAX_SHOWN_ANSWERS = 6
     _MAX_ANSWER_CHARS = 64
+    # flaw 窗口（v3.2：80 → 300）。80 是 v3.1 拍的，当时没量过 critic 到底说多长。
+    # 实测（v2+v3 SFT 数据，剥离 <interaction> 块后）：critic **真报了错**的 218 条
+    # 输出中位 267 字、p75 341 字，80 窗口只有 4% 能完整送达，300 窗口 63%。
+    # 也就是说 v3 观测到的"critic 无差别 flag、对最终答案无因果通路"，有一部分
+    # 根本不是 critic 弱，而是它的话在这里被截掉了。
+    # 300 是安全的：① prompt 预算 max_prompt_tokens ≈ 3008 token（4096−1024−64），
+    # 当前整条 prompt 不到其三分之一；② 与 request_context / correction 的 300
+    # 窗口取同一个数，只留一个量级要记；③ flaw 只取 flaws[-1]，**不随轮数累积**，
+    # 与答案列表不同，不是 v3 step 151 prompt 崩那个增长源。
+    # 不开更大是因为 p90 已到 508 字，再放宽收益递减而 prompt 是每个角色都付的。
+    _MAX_FLAW_CHARS = 300
 
     def _answers_for_display(self) -> list[str]:
         """展示层：滤空串（解析失败的占位）+ 限长 + 只留最近 K 个。
@@ -86,7 +97,7 @@ class Blackboard:
             shown = self._answers_for_display()
             lines.append(f"已有{len(self.traces)}个解法，答案：{shown}")
         if self.flaws and include_flaws:
-            lines.append(f"发现问题：{self.flaws[-1]['content'][:80]}")
+            lines.append(f"发现问题：{self.flaws[-1]['content'][:self._MAX_FLAW_CHARS]}")
         if self.scores:
             distinct = [a for a in self.get_distinct_answers() if a]
             if distinct:

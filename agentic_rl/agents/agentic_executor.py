@@ -17,10 +17,12 @@ from agents.grader import math_equal   # re-export：evaluate.py 从此模块导
 from agents.parsing import (
     ROLE_NAMES,
     critic_found_errors,
+    has_answer_label,
     parse_decision,
     parse_interaction,
     parse_reasoning,
     parse_score,
+    strip_interaction,
 )
 from agents.raca_rewards import compute_turn_data
 from envs.blackboard import Blackboard, Message, MessageType
@@ -152,9 +154,16 @@ class AgenticExecutor:
                 usr = f"待验证答案：{last[1]}\n推理：{last[0]}\n当前状态：{bb.to_text()}"
             else:  # proposer 修正
                 sys = PromptTemplates.proposer_system()
+                # 去重：flaw 窗口放宽到 300 后，黑板的「发现问题」与下面
+                # `proposer_correction_user` 的 `initiator_output` 在 critic 硬触发
+                # 路径上是**逐字节相同**的两份拷贝（同一个 `shown`、同样截 300），
+                # 白占 300 字预算还让 prompt 自我重复。这里按内容比对来判定，而不是
+                # 推断"initiator 是不是 critic"——critic 未标错却主动请求修正时
+                # flaws[-1] 是更早的另一条，那份信息是真的、不能扔。
+                dup = bool(bb.flaws) and bb.flaws[-1]["content"][:300] == init_out[:300]
                 usr = PromptTemplates.proposer_correction_user(
                     questions[i], ROLE_NAMES.get(initiator, initiator),
-                    init_out, bb.to_text())
+                    init_out, bb.to_text(include_flaws=not dup))
             if not forced and target != "proposer":
                 usr += PromptTemplates.request_context(
                     ROLE_NAMES.get(initiator, initiator), action, reason, init_out)
@@ -223,13 +232,16 @@ class AgenticExecutor:
                 out = record(i, "proposer", sys, usr, res, tid)
                 reasoning, answer = parse_reasoning(out)
                 blackboards[i].add_message(Message(0, MessageType.TRACE, (reasoning, answer)))
+                # 展示副本：交给别的角色看的文本一律剥掉 <interaction> 块。
+                # `out` 本身（= record 存下的训练目标）绝不能动。
+                shown = strip_interaction(out)
 
                 st = ep_st[i]
                 st["primary_tid"] = tid
                 st["primary_answer"] = answer
-                # 格式健康：是否输出了「最终答案：」字段（而非靠抽末尾数字兜底）。
+                # 格式健康：是否输出了答案标签（而非靠抽末尾数字兜底）。
                 # 格式崩了 reward 再高也是假的，所以进入监控指标。
-                st["primary_parsed"] = "最终答案：" in out and bool(answer)
+                st["primary_parsed"] = has_answer_label(out) and bool(answer)
 
                 action, target, reason = parse_interaction(out)
                 # 自指归一化：`parse_interaction` 已保证 target ∈ ROLE_NAMES 或
@@ -271,7 +283,7 @@ class AgenticExecutor:
                 # target 对 forced 轮也落盘（v2.3：q_spont/q_forced 拆分需要）
                 st["target"] = target if (u or forced) else None
                 if u or forced:
-                    st["pending"].append(("proposer", out, action, target, reason, forced))
+                    st["pending"].append(("proposer", shown, action, target, reason, forced))
 
             # ── 3. 交互链（≤ max_hops 跳，跨 episode 按深度批量） ──────────
             for _hop in range(self.max_hops):
@@ -298,6 +310,11 @@ class AgenticExecutor:
                 )
                 for (i, tid, target, sys, usr, reviewed), res in zip(batch_req, res_all):
                     out = record(i, target, sys, usr, res, tid)
+                    # 展示副本（不影响 record 存下的训练目标）：黑板文本会嵌进
+                    # controller / critic / verifier 每一个 prompt，而 flaw 窗口只有
+                    # `_MAX_FLAW_CHARS`；块占着窗口就是 v3 "critic 说了等于没说"
+                    # 的根源。剥离对接收方零信息损失（发起意图由 request_context 表达）。
+                    shown = strip_interaction(out)
                     st = ep_st[i]
                     bb = blackboards[i]
                     flagged = False
@@ -305,7 +322,7 @@ class AgenticExecutor:
                     if target == "critic":
                         flagged = critic_found_errors(out)
                         if flagged:
-                            bb.add_message(Message(1, MessageType.FLAW, {"content": out}))
+                            bb.add_message(Message(1, MessageType.FLAW, {"content": shown}))
                         st["critic_turns"].append({
                             "tid": tid, "flagged": flagged,
                             "reviewed_answer": reviewed,
@@ -341,12 +358,12 @@ class AgenticExecutor:
                             list(ROLE_NAMES).index(target), MessageType.INTERACTION,
                             {"from": target, "action": "request",
                              "target": "proposer", "reason": r2}))
-                        st["pending"].append((target, out, "request", "proposer", r2, False))
+                        st["pending"].append((target, shown, "request", "proposer", r2, False))
                     elif a2 != "none" and t2 != target:
                         bb.add_message(Message(
                             list(ROLE_NAMES).index(target), MessageType.INTERACTION,
                             {"from": target, "action": a2, "target": t2, "reason": r2}))
-                        st["pending"].append((target, out, a2, t2, r2, False))
+                        st["pending"].append((target, shown, a2, t2, r2, False))
 
             # ── 3.5 闸门解锁批次（v3.1，不占 hop 预算） ────────────────
             # v2.0 写的解锁通道在上文 elif（proposer 未自发起）分支里，当时

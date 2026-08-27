@@ -37,7 +37,8 @@ import json
 import random
 
 from agents.grader import math_equal
-from agents.parsing import ROLE_NAMES, critic_found_errors, parse_reasoning, parse_score
+from agents.parsing import (ROLE_NAMES, critic_found_errors, parse_reasoning,
+                            parse_score, strip_interaction)
 from envs.blackboard import Blackboard, Message, MessageType
 from llm.prompt_templates import PromptTemplates
 from llm.vllm_engine import VLLMInferenceEngine
@@ -153,7 +154,11 @@ def main():
         bb = Blackboard()
         bb.add_message(Message(0, MessageType.TRACE, (s["reasoning"], s["answer"])))
         if flaw is not None:
-            bb.add_message(Message(1, MessageType.FLAW, {"content": flaw}))
+            # 与 RL 侧一致地剥块。这里若不剥，量出来的「通道增益」对应的是一个
+            # RL 里已经不存在的 prompt 形状——块占 68 字窗口正是 v3 通道测量被
+            # 低估的原因之一，用旧形状复测等于把偏差再引入一次。
+            bb.add_message(Message(1, MessageType.FLAW,
+                                   {"content": strip_interaction(flaw)}))
         return bb
 
     def hits_of(outs, subset):

@@ -31,7 +31,7 @@ import json
 import random
 
 from agents.grader import math_equal
-from agents.parsing import parse_reasoning
+from agents.parsing import parse_reasoning, strip_interaction
 from envs.blackboard import Blackboard, Message, MessageType
 from llm.prompt_templates import PromptTemplates
 from llm.vllm_engine import VLLMInferenceEngine
@@ -178,7 +178,12 @@ def main():
         bb = Blackboard()
         bb.add_message(Message(0, MessageType.TRACE, (s["reasoning"], s["answer"])))
         if flaw:
-            bb.add_message(Message(1, MessageType.FLAW, {"content": flaw}))
+            # 与 RL 侧一致：写进黑板的必须是**剥过块**的文本（executor 里那一行
+            # 是 `FLAW, {"content": shown}`，shown = strip_interaction(out)）。
+            # 这里不剥，重新生成 v3 就会再造出一批「上游发言里带块」的 prompt，
+            # 而 RL 推理时给的 prompt 里没有块——一处无声的训练/推理漂移。
+            bb.add_message(Message(1, MessageType.FLAW,
+                                   {"content": strip_interaction(flaw)}))
         return bb.to_text()
 
     episodes, stats = [], {"verifier": 0, "critic": 0, "correction": 0,

@@ -537,11 +537,13 @@ class FakeEngine:
     def __init__(self, script):
         self.script = {k: list(v) for k, v in script.items()}
         self.calls = []
+        self.prompts = []          # (role, prompt) —— 供「下游到底看到了什么」的断言
 
     def generate_batch(self, requests):
         out = []
         for r in requests:
             self.calls.append(r["role"])
+            self.prompts.append((r["role"], r["prompt"]))
             text = self.script[r["role"]].pop(0)
             out.append((text, [-0.5, -0.5, -0.5], [11, 12, 13]))
         return out
@@ -984,6 +986,142 @@ def test_signal_quality_metrics():
 
     # 空输入不崩
     assert T_metrics([]) == {}
+
+
+# ── v3.2：信道修复（剥块 + 放宽 flaw 窗口）────────────────────────────────
+
+def test_strip_interaction_only_affects_display_copy():
+    """块对**接收方**零信息量，必须在展示前剥掉；但训练目标一个字符都不能动。
+
+    为什么这条测试是必需的：`strip_interaction` 用错地方就是一个静默的灾难。
+    `record()` 存下的 `response` 与 `token_ids` / `log_probs` 逐位对齐，若把剥过
+    块的文本存进去，per-token ratio 会整体错位——训练照跑、loss 照降，只是梯度
+    对着错误的 token。所以这里同时钉住两侧：展示副本必须没有块，落库的
+    `response` 必须仍带块。
+    """
+    from agents.parsing import strip_interaction
+
+    blk = "<interaction>\naction: request\ntarget: critic\nreason: 不确定\n</interaction>"
+    # 尾部（M1 之后的常态）、头部（M1 之前的历史数据）都要剥掉
+    assert strip_interaction(f"错误分析：第二步错了\n{blk}") == "错误分析：第二步错了"
+    assert strip_interaction(f"{blk}\n错误分析：第二步错了") == "错误分析：第二步错了"
+    # 没有块时原样返回（只 strip 首尾空白）
+    assert strip_interaction("错误分析：第二步错了") == "错误分析：第二步错了"
+
+    # 端到端：critic 的意见进了 proposer 的修正 prompt，但块没跟着进去
+    script = {
+        "controller": [
+            "<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>",
+            "<meta-plan>\ndecision: stop\nreason: r\n</meta-plan>",
+        ],
+        "proposer": [
+            "推理过程：x\n最终答案：5\n" + INTER.format(a="request", t="critic"),
+            "推理过程：fix\n最终答案：4\n" + INTER.format(a="none", t="none"),
+        ],
+        "critic": ["错误分析：第二步把 6*7 算成了 41\n"
+                   + INTER.format(a="request", t="proposer")],
+        "verifier": ["分数: 0.9\n验证说明：ok\n" + INTER.format(a="none", t="none")],
+    }
+    eng = FakeEngine(script)
+    # stop_gate=False：本测试关心的是「块有没有泄漏到下游 prompt」，不是终止逻辑。
+    # 开着闸门时第 2 轮的 stop 会因无分数被拦下、多跑一轮，与本测试无关。
+    res = _mk_executor(eng, stop_gate=False).run_episodes_batch(["6*7=?"], ["42"])[0]
+
+    # 只看 user 部分。system 里本来就有 `<interaction>` 的格式说明（那是在教模型
+    # 怎么写块），拿整个 prompt 去搜必然命中，断言会恒真——假绿。
+    # FakeTokenizer 用 "\n---\n" 连接 system 与 user，据此切开。
+    corr = [p for role, p in eng.prompts if role == "proposer"][1].split("\n---\n", 1)[1]
+    assert "第二步把 6*7 算成了 41" in corr, "critic 的意见没送到修正 prompt"
+    assert "<interaction>" not in corr, f"块泄漏进下游 prompt：{corr[-200:]!r}"
+
+    # 训练目标一侧：critic 的 response 必须仍带块（否则 token 对齐被破坏）
+    critic_msgs = [m for m in res["messages"] if m.get("role_name") == "critic"]
+    assert critic_msgs, "没抓到 critic 的落库记录"
+    assert "<interaction>" in critic_msgs[0]["response"], \
+        "落库的 response 被剥了块——token_ids/log_probs 会错位"
+
+
+def test_flaw_window_fits_a_realistic_critic_message():
+    """flaw 窗口 80 → 300：v3「critic 说了等于没说」的直接成因。
+
+    实测 critic 真报错时中位 267 字、p75 341 字。80 的窗口只有 4% 能完整送达，
+    而块又固定占 68 字——真正传下去的实质内容约 11 字。这条测试用一段中位长度的
+    批评钉住修复：剥块之后，300 的窗口要能把结论部分带过去。
+    """
+    from envs.blackboard import Blackboard, Message, MessageType
+
+    bb = Blackboard()
+    bb.add_message(Message(0, MessageType.TRACE, ("r", "5")))
+    # 一段 ~250 字的批评，结论在末尾（真实 critic 就是这么写的：先复述再定位）
+    concl = "，所以第二步的 41 应为 42"
+    flaw = ("第一步把条件抄错了：题目给的是 6×7，" + "复述与推导过程" * 31 + concl)
+    assert 250 <= len(flaw) <= 340, f"样例长度 {len(flaw)} 不在实测中位区间"
+    bb.add_message(Message(1, MessageType.FLAW, {"content": flaw}))
+
+    # 核心断言：结论句要真的出现在下游看到的文本里
+    txt = bb.to_text()
+    assert "发现问题" in txt
+    assert concl in txt, "critic 的结论仍被窗口截掉了——信道没修好"
+    # 反向对照：旧的 80 窗口连复述都没说完，结论一定丢
+    assert concl not in flaw[:80]
+
+
+def test_parser_label_tolerance():
+    """半角冒号与英文别名：解析失败在这三处都不是「安全默认」而是静默污染。
+
+    - proposer：抽不到答案会回落「文本里最后一个数字」，`最终答案: 24` 里的
+      `45,045` 会变成 `045` 进投票池，各自占一票稀释多数投票；
+    - verifier：回落 0.5 先验不是中性的，它系统性压制未验证的正确答案。
+    critic 刻意**不给**英文别名：`无错误`/`错误分析` 是一对互补判据，单边加别名
+    会让每条英文 critic 都被判成 flag，假 flag 直接污染 r^critic 与漏斗指标。
+    """
+    from agents.parsing import (critic_found_errors, has_answer_label,
+                                parse_reasoning, parse_score)
+
+    # 半角冒号（SFT 数据里真实出现过）
+    assert parse_reasoning("推理过程：x\n最终答案: 24")[1] == "24"
+    assert has_answer_label("最终答案: 24")
+    assert parse_score("分数: 0.35") == 0.35
+    # 全角冒号
+    assert parse_score("分数：0.35") == 0.35
+    # 英文别名
+    assert parse_reasoning("推理过程：x\nFinal Answer: 24")[1] == "24"
+    assert parse_score("Score: 1.0") == 1.0
+    # 越界仍要夹回 [0,1]
+    assert parse_score("Score: 1.7") == 1.0 and parse_score("分数: -2") == 0.0
+    # 真的没有分数时仍返回 None（不能被别名放宽成「抓任意数字」）
+    assert parse_score("验证说明：第二步可疑，涉及 42 与 6") is None
+    # critic 不认英文——这是刻意的，不是遗漏
+    assert critic_found_errors("Error analysis: step two is wrong") is False
+
+
+def test_correction_prompt_does_not_duplicate_critic_text():
+    """critic 硬触发修正时，黑板的「发现问题」与 initiator_output 是同一段文本。
+
+    窗口从 80 放宽到 300 之后这份重复才显形：同一段批评在一个 prompt 里出现两次，
+    白占 300 字预算（`max_prompt_tokens` ≈ 3008，且黑板文本嵌进每个角色的 prompt）。
+    去重按**内容比对**而非「initiator 是不是 critic」——critic 未标错却主动请求
+    修正时 `flaws[-1]` 是更早的另一条，那份信息是真的、不能扔。
+    """
+    script = {
+        "controller": [
+            "<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>",
+            "<meta-plan>\ndecision: stop\nreason: r\n</meta-plan>",
+        ],
+        "proposer": [
+            "推理过程：x\n最终答案：5\n" + INTER.format(a="request", t="critic"),
+            "推理过程：fix\n最终答案：4\n" + INTER.format(a="none", t="none"),
+        ],
+        "critic": ["错误分析：第二步把 6*7 算成了 41\n"
+                   + INTER.format(a="request", t="proposer")],
+        "verifier": ["分数: 0.9\n验证说明：ok\n" + INTER.format(a="none", t="none")],
+    }
+    eng = FakeEngine(script)
+    _mk_executor(eng, stop_gate=False).run_episodes_batch(["6*7=?"], ["42"])[0]
+
+    corr = [p for role, p in eng.prompts if role == "proposer"][1]
+    assert corr.count("第二步把 6*7 算成了 41") == 1, \
+        f"critic 的意见在修正 prompt 里出现了 {corr.count('第二步把 6*7 算成了 41')} 次"
 
 
 if __name__ == "__main__":

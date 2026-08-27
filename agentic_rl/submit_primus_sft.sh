@@ -111,6 +111,21 @@ wc -l data/sft_train_v2_m1.jsonl data/sft_train_v3_m1.jsonl data/sft_train_v23.j
 # 41 条。但**这一轮仍不动**：M1、重放、max_len 三件事同时改，跑出来的
 # `parse_rate` / `eff` 变化就没法归因给其中任何一件。等这次 SFT + 诊断跑出结果
 # 再单独做。
+#
+# v3.2（第四轮，信道审计之后重测）：跨角色截断改为**带可见标记**（`CLIP_MARK`）
+# 之后，截断率**一点没动**——1024 仍是 44/2864（1.54%），1536 仍是 3（0.10%）。
+# 意料之中：一个标记约十个字符，而这把尺是 chars/2.2 > max_len，十个字符不足以
+# 把任何一条推过线。所以上面那些数与结论继续有效，不需要重写。
+#
+# 顺带得到一个新读数：**148/2864（5.2%）的 turn，其 `user` 里带着截断标记**，
+# 按角色 critic 79 / verifier 65 / controller 3 / proposer 1。critic 与 verifier
+# 占绝对多数，因为它们正是读 `发现问题` 与 `对方内容` 的那两个角色——也就是
+# v3「critic 说了等于没说」发生的位置，5.2% 是那条信道被掐的真实频率。
+# 附带的好处：这 148 条会**教模型认这个标记**（SFT 里就见过带标记的输入），
+# 而不是上线才第一次遇到。
+# 量它用 grep 而不是计数器：`to_text` 每个 turn 被调用多次（controller / critic /
+# verifier / 修正各一次），在函数里计数得到的是调用次数而非事件数；而落盘 prompt
+# 里的标记既能算率，又能指出是哪个 turn。
 python - <<'EOF'
 import json, re, sys
 sys.path.insert(0, ".")

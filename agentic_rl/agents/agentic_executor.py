@@ -15,6 +15,7 @@ from collections import Counter
 
 from agents.grader import math_equal   # re-export：evaluate.py 从此模块导入
 from agents.parsing import (
+    MAX_CHANNEL_CHARS,
     ROLE_NAMES,
     critic_found_errors,
     has_answer_label,
@@ -154,13 +155,19 @@ class AgenticExecutor:
                 usr = f"待验证答案：{last[1]}\n推理：{last[0]}\n当前状态：{bb.to_text()}"
             else:  # proposer 修正
                 sys = PromptTemplates.proposer_system()
-                # 去重：flaw 窗口放宽到 300 后，黑板的「发现问题」与下面
-                # `proposer_correction_user` 的 `initiator_output` 在 critic 硬触发
-                # 路径上是**逐字节相同**的两份拷贝（同一个 `shown`、同样截 300），
-                # 白占 300 字预算还让 prompt 自我重复。这里按内容比对来判定，而不是
-                # 推断"initiator 是不是 critic"——critic 未标错却主动请求修正时
+                # 去重：flaw 窗口放宽到 `MAX_CHANNEL_CHARS` 后，黑板的「发现问题」
+                # 与下面 `proposer_correction_user` 的 `initiator_output` 在 critic
+                # 硬触发路径上是**逐字节相同**的两份拷贝（同一个 `shown`、同样的
+                # 窗口），白占 300 字预算还让 prompt 自我重复。这里按内容比对来判定，
+                # 而不是推断"initiator 是不是 critic"——critic 未标错却主动请求修正时
                 # flaws[-1] 是更早的另一条，那份信息是真的、不能扔。
-                dup = bool(bb.flaws) and bb.flaws[-1]["content"][:300] == init_out[:300]
+                # 用常量而非字面量 300：这个比较**必须**与两处截断同宽。窄了会把
+                # 两份实际相同的拷贝判成不同（去重失效，白付预算），宽了会把两份
+                # 前 300 字相同、后文不同的内容判成同一条（误删真信息）。写成两个
+                # 恰好相等的字面量，等于把这条耦合交给记性——已经栽过五次了。
+                dup = (bool(bb.flaws)
+                       and bb.flaws[-1]["content"][:MAX_CHANNEL_CHARS]
+                       == init_out[:MAX_CHANNEL_CHARS])
                 usr = PromptTemplates.proposer_correction_user(
                     questions[i], ROLE_NAMES.get(initiator, initiator),
                     init_out, bb.to_text(include_flaws=not dup))

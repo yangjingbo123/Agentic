@@ -1,3 +1,6 @@
+from agents.parsing import MAX_CHANNEL_CHARS, clip_text
+
+
 class PromptTemplates:
     """RACA v2 prompt 集。
 
@@ -17,20 +20,27 @@ class PromptTemplates:
        调参问题。这条与交互能否见效无关，属于必须修。
 
     2. **顺带打开一条被挤掉的信道（实测）。** 块长度固定 68 字符（v2+v3 共
-       2030 个 turn 全部如此，min=max=68）。而 `Blackboard.to_text` 里
-       `发现问题：{flaws[-1]['content'][:80]}` 存的是 critic 的**原始输出**，
-       块在开头时这 80 字窗口只剩 12 字装实质内容。分两种情形看（667 个
+       2030 个 turn 全部如此，min=max=68）。而 `Blackboard.to_text` 的
+       `发现问题：` 行当时只给 80 字窗口、且存的是 critic 的**原始输出**（含
+       块），块在开头时这 80 字里只剩 12 字装实质内容。分两种情形看（667 个
        critic turn）：65% 的输出是「错误分析：无错误」这类 8 字短句，窗口本来
-       就不吃紧；但**真正报了错的 234 个 turn 分析长度中位数 254 字，旧布局只
-       送达 11 字，新布局送达 80 字（7.3×）**。这条 `发现问题` 行会进 critic /
-       verifier / 修正 / controller 每一个 prompt——也就是说过去 critic 报的错
-       传到下游基本只剩「有问题」三个字。`request_context` 与
-       `proposer_correction_user` 的 300 字窗口同理由 231 → 254。
-       （更彻底的做法是存黑板前显式剥离块，那样短分析也不会混进块尾；留作后续
-       独立一步，以免与 M1 混淆 `eff` / `flip` 的归因。）
+       就不吃紧；但**真正报了错的 218 个 turn，进信道的那个串（剥块后整段）
+       中位 267 字、p75 341、p90 508**，旧布局只送达 11 字。这条 `发现问题`
+       行会进 critic / verifier / 修正 / controller 每一个 prompt——也就是说
+       过去 critic 报的错传到下游基本只剩「有问题」三个字。
+       （注：曾有一版注释写「234 个 turn 中位 254 字」，两把尺子都量不出这两个
+       数——「仅『错误分析』段」这把尺量得 n=218 中位 262 p90 503，与整段那把
+       差别很小；该串已作废，以本段为准。窗口内真正决定送达量的是**整段**，
+       因为黑板存的就是整段。）
+
+       M1 之后另两步已落地，此处一并记：块在**展示副本**上被显式剥离
+       （`strip_interaction`，`5d4bac7`），窗口由 80 抬到
+       `MAX_CHANNEL_CHARS = 300`（`envs/blackboard.py`）。300 仍有 37%
+       （80/218）被截，故第四轮改为**带可见标记**截断（`clip_text`），
+       让接收方能分辨「说完了」与「被砍了」；继续加大窗口是另一回事。
 
     注：`parse_interaction` 全文搜索块，不依赖位置；但 `parse_reasoning` 的
-    `最终答案：` 正则原先缺 `<` 的 lookahead，已同步修正（见 parsing.py）。
+    `最终答案：` 正则原先缺块开标签的 lookahead，已同步修正（见 parsing.py）。
     SFT 数据的 `system` 字段与本文件逐字节相同，改这里必须同步重新生成，
     否则 SFT 与 RL 的 prompt 会漂移。
     """
@@ -101,20 +111,30 @@ reason: [一句话]
 
     @staticmethod
     def request_context(initiator: str, action: str, reason: str, initiator_output: str):
-        """拼在响应方标准 user prompt 末尾的请求上下文（响应方仍按标准格式输出）。"""
+        """拼在响应方标准 user prompt 末尾的请求上下文（响应方仍按标准格式输出）。
+
+        `对方内容` 走 `clip_text` 而非硬切片：响应方要**基于这段内容**给判断，
+        分不清"对方说完了"和"被砍了"就会对半句话下结论。窗口与黑板 flaw 同源。
+        """
         return (
             f"\n协作者（{initiator}）发起了交互：{action}，理由：{reason}\n"
-            f"对方内容：{initiator_output[:300]}\n"
+            f"对方内容：{clip_text(initiator_output, MAX_CHANNEL_CHARS)}\n"
             f"请按你的标准输出格式回应。"
         )
 
     @staticmethod
     def proposer_correction_user(question: str, initiator: str,
                                  initiator_output: str, blackboard_text: str):
-        """proposer 被要求修正解法时的 user prompt（输出标准 proposer 格式）。"""
+        """proposer 被要求修正解法时的 user prompt（输出标准 proposer 格式）。
+
+        同 `request_context`：被指出的问题若在第 300 字处断掉而不留痕迹，
+        proposer 会把半句批评当成完整意见去改，这是 v3 `flip/corr` 低的一个
+        可疑来源（未证实，但至少先别自己制造这个歧义）。
+        """
         return (
             f"问题：{question}\n"
-            f"你之前的解法被 {initiator} 指出问题：{initiator_output[:300]}\n"
+            f"你之前的解法被 {initiator} 指出问题："
+            f"{clip_text(initiator_output, MAX_CHANNEL_CHARS)}\n"
             f"当前状态：{blackboard_text}\n"
             f"请修正解法，给出完整推理过程与最终答案。"
         )

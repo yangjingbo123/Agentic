@@ -2,6 +2,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from agents.parsing import MAX_CHANNEL_CHARS, clip_text
+
 
 class MessageType(Enum):
     TRACE = "trace"
@@ -77,10 +79,18 @@ class Blackboard:
     # 根本不是 critic 弱，而是它的话在这里被截掉了。
     # 300 是安全的：① prompt 预算 max_prompt_tokens ≈ 3008 token（4096−1024−64），
     # 当前整条 prompt 不到其三分之一；② 与 request_context / correction 的 300
-    # 窗口取同一个数，只留一个量级要记；③ flaw 只取 flaws[-1]，**不随轮数累积**，
-    # 与答案列表不同，不是 v3 step 151 prompt 崩那个增长源。
+    # 窗口取同一个数（现已统一到 `MAX_CHANNEL_CHARS`，只留一个来源），只留一个
+    # 量级要记；③ flaw 只取 flaws[-1]，**不随轮数累积**，与答案列表不同，不是
+    # v3 step 151 prompt 崩那个增长源。
     # 不开更大是因为 p90 已到 508 字，再放宽收益递减而 prompt 是每个角色都付的。
-    _MAX_FLAW_CHARS = 300
+    #
+    # v3.2（第四轮）：**300 仍有 37% 被截（80/218），但这一轮修的不是窗口而是
+    # 「无标记」。** 最长那条 1791 字，proposer 在「发现问题：」里读到的是
+    # `...得到\\` 这样一个断在反斜杠上的句子，而被砍掉的后 120 字里才是 critic
+    # 真正的结论（"这一步是正确的，但学生在后续推导中错误地认为…"）。旧代码不留
+    # 任何痕迹，proposer 只能把半句话当成完整批评去"修正"。改走 `clip_text` 之后
+    # 它至少知道后面还有话——继续加大窗口是另一回事，见 §7.1。
+    _MAX_FLAW_CHARS = MAX_CHANNEL_CHARS
 
     def _answers_for_display(self) -> list[str]:
         """展示层：滤空串（解析失败的占位）+ 限长 + 只留最近 K 个。
@@ -97,7 +107,8 @@ class Blackboard:
             shown = self._answers_for_display()
             lines.append(f"已有{len(self.traces)}个解法，答案：{shown}")
         if self.flaws and include_flaws:
-            lines.append(f"发现问题：{self.flaws[-1]['content'][:self._MAX_FLAW_CHARS]}")
+            lines.append("发现问题："
+                         + clip_text(self.flaws[-1]["content"], self._MAX_FLAW_CHARS))
         if self.scores:
             distinct = [a for a in self.get_distinct_answers() if a]
             if distinct:

@@ -891,9 +891,18 @@ def test_unbounded_text_is_capped():
     _, ok = parse_reasoning("推理过程：x\n最终答案：\\frac{\\pi}{2}")
     assert ok == "\\frac{\\pi}{2}"
 
-    # ②reasoning 缺失时返回整个输出，必须限长
+    # ②reasoning 缺失时返回整个输出，必须限长——且截断必须**可见**。
+    # 标记刻意不占 limit 预算（`text[:limit] + 标记`），所以上界是
+    # limit + len(标记)，而不是 limit。这条断言的形状本身就是那个设计决定：
+    # 「保证送达 limit 个字符正文」不因为加标记而缩水。
+    from agents.parsing import CLIP_MARK
     reasoning, _ = parse_reasoning("没有任何格式的长输出" + "哦" * 5000)
-    assert len(reasoning) <= MAX_REASONING_CHARS
+    assert len(reasoning) <= MAX_REASONING_CHARS + len(CLIP_MARK)
+    assert reasoning.endswith(CLIP_MARK), "跨角色截断必须留下痕迹，否则接收方分不清『说完了』和『被砍了』"
+    assert len(reasoning) - len(CLIP_MARK) == MAX_REASONING_CHARS
+    # 没超限就不该有标记（否则接收方会以为有话被砍、把完整信息当残文对待）
+    short, _ = parse_reasoning("推理过程：短推理\n最终答案：4")
+    assert CLIP_MARK not in short and short == "短推理"
 
     # ③黑板文本：答案数量与单个长度均不随轮数无限增长
     from envs.blackboard import Blackboard, Message, MessageType
@@ -1130,6 +1139,168 @@ def test_flaw_window_fits_a_realistic_critic_message():
     assert concl in txt, "critic 的结论仍被窗口截掉了——信道没修好"
     # 反向对照：旧的 80 窗口连复述都没说完，结论一定丢
     assert concl not in flaw[:80]
+
+
+def test_no_bare_lt_lookahead_in_parsers():
+    """源码级不变量：`parsing.py` 的任何前瞻都不许用**裸 `<`**。
+
+    这一类已经犯到第五例（flaw 窗口 80、块未剥、`parse_reasoning` 的推理前瞻、
+    无标签兜底泄漏、`critic_found_errors` 的错误分析前瞻）。前四例都是被动撞见的，
+    说明靠"下次记得"不行——`<` 在数学文本里是**不等号**，写下 `(?=<...)` 的那一刻
+    看起来完全无害，要到某个 turn 的推理里出现 `若 x < 3` 才会显形，而且不报错，
+    只是悄悄少送 77% 的正文。所以这条不变量必须由一个**会失败的测试**来守。
+
+    判据是"前瞻里的 `<` 后面必须紧跟 `interaction`"。允许 `_INTER_OPEN` 这个
+    常量本身出现（它就是那个开标签），也允许 f-string 里插值它。
+    """
+    import ast
+    import pathlib
+    import re as _re
+
+    src = pathlib.Path(__file__).with_name("agents").joinpath("parsing.py").read_text()
+    tree = ast.parse(src)
+
+    # 只扫**真正的字符串字面量**，不扫原文。第一版按原文 grep，立刻被自己的
+    # 文档绊倒：`parse_reasoning` 的 docstring 里逐字引用了旧的坏正则
+    # （`(?=最终答案[：:]|<|$)`）作为病灶记录。那句引用必须留着——它是这个
+    # 缺陷唯一的现场证据，删了以后没人知道当年错在哪。所以尺子得换：走 AST
+    # 天然排除注释，再把「独立成句的字符串」（即 docstring）剔掉，剩下的就是
+    # 会被 `re` 真正执行的那些串。
+    docstrings = {
+        id(n.value) for n in ast.walk(tree)
+        if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
+        and isinstance(n.value.value, str)
+    }
+    literals = [n.value for n in ast.walk(tree)
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                and id(n) not in docstrings]
+    assert literals, "一个字面量都没扫到——AST 走空了，断言会恒真（假绿）"
+
+    # 前瞻/前视里的字面 `<`：`(?=` / `(?!` 之后到闭括号之前那一段。
+    # f-string 会被拆成若干常量片段（`(?=` 与插值的 `_INTER_OPEN` 分开），
+    # 因此插值写法不会误报；而**写死**的裸 `<` 一定落在同一个片段里，会被抓到。
+    bad = []
+    for lit in literals:
+        for m in _re.finditer(r"\(\?[=!][^)]*", lit):
+            frag = m.group(0)
+            for lt in _re.finditer(r"<", frag):
+                if not frag[lt.start():].startswith("<interaction"):
+                    bad.append(frag)
+    assert not bad, ("前瞻里有裸 `<`，数学不等号会把正文截掉——"
+                     f"请改用 _INTER_OPEN：{bad}")
+
+    # 正向：块开标签确实还在用（防止上面那条被"删掉所有前瞻"这种方式假绿）
+    assert "_INTER_OPEN" in src and 'r"<interaction"' in src
+    # 并且那句病灶记录还在（这条不变量的存在理由本身也得钉住）
+    assert "(?=最终答案[：:]|<|$)" in src, "病灶记录被删了——后人会重新踩一次"
+
+
+def test_critic_flag_is_insensitive_to_angle_brackets():
+    """critic 的 flag 判定不因输出里出现 `<` / `>` 而改变。
+
+    **这条测试不守 `_INTER_OPEN` 那个改动**——说明白很重要，否则它看起来像是。
+    变异测试证过：把 `critic_found_errors` 的前瞻回滚成裸 `<`，本测试照样全绿
+    （长度 ≤4 穷举 11110 串 + 真实 2228 条 critic turn，两版判定 0 处不同）。
+    原因是这个函数只看 `err_text` **空不空**，而 `.+?` 至少吃一个字符、前导空白
+    又被 `\\s*` 吃掉了，所以恒非空；「无错误」也早在第一个分支按整段拦掉了。
+    守那个改动的是 `test_no_bare_lt_lookahead_in_parsers`（源码级不变量）。
+
+    那这条测试能抓什么、不能抓什么，三次变异实测如下（写全是因为一条抓不到
+    任何单点变异的测试很容易被误当成守着什么）：
+
+    - 单变异「前瞻回滚成裸 `<`」：**不响**。理由同上，判定只看空不空。
+      这条由 `test_no_bare_lt_lookahead_in_parsers` 守。
+    - 单变异「`bool(err_text)` 改成 `len(err_text) > 5`」：**也不响**。因为修好
+      的前瞻不再在 `<` 处停，插入尖括号根本不会让 `err_text` 变短。
+    - **两处同时变异：响**（`错误分析：第<二步 ...` 判定翻转）。
+
+    所以它的价值就是这一条**合取**，不多也不少：将来若有人给判定加上任何"看
+    `err_text` 内容或长度"的逻辑，这条测试就成了那条逻辑与前瞻之间的耦合警报——
+    单看任一处都没问题、合起来才出事的那类缺陷，正是这个仓库反复栽的地方。
+    """
+    from agents.parsing import critic_found_errors
+
+    # 插入位置限定在**正文**里。插进 `错误分析` 标签中间（`错<误分析：`）或
+    # 「无错误」中间（`无<错误`）会真的改变这个串的含义——标签没了就不该解析出
+    # 报错段，关键词被劈开就不再是"没错误"。那种情形下判定翻转是**正确行为**，
+    # 不是缺陷。这条测试要钉的是"尖括号出现在 critic 说的话里"这个真实场景。
+    label = "错误分析："
+    cases = [
+        # (正文, 期望判定)：正文里怎么插尖括号都不许改判定
+        ("第二步 2x=-12 应为 x=-6，符号错了", True),
+        ("无错误，各步系数与代入均核对过", False),
+    ]
+    for body, want in cases:
+        base = label + body
+        assert critic_found_errors(base) is want, f"基线就不对：{base!r}"
+        # 「无错误」这个关键词本身也不能被劈开，故 False 那条从它之后开始插
+        safe_from = len(label) + (len("无错误") if not want else 0)
+        for pos in range(safe_from, len(base) + 1):
+            for ch in ("<", ">", "<第二步>"):
+                mutated = base[:pos] + ch + base[pos:]
+                assert critic_found_errors(mutated) is want, \
+                    f"在正文第 {pos} 位插入 {ch!r} 后判定翻转：{mutated!r}"
+
+    # 不等号的真实用法（整句），以及块在末尾时仍要正常截住
+    assert critic_found_errors("错误分析：第三步要求 x < 3，但解里取了 x=5") is True
+    assert critic_found_errors(
+        "错误分析：第二步算错了\n" + INTER.format(a="request", t="proposer")) is True
+    assert critic_found_errors(
+        "错误分析：无错误\n" + INTER.format(a="none", t="none")) is False
+
+
+def test_cross_role_truncation_is_visible():
+    """所有跨角色截断都必须留下 `CLIP_MARK`。
+
+    第四轮复盘的结论：**坏的不是「截断」，是「截断不可见」。** 截断本身必要
+    （prompt 预算有限），致命的是接收方拿到残文后分不清「对方说完了」和「对方
+    还有话被砍了」，于是照常给一个自信的判断——critic 对着断在 `C\\sqrt{` 处的
+    LaTeX 回答"有没有计算错误"，proposer 对着半句批评去"修正"。标记改变的是
+    接收方的**可判定性**：看到它就该说"信息不全"，而不是"这步是错的"。
+
+    覆盖三条信道（三处共用 `MAX_CHANNEL_CHARS`）：黑板 `发现问题`、
+    `request_context` 的 `对方内容`、`proposer_correction_user` 的引述。
+    `parse_reasoning` 的推理上限在 `test_unbounded_text_is_capped` 里钉。
+    """
+    from agents.parsing import CLIP_MARK, MAX_CHANNEL_CHARS, clip_text
+    from envs.blackboard import Blackboard, Message, MessageType
+    from llm.prompt_templates import PromptTemplates
+
+    long = "复述与推导" * 200          # 1000 字，远超窗口
+    short = "第二步把 6*7 算成了 41"    # 远低于窗口
+    assert len(long) > MAX_CHANNEL_CHARS > len(short)
+
+    # ① 单元语义：超限带标记且正文不缩水，未超限一字不改
+    assert clip_text(long, MAX_CHANNEL_CHARS) == long[:MAX_CHANNEL_CHARS] + CLIP_MARK
+    assert clip_text(short, MAX_CHANNEL_CHARS) == short
+
+    # ② 黑板 flaw 窗口
+    bb = Blackboard()
+    bb.add_message(Message(0, MessageType.TRACE, ("r", "5")))
+    bb.add_message(Message(1, MessageType.FLAW, {"content": long}))
+    assert CLIP_MARK in bb.to_text(), "flaw 被截了却没留痕迹"
+
+    bb2 = Blackboard()
+    bb2.add_message(Message(0, MessageType.TRACE, ("r", "5")))
+    bb2.add_message(Message(1, MessageType.FLAW, {"content": short}))
+    assert CLIP_MARK not in bb2.to_text(), \
+        "没超限却带了标记——接收方会把完整信息当残文对待"
+
+    # ③ 两处模板引述
+    ctx = PromptTemplates.request_context("Critic", "request", "请审查", long)
+    assert CLIP_MARK in ctx
+    corr = PromptTemplates.proposer_correction_user("6*7=?", "Critic", long, "尚无信息")
+    assert CLIP_MARK in corr
+    # 未超限时两处都不留标记
+    assert CLIP_MARK not in PromptTemplates.request_context(
+        "Critic", "request", "请审查", short)
+    assert CLIP_MARK not in PromptTemplates.proposer_correction_user(
+        "6*7=?", "Critic", short, "尚无信息")
+
+    # ④ 标记本身要**能被人看懂**，且不能撞上块标签或黑板行首标记
+    #   （它会出现在 prompt 里被模型读到，也会被 grep 用来量截断率）
+    assert "截断" in CLIP_MARK
+    assert "<" not in CLIP_MARK and "当前状态" not in CLIP_MARK
 
 
 def test_parser_label_tolerance():

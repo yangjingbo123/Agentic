@@ -80,6 +80,42 @@ def strip_interaction(text: str, *, trim: bool = True) -> str:
 MAX_ANSWER_CHARS = 64      # 数学答案（含 LaTeX）远不到此长度；超出即视为解析失败
 MAX_REASONING_CHARS = 1500  # 完整推理保留上限（够容纳正常多步解题）
 
+# ── 信道截断的统一出口（v3.2 第四轮） ────────────────────────────────────
+# 本仓库反复栽在同一类病灶上（到这一轮已第五例：flaw 窗口 80、块未剥、reasoning
+# 前瞻裸 `<`、无标签兜底泄漏、`critic_found_errors` 裸 `<`）。复盘后的结论是：
+# **坏的不是「截断」，是「截断不可见」。** 截断本身必要——prompt 预算有限，
+# `_MAX_FLAW_CHARS` / `MAX_REASONING_CHARS` 都得存在。真正致命的是接收方拿到残
+# 文之后**无法分辨「对方说完了」和「对方还有话被砍了」**，于是照常给出一个自信
+# 的判断：critic 对着截在 `C\sqrt{` 处的 LaTeX 回答"有没有计算错误"，proposer
+# 对着半句话去"修正"。错误由此凭空产生，且全链路无人报错。
+#
+# 所以所有面向**另一个角色**的截断都必须走这里，带一个可见标记。这不是防御性
+# 编程：标记改变的是接收方的可判定性——看到标记它就知道该说"信息不全"而不是
+# "这步是错的"。
+#
+# 刻意不加计数器：`to_text` 每个 turn 被调用多次（controller / critic / verifier
+# / 修正各一次），在里面计数得到的是调用次数而非事件数，是个会误导人的读数。
+# 要量截断发生率就 grep 落盘 prompt 里的这个标记——比计数器更好，因为它还能告诉
+# 你是哪个 turn。`agentic_executor.clip_user` 的 `n_prompt_clipped` 是另一回事：
+# 那里每个 prompt 恰好过一次，计数是准的。
+CLIP_MARK = "…（后文已截断）"
+
+# 展示给另一个角色的自由文本窗口。三处共用同一个数（黑板 `发现问题`、
+# `request_context` 的 `对方内容`、`proposer_correction_user` 的引述），只留一个
+# 量级要记。300 的取值理由见 `envs/blackboard.py:_MAX_FLAW_CHARS`。
+MAX_CHANNEL_CHARS = 300
+
+
+def clip_text(text: str, limit: int) -> str:
+    """按字符截断并**留下可见标记**。所有跨角色的文本截断都必须走这里。
+
+    标记不占 `limit` 预算（`text[:limit] + 标记`），因此「保证送达 limit 个字符
+    正文」这条语义不因加标记而缩水；多出的十来个字符对 3008 token 的 prompt
+    预算可以忽略。
+    """
+    return text if len(text) <= limit else text[:limit] + CLIP_MARK
+
+
 # 标签的容错写法。抽成常量是为了让 reasoning 的**前瞻**与 answer 的**匹配**用
 # 同一套字面量——两处写歧了会造成「reasoning 吃掉答案段」这种极难发现的错位。
 _RSN_LABEL = r"推理过程[：:]"
@@ -141,7 +177,12 @@ def parse_reasoning(text: str) -> tuple[str, str]:
             nums = re.findall(r"-?\d+\.?\d*", ans_str)
             ans_str = nums[-1] if nums else ""
     reasoning_str = reasoning.group(1).strip() if reasoning else fallback_src
-    return (reasoning_str[:MAX_REASONING_CHARS], ans_str)
+    # 推理超限**带标记**截断。实测 599 个 proposer turn 中 8 个（1.3%）超 1500，
+    # 最长 1753 字；旧代码在第 1500 个字符处硬切，实测切口落在 LaTeX 中间
+    # （`C\sqrt{`）。这个串正是 `traces[-1][0]` → critic 的 `待审查解法：`，于是
+    # critic 要对一段被截在半个公式处的推导回答"有没有计算错误"——它没有任何
+    # 线索知道后面还有 253 字。标记就是那个线索。
+    return (clip_text(reasoning_str, MAX_REASONING_CHARS), ans_str)
 
 
 def has_answer_label(text: str) -> bool:
@@ -179,12 +220,38 @@ def critic_found_errors(critic_output: str) -> bool:
     critic 输出都判成 flag（假阳性），直接污染 `r^critic` 的四格矩阵与 flag→corr
     漏斗。失败模式在这里是「保守不 flag」（良性），所以宁可失败也不放宽。
     整条英文的 critic turn 改为在 SFT 派生步剔除（`data/prepare_sft.py`）。
+
+    v3.2（第四轮）：前瞻由裸 `<` 改为 `_INTER_OPEN`。这是裸 `<` 病灶的第五例，
+    写法上和 `parse_reasoning` 那条一模一样（当时只扫了 `parse_reasoning`，漏了
+    这里），但**行为后果与那条完全不同，必须说清，否则会误导下一个人**：
+
+    这里改前改后**判定完全等价**，不是"实测没翻转"而是**结构上不可能翻转**。
+    先说证据：长度 ≤4 的字母表穷举 11110 个串、真实 critic turn 2228 条，两版
+    判定不同的**一个都没有**。再说机制，两条缺一不可：① `.+?` 至少吃 1 个字符，
+    而 `\\s*` 已贪婪吃掉前导空白，所以 `err_text` 恒非空——`bool(err_text)` 这个
+    分支永远为真，前瞻停在哪都不影响它；② 输出里任何位置的「无错误」都被**上面
+    第一个分支**在整段上拦掉了，轮不到截断后的 `err_text` 去判。
+    换言之被裸 `<` 截短的只是 `err_text` 的**长度**，而这个函数只看它空不空。
+
+    （这条更正是**变异测试逼出来的**：原先这里写着"有一条可达的假阴性路径——
+    critic 用尖括号做强调时 err_text 被截成空串"。把修复回滚成裸 `<` 之后，
+    专门为这条路径写的
+    `test_critic_flag_survives_angle_bracket_emphasis` 照样通过——一个抓不到
+    自己那个变异的测试，说明被测的那个失败模式根本不存在。先写测试再回滚验证，
+    比"想一想觉得有道理"可靠得多。）
+
+    所以本次改动的理由**只有一条**：留着它，整个仓库就还有一个裸 `<`，
+    `test_no_bare_lt_lookahead_in_parsers` 那条不变量就立不起来。这一类已经
+    犯了五次，靠记性显然不行，得靠一个会失败的测试；而那个测试要能成立，
+    前提是仓库里一个裸 `<` 都不剩。为一条不变量做的一致性改动是正当的，
+    但它**不是 bug 修复**，不该记进"修了几个缺陷"里。
     """
     if "无错误" in critic_output or "无错" in critic_output:
         return False
-    err_match = re.search(r"错误分析[：:]\s*(.+?)(?=<|$)", critic_output, re.S)
+    err_match = re.search(rf"错误分析[：:]\s*(.+?)(?={_INTER_OPEN}|$)", critic_output, re.S)
     if err_match:
         err_text = err_match.group(1).strip()
         return bool(err_text) and "无错误" not in err_text and "无错" not in err_text
     # 无「错误分析」段（响应未按格式）——保守不判 flag
     return False
+

@@ -59,6 +59,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agents.parsing import (  # noqa: E402
+    MAX_CHANNEL_CHARS,
     ROLE_NAMES,
     critic_found_errors,
     parse_interaction,
@@ -143,7 +144,11 @@ def replay_row(row: dict) -> dict:
             init_role, init_out, _a, _t, _r = pending
             # 与 executor 同一个判据：黑板的「发现问题」与 initiator_output 在
             # critic 硬触发路径上是逐字节相同的两份拷贝，去掉一份。
-            dup = bool(bb.flaws) and bb.flaws[-1]["content"][:300] == init_out[:300]
+            # 常量与 executor 共用：这里只要与那边差一个字符，重放出来的 prompt
+            # 就与 RL 侧不同——而这个文件存在的全部意义就是让两者相同。
+            dup = (bool(bb.flaws)
+                   and bb.flaws[-1]["content"][:MAX_CHANNEL_CHARS]
+                   == init_out[:MAX_CHANNEL_CHARS])
             user = PromptTemplates.proposer_correction_user(
                 q, ROLE_NAMES.get(init_role, init_role), init_out,
                 bb.to_text(include_flaws=not dup))

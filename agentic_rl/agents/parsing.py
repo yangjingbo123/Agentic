@@ -85,17 +85,31 @@ MAX_REASONING_CHARS = 1500  # 完整推理保留上限（够容纳正常多步�
 _RSN_LABEL = r"推理过程[：:]"
 _ANS_LABEL = r"(?:最终答案|Final Answer)[：:]"
 
+# 块的开标签。**必须用它，不能用裸 `<`**（v3.2 第三轮修的实测缺陷）。
+# reasoning 的前瞻原先写 `(?=最终答案[：:]|<|$)`，配 `re.S` + 非贪婪 `.+?`，于是
+# 推理在**第一个 `<`** 处就停——而数学里 `<` 是不等号。实测 v2+v3 的 582 个
+# proposer turn 中 32 个（5.5%）中招，中位丢掉 77% 的推理（411 字 → 83 字），
+# 最坏 316 字只剩 10 字（`首先解第一段：若 x`）。这段残文正是
+# `traces[-1][0]`，会原样进 critic 的 `待审查解法：` 与 verifier 的 `推理：`——
+# 也就是说 critic 有 5.5% 的概率在**审查一个被截在第一个不等号处的片段**，还要
+# 回答"有没有计算错误"。这与 flaw 窗口 80 是同一类病灶（静默的信道截断），且
+# 自 v2（`524ddfa`）就在，与 M1 无关。
+# 换成块的开标签后语义才是原本想表达的那个，且数学文本不可能包含它。
+_INTER_OPEN = r"<interaction"
+
 
 def parse_reasoning(text: str) -> tuple[str, str]:
     """proposer 输出 → (推理过程, 最终答案)。两路返回值均有硬上限。
 
-    v3.2（M1）：`最终答案：` 的正则加了 `(?=<|\\n|$)` 前瞻。M1 把
+    v3.2（M1）：`最终答案：` 的正则加了 `(?=<interaction|\\n|$)` 前瞻。M1 把
     `<interaction>` 块从开头移到了**答案之后**，若模型把块写在同一行
     （`最终答案：4<interaction>...`），原来的 `(.+)` 会把块吃进答案——长度常
     不足 64 字符，于是这个带标签的垃圾串会被当成合法答案进投票池，各自占一票。
-    三个分支缺一不可：`\\n` 覆盖块换行写（最常见），`<` 覆盖同行写，`$` 覆盖
-    答案就是输出末尾。注意光写 `$` 不够：未开 re.M 时 `$` 只匹配串尾，
-    非贪婪的 `.+?` 又跨不过换行，会导致整个匹配失败。
+    三个分支缺一不可：`\\n` 覆盖块换行写（最常见），`<interaction` 覆盖同行写，
+    `$` 覆盖答案就是输出末尾。注意光写 `$` 不够：未开 re.M 时 `$` 只匹配串尾，
+    非贪婪的 `.+?` 又跨不过换行，会导致整个匹配失败。前瞻用块的**开标签**而
+    非裸 `<`，理由见 `_INTER_OPEN` 的注释（裸 `<` 会撞上不等号，实测截掉 5.5%
+    的 proposer 推理）。
 
     v3.2（第二轮）：标签容错扩到 **半角冒号 + 英文别名**。这不是防御性编程，
     是修实测缺陷——SFT 数据里就有 `最终答案: 24`（半角）这种写法，原正则只认
@@ -105,10 +119,19 @@ def parse_reasoning(text: str) -> tuple[str, str]:
     （污染），而推理解析失败 → 整段输出当推理（仅冗长，无害），按同一条原则
     只在污染侧放宽。`critic_found_errors` 刻意不加英文别名，理由见该函数。
     """
-    reasoning = re.search(rf"{_RSN_LABEL}(.+?)(?={_ANS_LABEL}|<|$)", text, re.S)
-    answer = re.search(rf"{_ANS_LABEL}(.+?)(?=<|\n|$)", text)
+    reasoning = re.search(rf"{_RSN_LABEL}(.+?)(?={_ANS_LABEL}|{_INTER_OPEN}|$)", text, re.S)
+    answer = re.search(rf"{_ANS_LABEL}(.+?)(?={_INTER_OPEN}|\n|$)", text)
+    # 兜底路径专用的无块副本。前瞻只在**标签存在**时挡住块；标签缺失时旧代码
+    # 直接 `return text`，块就跟着整段输出被当成推理返回，而这个串正是
+    # `traces[-1][0]`——会原样出现在 critic 的 `待审查解法：` 与 verifier 的
+    # `推理：` 里。实测 SFT 数据 599 个 proposer turn 中 17 个（2.8%）如此；运行
+    # 时只会更多，因为 v3 的 `parse_rate` 一度掉到 0.80，掉的正是标签。
+    # 与前瞻是互补而非重复：前瞻管「有标签的正常输出」，这里管「无标签的兜底」，
+    # 两条路的失效条件不同。先 `strip_interaction` 剥规范块，再按开标签截一刀，
+    # 是为了连**没写闭标签**的残块一起挡掉（那种 `_INTER_BLOCK` 匹配不上）。
+    fallback_src = re.split(_INTER_OPEN, strip_interaction(text), maxsplit=1)[0]
     if not answer:
-        nums = re.findall(r"-?\d+\.?\d*", text)
+        nums = re.findall(r"-?\d+\.?\d*", fallback_src)
         ans_str = nums[-1] if nums else ""
     else:
         ans_str = answer.group(1).strip()
@@ -117,7 +140,7 @@ def parse_reasoning(text: str) -> tuple[str, str]:
         if len(ans_str) > MAX_ANSWER_CHARS:
             nums = re.findall(r"-?\d+\.?\d*", ans_str)
             ans_str = nums[-1] if nums else ""
-    reasoning_str = reasoning.group(1).strip() if reasoning else text
+    reasoning_str = reasoning.group(1).strip() if reasoning else fallback_src
     return (reasoning_str[:MAX_REASONING_CHARS], ans_str)
 
 

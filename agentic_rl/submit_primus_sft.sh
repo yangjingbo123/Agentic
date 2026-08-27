@@ -100,6 +100,17 @@ wc -l data/sft_train_v2_m1.jsonl data/sft_train_v3_m1.jsonl data/sft_train_v23.j
 #   ③ 更干净的做法是把超长 turn 整条剔除（截断样本无论砍哪头都在教「不输出
 #      EOS」），但那是与 M1 无关的数据卫生改动，混进来会污染 M1 的归因。
 # → 留作后续独立一步：剔除超长 turn，或把 max_len 抬到 1536 后重测。
+#
+# v3.2（加了 v2 prompt 重放之后重测）：上面那 34 是重放前的数。重放把 v2 的
+# `user` 从一句手写摘要换成结构化黑板转储（critic/verifier 还要带 300 字的
+# `对方内容`），prompt 变长，于是截断跟着涨：
+#   截断 turn：34 → 44（1.17% → 1.54%，仍在 2% 阈内）
+#   分布：proposer 28 / verifier 7 / critic 6 / controller 3
+#   同一把尺下把 max_len 抬到 1536：只剩 3 条（0.10%）
+# 也就是说「抬 max_len」这条待办的性价比比之前更清楚了——一个数字换掉 44 里的
+# 41 条。但**这一轮仍不动**：M1、重放、max_len 三件事同时改，跑出来的
+# `parse_rate` / `eff` 变化就没法归因给其中任何一件。等这次 SFT + 诊断跑出结果
+# 再单独做。
 python - <<'EOF'
 import json, re, sys
 sys.path.insert(0, ".")

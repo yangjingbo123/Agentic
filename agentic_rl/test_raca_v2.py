@@ -123,6 +123,72 @@ def test_parsers_survive_m1_trailing_interaction_block():
     assert parse_interaction(vt)[:2] == ("request", "critic")
 
 
+def test_reasoning_lookahead_is_block_tag_not_bare_lt():
+    """推理的前瞻必须是块的开标签 `<interaction`，不能是裸 `<`。
+
+    裸 `<` 配 `re.S` + 非贪婪 `.+?` 会让推理停在**第一个 `<`**——而数学里 `<`
+    是不等号。实测 v2+v3 的 599 个 proposer turn 中 32 个（5.3%）中招，中位只
+    保留 24% 的推理，最坏 316 字剩 10 字（就是下面这条的形状：分段函数的
+    `若 x < -2`）。这段残文正是 `traces[-1][0]`，会原样进 critic 的
+    `待审查解法：` 与 verifier 的 `推理：`，也就是让 critic 去审查一个被截在
+    第一个不等号处的片段还要回答"有没有计算错误"。与 flaw 窗口 80 同类
+    （静默信道截断），自 v2 就在，与 M1 无关。
+    """
+    from agents.parsing import parse_reasoning
+
+    blk = "<interaction>\naction: none\ntarget: none\nreason: 有把握\n</interaction>"
+    resp = (
+        "推理过程：\n"
+        "首先解第一段：若 x < -2，令 2x+7 = -5，得 x = -6，满足定义域。\n"
+        "然后解第二段：若 x ≥ -2，令 -x^2 - x + 1 = -5，得 x = -3 或 x = 2，\n"
+        "其中 x = -3 不满足 x ≥ -2 舍去。\n"
+        "所以两解为 -6 与 2，其和为 -4。\n"
+        "最终答案：-4\n" + blk
+    )
+    rsn, ans = parse_reasoning(resp)
+    assert ans == "-4"
+    # 不等号后面的内容一个字都不能丢：整条推理必须完整保留
+    assert rsn.endswith("其和为 -4。"), f"推理被不等号截断：{rsn!r}"
+    assert "x ≥ -2" in rsn and "因式" not in rsn  # 内容完整，且没越界吃别的
+    # 块仍然被排除在推理之外（前瞻仍在起作用，不是简单删掉了分支）
+    assert "<interaction>" not in rsn and "action:" not in rsn
+
+    # 答案标签之后出现不等号时也不能被误截
+    assert parse_reasoning(f"推理过程：x\n最终答案：x < 3\n{blk}")[1] == "x < 3"
+
+
+def test_reasoning_fallback_never_leaks_interaction_block():
+    """缺「推理过程：」标签时的兜底路径也不能把块带出来。
+
+    前瞻只在**标签存在**时挡住块；标签缺失时旧代码直接 `return text`，块就跟着
+    整段输出被当成推理返回。而这个串正是 `traces[-1][0]`——会原样进 critic 的
+    `待审查解法：` 与 verifier 的 `推理：`，白占 68 字符窗口，还教 critic 去审查
+    一段带着协议标签的文本。实测 SFT 数据 599 个 proposer turn 中 17 个（2.8%）
+    如此；运行时只会更多，因为 v3 的 `parse_rate` 一度掉到 0.80，掉的正是标签。
+
+    这条不是审出来的，是 `prepare_sft.py` 里「重放后 user 剥块必须是空操作」那句
+    断言炸出来的——所以那种"本该是空操作"的断言值得多写。
+    """
+    from agents.parsing import parse_reasoning
+
+    blk = ("<interaction>\naction: request\ntarget: critic\n"
+           "reason: 请复核代数\n</interaction>")
+    # 真实数据里的形态：整条英文，没有中文标签
+    eng = f"Reasoning:\nWe have |a+b|^2 = 4, so the answer is 4.\n{blk}"
+    rsn, ans = parse_reasoning(eng)
+    assert "<interaction>" not in rsn and "action:" not in rsn, \
+        f"块从兜底路径漏进推理：{rsn!r}"
+    assert rsn.strip().endswith("the answer is 4."), rsn
+    assert "interaction" not in ans
+
+    # 残块（漏了闭标签）：`strip_interaction` 的正则匹配不上，所以还要按开标签
+    # 截一刀，否则这一路照样漏
+    broken = "Reasoning:\nthe answer is 4.\n<interaction>\naction: request"
+    rsn2, _ = parse_reasoning(broken)
+    assert "<interaction" not in rsn2 and "action:" not in rsn2, \
+        f"残块从兜底路径漏进推理：{rsn2!r}"
+
+
 # ── 奖励矩阵 ─────────────────────────────────────────────────────────────────
 
 def test_r_int_effective_help():
@@ -1122,6 +1188,163 @@ def test_correction_prompt_does_not_duplicate_critic_text():
     corr = [p for role, p in eng.prompts if role == "proposer"][1]
     assert corr.count("第二步把 6*7 算成了 41") == 1, \
         f"critic 的意见在修正 prompt 里出现了 {corr.count('第二步把 6*7 算成了 41')} 次"
+
+
+def test_replay_rebuilds_v2_prompts_into_rl_shape():
+    """v2 的手写 `user` → RL 形状（`response` 一字不动）。
+
+    v2 那批 SFT 数据连 `user` 一起是编出来的：模型被教着读一句人话摘要，而 RL
+    给的是 `Blackboard.to_text()` 的结构化转储。实测 v2 的 1765 个 turn 里只有 5
+    个含 `当前状态：`，其中 884 条 controller turn **全部**在 v2——也就是
+    controller 一次都没在带黑板的 prompt 上被 SFT 过。
+    """
+    from data.prepare_sft import reorder_response
+    from data.replay_v2_prompts import needs_replay, replay_row
+
+    blk_req = ("<interaction>\naction: request\ntarget: critic\n"
+               "reason: 请审查\n</interaction>")
+    blk_none = ("<interaction>\naction: none\ntarget: none\n"
+                "reason: 有把握\n</interaction>")
+    row = {
+        "question": "1+1=?", "answer": "2",
+        "turns": [
+            {"role_name": "controller", "system": "", "user": "现在开始解题。",
+             "response": "<meta-plan>\ndecision: continue\nreason: 还没有解法\n"
+                         "</meta-plan>"},
+            {"role_name": "proposer", "system": "", "user": "请解这道题。",
+             "response": f"{blk_req}\n推理过程：算错了，1+1=3\n最终答案：3"},
+            {"role_name": "critic", "system": "",
+             "user": "Proposer 给出答案 3，请审查。",
+             "response": f"{blk_none}\n错误分析：1+1 应为 2，不是 3"},
+            {"role_name": "proposer", "system": "",
+             "user": "Critic 指出错误，请修正。",
+             "response": f"{blk_none}\n推理过程：改回 1+1=2\n最终答案：2"},
+        ],
+    }
+    assert needs_replay(row) is True
+    orig_resp = [t["response"] for t in row["turns"]]
+
+    for t in row["turns"]:                      # 阶段一：M1 重排（重放的前置）
+        t["response"] = reorder_response(t["response"])[0]
+    reordered = [t["response"] for t in row["turns"]]
+    replay_row(row)
+
+    # response 不能被重放动过（它是训练目标，与 token_ids 逐位对齐）
+    assert [t["response"] for t in row["turns"]] == reordered
+    # 块确实只是搬了位置，实质内容一字不改
+    for old, new in zip(orig_resp, reordered):
+        assert sorted(old) == sorted(new)
+
+    users = [t["user"] for t in row["turns"]]
+    assert all("当前状态：" in u for u in users)
+    assert all("<interaction>" not in u for u in users)
+
+    # controller 第一轮：黑板空
+    assert users[0] == "问题：1+1=?\n当前状态：尚无信息"
+    # proposer primary：同样是空黑板（flaw_in_primary=False 时无 flaw 段）
+    assert users[1] == "问题：1+1=?\n当前状态：尚无信息"
+
+    # critic：字面量是从 agentic_executor.py 的 responder_prompt 抄下来的。
+    # 这里写死是有意的——重放器单方面改了字面量就会在这里炸。反方向（executor
+    # 改了而重放没跟）挡不住，因为 executor 的 prompt 是内联 f-string，无法调用。
+    assert users[2] == (
+        "待审查解法：算错了，1+1=3\n答案：3\n"
+        "当前状态：已有1个解法，答案：['3']\n"
+        "最近交互：proposer→critic（request）\n"
+        "协作者（Proposer）发起了交互：request，理由：请审查\n"
+        "对方内容：推理过程：算错了，1+1=3\n最终答案：3\n"
+        "请按你的标准输出格式回应。")
+
+    # proposer 修正轮：点名 Critic，且黑板的「发现问题」被去重（同一段话已经
+    # 在「你之前的解法被 Critic 指出问题：」里逐字引过了，再来一份纯占窗口）
+    assert "你之前的解法被 Critic 指出问题：错误分析：1+1 应为 2" in users[3]
+    assert users[3].count("1+1 应为 2") == 1, f"flaw 被重复塞了两份：{users[3]!r}"
+
+    # 重放完就是 RL 形状了：再判一次不该还要重放（幂等）
+    assert needs_replay(row) is False
+
+
+def test_replay_skips_rows_already_in_rl_shape():
+    """v3 那 1149 行本来就是按模板生成的，不能被碰。"""
+    from data.replay_v2_prompts import needs_replay
+
+    row = {"question": "2+2=?", "answer": "4", "turns": [
+        {"role_name": "proposer", "system": "", "user": "问题：2+2=?\n当前状态：尚无信息",
+         "response": "推理过程：2+2=4\n最终答案：4"}]}
+    assert needs_replay(row) is False
+
+
+def test_replay_refuses_to_invent_correction_context():
+    """修正轮没有发起方 → 抛 Unreplayable 整行剔除，绝不凭空编一句。
+
+    编出来就又回到 v2 的病：SFT 教模型在一句自造的上下文下作答。
+    """
+    from data.replay_v2_prompts import Unreplayable, replay_row
+
+    row = {"question": "1+1=?", "answer": "2", "turns": [
+        # proposer 声明 none → 后面那个 proposer 修正轮在 RL 里不可能发生
+        {"role_name": "proposer", "system": "", "user": "手写摘要",
+         "response": "推理过程：1+1=3\n最终答案：3\n<interaction>\naction: none\n"
+                     "target: none\nreason: 有把握\n</interaction>"},
+        {"role_name": "proposer", "system": "", "user": "手写摘要",
+         "response": "推理过程：改成 2\n最终答案：2"},
+    ]}
+    try:
+        replay_row(row)
+    except Unreplayable as e:
+        assert "缺发起方上下文" in str(e)
+    else:
+        raise AssertionError("修正轮缺发起方时必须抛 Unreplayable")
+
+
+def test_prepare_sft_replays_before_filtering_turns():
+    """派生链的阶段顺序：重放必须在剔除**之前**。
+
+    这是最容易写错、且错了不会报错的一处。若先剔 turn 再重放，被剔掉那个 turn
+    的产出就不会进黑板，后续 turn 看到的状态与 RL 真实呈现的不一致——等于用一份
+    自造的状态去教模型。
+
+    造法：中间放一条**英文打分**的 verifier turn。`keep_turn` 会剔掉它（判据是
+    严格中文 `分数：`，因为 SFT 的职责就是教中文格式），但运行时 `parse_score`
+    认得 `Score:`（宽容用于兜底），所以 RL 里这一分**确实上了黑板**。于是下一条
+    controller 的 prompt 里必须有「最高置信答案」那一行——那行只可能来自这条被
+    剔掉的 turn。顺序写反就没有这行。
+    """
+    import json
+    import os
+    import tempfile
+
+    from data.prepare_sft import convert, verify
+
+    row = {"question": "1+1=?", "answer": "2", "turns": [
+        {"role_name": "proposer", "system": "", "user": "手写摘要",
+         "response": "推理过程：1+1=2\n最终答案：2\n<interaction>\naction: request\n"
+                     "target: verifier\nreason: 请验证\n</interaction>"},
+        # 英文打分：SFT 判据剔除，运行时解析器认得 → 分数仍进黑板
+        {"role_name": "verifier", "system": "", "user": "手写摘要",
+         "response": "Score: 0.9\nVerification: looks right"},
+        {"role_name": "controller", "system": "", "user": "手写摘要",
+         "response": "<meta-plan>\ndecision: stop\nreason: 已有验证分数\n</meta-plan>"},
+    ]}
+    d = tempfile.mkdtemp()
+    p_in = os.path.join(d, "in.jsonl")
+    p_out = os.path.join(d, "out.jsonl")
+    with open(p_in, "w", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    st = convert(p_in, p_out)
+    assert st["rows_replayed"] == 1 and st["dropped"] == 1, st
+    verify(p_in, p_out)                       # 独立重推，逐字节对齐
+
+    out = [json.loads(x) for x in open(p_out, encoding="utf-8") if x.strip()]
+    assert len(out) == 1
+    kept = out[0]["turns"]
+    assert [t["role_name"] for t in kept] == ["proposer", "controller"]
+    ctrl_user = kept[1]["user"]
+    assert "最高置信答案：2（分数0.90）" in ctrl_user, (
+        f"被剔掉的 verifier 那一分没进黑板——重放跑在剔除之后了？\n{ctrl_user!r}")
+    # 顺带确认 verifier 的自发请求也留在了黑板上
+    assert "最近交互：proposer→verifier（request）" in ctrl_user
 
 
 if __name__ == "__main__":

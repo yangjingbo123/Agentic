@@ -1901,20 +1901,82 @@ def test_parse_flags_are_wired_from_source_not_aliased():
         assert f'"{key}":' in src, f"{key} 没进 round record，指标会永远读成 0.0"
 
 
+class FakeQwen3:
+    """按 Qwen3 模板的三个关键分支复刻（供模板探针的两条测试共用）。
+
+    `inject_gen`  = `add_generation_prompt=True` 且 `enable_thinking=False`
+                    时是否注入空 think 块（真实 Qwen3 会注入）。
+    `inject_full` = 末条 assistant 消息是否也带上空 think 块（真实 Qwen3 的
+                    `loop.last` 分支会带）。
+    `full_flag_sensitive` = 上面那个块**是否也受 `enable_thinking=False` 影响**。
+                    这一维是 08-28 才加的，专为探针的第 4 种渲染
+                    （`sft_full_ef` = `train_sft.py:37` + `enable_thinking=False`）：
+                    若不加这一维，`inject_full` 与 `enable_thinking` 无关 ⇒
+                    `sft_full_ef` 永远等于 `sft_full` ⇒ `both_flag_ok` 永远等于
+                    `only_38_ok`，"两行都补会打破前缀不变量"那条路径一次都走不到，
+                    等于给 #25 的决策加了段没测过的代码。
+    """
+
+    def __init__(self, inject_gen, inject_full, full_flag_sensitive=False):
+        self.inject_gen = inject_gen
+        self.inject_full = inject_full
+        self.full_flag_sensitive = full_flag_sensitive
+
+    def apply_chat_template(self, messages, tokenize=False,
+                           add_generation_prompt=False, enable_thinking=None):
+        s = ""
+        for m in messages:
+            body = m["content"]
+            suppressed = self.full_flag_sensitive and enable_thinking is False
+            if m["role"] == "assistant" and self.inject_full and not suppressed:
+                body = "<think>\n\n</think>\n\n" + body
+            s += f"<|im_start|>{m['role']}\n{body}<|im_end|>\n"
+        if add_generation_prompt:
+            s += "<|im_start|>assistant\n"
+            if self.inject_gen and enable_thinking is False:
+                s += "<think>\n\n</think>\n\n"
+        return s
+
+    # 按字符当 token（与 FakeTokenizer 同一套约定）
+    def encode(self, text, add_special_tokens=False):
+        return list(text)
+
+    def decode(self, ids):
+        return "".join(ids)
+
+
+# 探针要吃一个真实形状的 turn（M1 之后 <interaction> 在尾部），两条测试共用一份，
+# 免得各自维护一份、哪天形状漂了只改一处。
+_PROBE_TURN = {
+    "role_name": "proposer",
+    "system": "你是解题者",
+    "user": "问题：1+1\n当前状态：尚无信息",
+    "response": "推理过程：显然\n最终答案：2\n<interaction>none</interaction>",
+}
+
+
 def test_sft_template_probe_separates_the_three_think_block_outcomes():
     """`check_sft_template.probe_template` 必须能分清三种结局，不能只会说"不对齐"。
 
-    背景：全仓 6 处 `apply_chat_template`，5 处显式传 `enable_thinking=False`
-    （executor / grpo_trainer / verify_sft_format / measure_channels /
-    generate_sft_v3），只有真正训练的那一处 `train_sft.py:37-38` 两行都不传。
+    背景：AST 普查 19 处 `apply_chat_template`，9 处显式传
+    `enable_thinking=False`（**口径：遍历全仓 .py 但排除 test_*.py**；含测试文件
+    是 21 / 9 / 12，多出来的两处是本文件给假 tokenizer 的调用，与本议题无关。这个
+    范围要跟 `check_sft_template.py` 模块 docstring A 段写的一致，否则两边数字对
+    不上，下一个读者会以为其中一处过期），其中 5 处在真推理/数据链路上
+    （executor:106 / grpo_trainer:237 / verify_sft_format:84 / measure_channels:96
+    / generate_sft_v3:111），另 4 处是量具自身。10 处没传的里面只有真正训练的那处
+    `train_sft.py:37-38` 是活着的缺口（其余是本脚本的探针臂和已废弃的诊断脚本）。
     这处不对称的**后果**取决于 Qwen3 模板怎么渲染末条 assistant 消息，而那要有
     tokenizer 才量得出来，本地开发机没有 —— 所以探针本身必须先被证明是准的，
     否则集群上那一行读数没人敢信。
 
     三种结局的后果差很远，混成一句"不对齐"等于没测：
       ① aligned                          —— 两处渲染一致，这处不对称无后果
-      ② think_block_in_supervised_region —— 推理 prompt 仍是 SFT 序列的前缀，
-         但空 think 块落在了 labels != -100 那段里：SFT 在教模型再吐一个块
+      ② think_block_in_supervised_region —— 推理 prompt 仍是 SFT 序列的**逐 token
+         前缀**，空 think 块落在了 labels != -100 那段里。注意后果**不是**"SFT 教
+         模型再吐一个块"（那句话是 08-27 写错的，`prefix_ok=True` 就否掉了它：块
+         在两侧出现的位置相同，推理时生成从块之后起，而那个位置被直接监督过）。
+         真实后果只有错位监督 delta 个 token + loss 平均被稀释，RL 侧安全。
       ③ diverged                         —— 推理喂进去的前缀 SFT 从未见过
     """
     import io
@@ -1922,42 +1984,7 @@ def test_sft_template_probe_separates_the_three_think_block_outcomes():
 
     from check_sft_template import probe_template
 
-    class FakeQwen3:
-        """按 Qwen3 模板的两个关键分支复刻。
-
-        `inject_gen`  = `add_generation_prompt=True` 且 `enable_thinking=False`
-                        时是否注入空 think 块（真实 Qwen3 会注入）。
-        `inject_full` = 末条 assistant 消息是否也带上空 think 块（真实 Qwen3 的
-                        `loop.last` 分支会带）。
-        """
-
-        def __init__(self, inject_gen, inject_full):
-            self.inject_gen = inject_gen
-            self.inject_full = inject_full
-
-        def apply_chat_template(self, messages, tokenize=False,
-                               add_generation_prompt=False, enable_thinking=None):
-            s = ""
-            for m in messages:
-                body = m["content"]
-                if m["role"] == "assistant" and self.inject_full:
-                    body = "<think>\n\n</think>\n\n" + body
-                s += f"<|im_start|>{m['role']}\n{body}<|im_end|>\n"
-            if add_generation_prompt:
-                s += "<|im_start|>assistant\n"
-                if self.inject_gen and enable_thinking is False:
-                    s += "<think>\n\n</think>\n\n"
-            return s
-
-        # 按字符当 token（与 FakeTokenizer 同一套约定）
-        def encode(self, text, add_special_tokens=False):
-            return list(text)
-
-        def decode(self, ids):
-            return "".join(ids)
-
-    turn = {"role_name": "proposer", "system": "你是解题者", "user": "问题：1+1\n当前状态：尚无信息",
-            "response": "推理过程：显然\n最终答案：2\n<interaction>none</interaction>"}
+    turn = _PROBE_TURN
 
     cases = {
         # 生成侧不注入 ⇒ 两处 prompt 逐字节相同
@@ -2002,6 +2029,78 @@ def test_sft_template_probe_separates_the_three_think_block_outcomes():
     with redirect_stdout(buf):
         res = probe_template(cases["diverged"], turn)
     assert not res["prefix_ok"] and not res["same_prompt"], res
+
+
+def test_sft_template_probe_tells_apart_the_two_ways_to_fix_train_sft():
+    """第 4 种渲染必须能分清「只补 :38」和「两行都补」的后果，#25 要照它决定改哪行。
+
+    为什么需要这条：`train_sft.py:37-38` 两行都没传 `enable_thinking`。直觉上"两行
+    都补"最整齐，但 Qwen3 的 `loop.last` 分支**可能也受这个参数影响**——若是，补完
+    `:37` 后 `sft_full` 就不再含空 think 块，而推理侧的 `rl_prompt` 仍含（executor
+    那处一直传 `enable_thinking=False`），于是 `prefix_ok` 会从 True 翻成 False：
+    等于把现在这个无害的错位换成一次**真的走散**。本地无 tokenizer 量不出来，所以
+    探针把两种补法的前缀不变量都算出来，让 #25 照读数改而不是照猜改。
+
+    三种结局，按 (full_flag_matters, both_flag_ok) 区分，必须互不相同：
+      A (F, T) —— :37 传不传都一样渲染 ⇒ 只补 :38 即可，补 :37 也无害
+      B (T, F) —— **只能补 :38** ⇒ 两行都补会打破前缀不变量（最要紧的一档）
+      C (T, T) —— 两种补法都保住前缀 ⇒ 可自由选
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    from check_sft_template import probe_template
+
+    turn = _PROBE_TURN
+    cases = {
+        # A：末条 assistant 的块不受 enable_thinking 影响（旧的两维假 tokenizer 就是这档）
+        "A": (FakeQwen3(inject_gen=True, inject_full=True, full_flag_sensitive=False),
+              False, True, "think_block_in_supervised_region", "加不加都一样"),
+        # B：块受影响 ⇒ 补 :37 会把它从 sft_full 里拿掉，而 rl_prompt 仍带 ⇒ 前缀断
+        "B": (FakeQwen3(inject_gen=True, inject_full=True, full_flag_sensitive=True),
+              True, False, "think_block_in_supervised_region", "只能补 :38"),
+        # C：生成侧本来就不注入 ⇒ rl_prompt 不含块，拿掉 sft_full 的块反而仍是前缀
+        "C": (FakeQwen3(inject_gen=False, inject_full=True, full_flag_sensitive=True),
+              True, True, "aligned", "都保住前缀"),
+    }
+
+    seen = {}
+    for name, (tok, want_matters, want_both, want_verdict, want_phrase) in cases.items():
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            res = probe_template(tok, turn)
+        out = buf.getvalue()
+        assert res["full_flag_matters"] is want_matters, \
+            f"{name}: full_flag_matters={res['full_flag_matters']}，期望 {want_matters}"
+        assert res["both_flag_ok"] is want_both, \
+            f"{name}: both_flag_ok={res['both_flag_ok']}，期望 {want_both}"
+        assert res["verdict"] == want_verdict, f"{name}: verdict={res['verdict']}"
+        # 只算对不打对，等于集群上什么都没留下
+        assert want_phrase in out, f"{name}: 人读的那一行里没有 {want_phrase!r}\n{out}"
+        # only_38_ok 就是现状的 prefix_ok，别让谁悄悄把它重定义成别的东西
+        assert res["only_38_ok"] is res["prefix_ok"], name
+        seen[name] = (res["full_flag_matters"], res["both_flag_ok"])
+
+    # 三档的读数组合必须互不相同，否则上面的断言可以被一个恒定返回值同时满足
+    assert len(set(seen.values())) == 3, seen
+
+    # B 这一档是唯一会拦住"两行都补"的，它必须**不给**修后监督区（前缀都不成立了，
+    # 那个切片没有意义），而 A/C 必须给，且给出来的是 response 而不是 think 块——
+    # 这正是修法要达成的效果：把块挪出监督区。
+    for name in ("A", "C"):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            res = probe_template(cases[name][0], turn)
+        assert res["supervised_ef"] is not None, name
+        assert res["supervised_ef"].startswith("推理过程："), \
+            f"{name}: 修后监督区没有从 response 起头：{res['supervised_ef'][:40]!r}"
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        res = probe_template(cases["B"][0], turn)
+    assert res["supervised_ef"] is None, \
+        f"B 档前缀不成立，不该给出修后监督区：{res['supervised_ef']!r}"
+    # 而且 B 档现状的监督区确实是从块开始的（否则这一档的叙述就是错的）
+    assert res["supervised"].startswith("<think>"), res["supervised"][:40]
 
 
 def test_sft_template_probe_pins_the_train_sft_call_shape():
@@ -2071,6 +2170,190 @@ def test_sft_template_probe_pins_the_train_sft_call_shape():
             assert raised == 2, f"{label} 漂了却没有 exit 2（拿到 {raised}）"
         finally:
             tmp2.unlink()
+
+
+def test_sft_template_census_splits_over_limit_three_ways():
+    """B 段普查新加的三项输出必须真的算对，不能只在集群上才第一次跑到。
+
+    三分法的后果差很远，混在一起等于没测（`train_sft.py:42` + `:96`）：
+      超限   —— full > max_len，被 `[:max_length]` 砍掉尾巴
+      零梯度 —— prompt 自己就 >= max_len ⇒ labels 全 -100 ⇒ `response_mask.sum()
+                == 0` ⇒ 整条 turn 一点梯度都不产生，且**日志里不留痕**
+      砍尾   —— 超限里除掉零梯度的那些，仍有梯度，只是丢尾巴；M1 把
+                `<interaction>` 块搬到了尾部，所以每一条砍尾都等于一条"交互决策
+                没被监督"的样本
+    另外钉监督区长度（full − prompt）：它是 A 段那 delta 个错位 token 的分母，
+    按角色打是因为 controller 只输出一行 decision、监督区最短，稀释比例的上界由
+    它决定。这些都是本轮新加的打印，此前 `census_truncation` 一条测试都没有。
+    """
+    import io
+    import json
+    import os
+    import tempfile
+    from contextlib import redirect_stdout
+
+    from check_sft_template import census_truncation
+
+    tok = FakeQwen3(inject_gen=False, inject_full=False)
+
+    def mk(role, s, u, r):
+        return {"role_name": role, "system": "s" * s,
+                "user": "u" * u, "response": "r" * r}
+
+    # 假 tokenizer 下 full − prompt = len(response) + len("<|im_end|>\n") = len+11
+    turns = [
+        mk("controller", 10, 10, 5),     # 监督区 16，整条在阈内
+        mk("controller", 10, 10, 105),   # 监督区 116 —— 让 controller 的中位≠最短
+        mk("proposer", 10, 10, 1500),    # 监督区 1511；prompt 短、full 长 ⇒ 砍尾
+        mk("critic", 400, 400, 5),       # 监督区 16；prompt 自己就超限 ⇒ 零梯度
+    ]
+
+    def lens(t):
+        msgs = [{"role": "system", "content": t["system"]},
+                {"role": "user", "content": t["user"]},
+                {"role": "assistant", "content": t["response"]}]
+        return (len(tok.apply_chat_template(msgs[:-1], tokenize=False,
+                                            add_generation_prompt=True)),
+                len(tok.apply_chat_template(msgs, tokenize=False,
+                                            add_generation_prompt=False)))
+
+    L = [lens(t) for t in turns]
+    # 阈值取 critic 的 prompt 长度：这样 critic 恰好满足 prompt >= ml（零梯度），
+    # proposer 的 full 远超阈而 prompt 远低于阈（砍尾），两条 controller 都在阈内。
+    ml = L[3][0]
+    assert L[0][1] <= ml and L[1][1] <= ml, L  # controller 不超限
+    assert L[2][0] < ml < L[2][1], L           # proposer 砍尾
+    assert L[3][0] >= ml and L[3][1] > ml, L   # critic 零梯度
+
+    fd, path = tempfile.mkstemp(suffix=".jsonl")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"turns": turns}, ensure_ascii=False) + "\n")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            census_truncation(tok, path, max_lens=(ml,))
+        out = buf.getvalue()
+    finally:
+        os.unlink(path)
+
+    # ── 三分法 ────────────────────────────────────────────────────────────
+    line = [l for l in out.splitlines() if f"max_len={ml}" in l]
+    assert len(line) == 1, out
+    # 去掉 markdown 的 ** 强调号再匹配：不让断言挂在排版符号上
+    line = line[0].replace("*", "")
+    assert "超限 2" in line, f"超限该是 2（proposer+critic）：{line}"
+    assert "零梯度 1" in line, f"零梯度该是 1（critic）：{line}"
+    assert "砍尾 1" in line, f"砍尾该是 1（proposer）：{line}"
+    # 三档各自的按角色拆分：超限那档是本轮才补的，此前只有零梯度那档有
+    over_part, rest = line.split("其中", 1)
+    dead_part, tail_part = rest.split("砍尾", 1)
+    assert "'proposer': 1" in over_part and "'critic': 1" in over_part, over_part
+    assert "controller" not in over_part, f"controller 没超限，不该出现：{over_part}"
+    assert "'critic': 1" in dead_part and "proposer" not in dead_part, dead_part
+    assert "'proposer': 1" in tail_part and "critic" not in tail_part, tail_part
+
+    # ── 监督区长度 ────────────────────────────────────────────────────────
+    # 期望值写死成字面数字，不由实现算出来——否则"中位数怎么取"这件事就测不到。
+    # controller 两条的监督区是 16 和 116：**上**中位数（srt[n//2]）给 116，
+    # 下中位数给 16。必须是 116，因为闸门用的就是 srt[len(srt)//2]，两处一致。
+    want = {                    # role: (n, 中位, 最短, 最长)
+        "controller": (2, 116, 16, 116),
+        "proposer":   (1, 1511, 1511, 1511),
+        "critic":     (1, 16, 16, 16),
+    }
+    for role, expect in want.items():
+        rows = [l for l in out.splitlines() if l.strip().startswith(role)]
+        assert len(rows) == 1, f"{role} 的监督区行没打出来或打了多行：{out}"
+        nums = tuple(int(x) for x in rows[0].replace("n=", " ").split()
+                     if x.lstrip("-").isdigit())
+        assert nums == expect, \
+            f"{role} 的 (n, 中位, 最短, 最长) 该是 {expect}，实得 {nums}：{rows[0]}"
+    # 整体：监督区 [16, 116, 1511, 16] ⇒ 排序 [16, 16, 116, 1511] ⇒ 上中位 116
+    overall = [l for l in out.splitlines() if "监督区 token 数" in l]
+    assert len(overall) == 1, out
+    assert overall[0].rstrip().endswith("116"), \
+        f"整体监督区中位该是 116（上中位数，与闸门同）：{overall[0]}"
+
+
+def test_census_and_gate_measure_over_and_dead_with_one_ruler():
+    """`census_truncation` 与体检闸门对"超限/零梯度"必须是同一个谓词，逐字一致。
+
+    为什么单独钉：`census_truncation` 的 docstring 里写了"口径必须与
+    `submit_primus_sft.sh` 的闸门逐字一致"，但在这条测试之前**没有任何东西执行
+    这句话**——那正是本项目已经踩过五次的"两把尺子"的标准形态：一句"请保持同步"
+    的注释，加上两处会各自漂移的实现。闸门那边 `assert not dead` 会拦作业，探针
+    这边只报数；两者若给出不同的数，人只会相信先看到的那一个。
+
+    同时把 census 的两处 `apply_chat_template` 也钉到 `train_sft.py` 上——它是渲染
+    chat template 的**第三处**（另两处：train_sft.py:37-38、闸门 heredoc），
+    前两处已由 `test_sft_health_gate_shares_one_ruler_with_train_sft` 钉住。
+    """
+    import ast
+    import pathlib
+    import re
+
+    from check_sft_template import _extract_calls
+
+    root = pathlib.Path(__file__).parent
+
+    def norm(expr):
+        """把阈值变量名归一：闸门叫 max_len，census 里循环变量叫 ml。"""
+        return re.sub(r"\b(max_len|ml)\b", "ML", expr)
+
+    def grab(tree, names):
+        got = {}
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id in names):
+                got[node.targets[0].id] = norm(ast.unparse(node.value))
+        return got
+
+    # ── 闸门侧：从 heredoc 里抠出那段 python ──────────────────────────────
+    sh = (root / "submit_primus_sft.sh").read_text(encoding="utf-8")
+    m = re.search(r'^python - "\$\{MODEL_PATH\}" "\$\{MAX_LEN\}" <<', sh, re.M)
+    assert m, "闸门 heredoc 的调用形状变了，本测试已过期"
+    body = sh[m.end():]
+    body = body[body.index("\n") + 1: body.index("\nEOF\n")]
+    gate = grab(ast.parse(body), {"over", "dead"})
+    assert set(gate) == {"over", "dead"}, f"闸门里 over/dead 的赋值变了：{sorted(gate)}"
+
+    # ── 探针侧：只看 census_truncation 这个函数 ───────────────────────────
+    probe_src = (root / "check_sft_template.py").read_text(encoding="utf-8")
+    fn = next((n for n in ast.walk(ast.parse(probe_src))
+               if isinstance(n, ast.FunctionDef) and n.name == "census_truncation"),
+              None)
+    assert fn, "check_sft_template.py 里找不到 census_truncation，本测试已过期"
+    cen = grab(fn, {"over", "dead", "tail"})
+    assert set(cen) == {"over", "dead", "tail"}, f"census 里的赋值变了：{sorted(cen)}"
+
+    for k in ("over", "dead"):
+        assert gate[k] == cen[k], (
+            f"{k} 的口径漂了——闸门与探针会对同一份数据给出不同的数。\n"
+            f"  闸门：{gate[k]}\n  探针：{cen[k]}")
+
+    # `tail` 只在探针侧有（闸门不需要），但它必须恰好是 dead 的补集，否则
+    # "超限 = 零梯度 + 砍尾"这个加法在打印里就不成立。
+    assert cen["tail"] == cen["dead"].replace(">=", "<"), \
+        f"tail 不是 dead 的补集：dead={cen['dead']}  tail={cen['tail']}"
+
+    # ── 第三处渲染必须与 train_sft.py 同形 ────────────────────────────────
+    cen_calls = {}
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and getattr(node.value.func, "attr", "") == "apply_chat_template"):
+            cen_calls[node.targets[0].id] = (
+                [ast.unparse(a) for a in node.value.args],
+                {k.arg: ast.unparse(k.value) for k in node.value.keywords})
+    assert set(cen_calls) == {"full", "prompt"}, \
+        f"census 里 apply_chat_template 的赋值目标变了：{sorted(cen_calls)}"
+    train = _extract_calls((root / "train_sft.py").read_text(encoding="utf-8"))
+    for tname, cname in (("full_text", "full"), ("prompt_text", "prompt")):
+        assert train[tname] == cen_calls[cname], (
+            f"census 的 {cname} 与 train_sft.py 的 {tname} 漂开了——普查量的不是训练"
+            f"实际吃的序列。train={train[tname]}  census={cen_calls[cname]}")
 
 
 def test_sft_health_gate_shares_one_ruler_with_train_sft():

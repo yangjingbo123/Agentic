@@ -2073,6 +2073,78 @@ def test_sft_template_probe_pins_the_train_sft_call_shape():
             tmp2.unlink()
 
 
+def test_sft_health_gate_shares_one_ruler_with_train_sft():
+    """体检闸门与 `train_sft.py` 必须是同一把尺子，且 max_len 只有一个来源。
+
+    背景：这个闸门原先用 `chars/2.2 > 1024` 这把代理尺量截断率，集群上用真
+    tokenizer 一量发现偏乐观 3.7 倍——1024 下真实截断 5.73% 早已越过 2% 阈值，
+    闸门却因为尺子偏软而放行。这是本项目第三次踩「两把尺子漂移」。
+
+    修法是把闸门换成真 tokenizer。但这么一改，`submit_primus_sft.sh` 的 heredoc
+    就成了**第三处**渲染 chat template 的地方（另两处是 train_sft.py:37-38 和
+    check_sft_template.py）。第三处若与 train_sft.py 漂开，就是把刚扫掉的缺陷
+    原样请回来，而且同样不会报错——闸门照样打印一个看起来正常的百分比。
+
+    所以这条钉两件事：
+      ① heredoc 里那两处 apply_chat_template 的实参形状与 train_sft.py 逐字相同
+         （**含「都不传 enable_thinking」这一点**：那是 train_sft.py 的现存缺陷，
+         闸门必须镜像它，否则量的就不是训练实际吃的序列；修法单独一步）；
+      ② max_len 只有一个来源 —— 闸门与 +sft.max_len 都读 ${MAX_LEN}，不许任何
+         一侧写字面量。原先两处各写一个 1024，改了一处忘了另一处不会报错。
+    """
+    import ast
+    import pathlib
+    import re
+
+    from check_sft_template import _extract_calls
+
+    root = pathlib.Path(__file__).parent
+    sh = (root / "submit_primus_sft.sh").read_text(encoding="utf-8")
+
+    # ── ② max_len 单一来源 ────────────────────────────────────────────────
+    assert re.search(r"^MAX_LEN=\$\{MAX_LEN:-\d+\}", sh, re.M), \
+        "submit_primus_sft.sh 里找不到 MAX_LEN 的定义（max_len 又散成字面量了？）"
+    assert '+sft.max_len="${MAX_LEN}"' in sh, \
+        "+sft.max_len 没有读 ${MAX_LEN}——训练参数与闸门会各自漂"
+    assert not re.search(r"\+sft\.max_len=\d", sh), \
+        "+sft.max_len 写成了字面量"
+    gate_call = re.search(r'^python - "\$\{MODEL_PATH\}" "\$\{MAX_LEN\}" <<', sh, re.M)
+    assert gate_call, "闸门 heredoc 没有把 MODEL_PATH / MAX_LEN 作为 argv 传进去"
+
+    # ── ① 闸门与 train_sft.py 同一把尺 ───────────────────────────────────
+    body = sh[gate_call.end():]
+    body = body[body.index("\n") + 1: body.index("\nEOF\n")]
+    tree = ast.parse(body)
+    # 查代理尺要在 AST 上查，不能查文本：heredoc 里有一句注释正是在说明「不用
+    # chars/2.2」，文本匹配会把那句注释当成尺子还在，一条永远失败的空断言。
+    floats = {n.value for n in ast.walk(tree)
+              if isinstance(n, ast.Constant) and isinstance(n.value, float)}
+    assert 2.2 not in floats, f"闸门代码里还留着 chars/2.2 代理尺（常量：{floats}）"
+    assert "AutoTokenizer" in body, "闸门没有用真 tokenizer"
+
+    gate = {}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and getattr(node.value.func, "attr", "") == "apply_chat_template"):
+            gate[node.targets[0].id] = (
+                [ast.unparse(a) for a in node.value.args],
+                {k.arg: ast.unparse(k.value) for k in node.value.keywords})
+    assert set(gate) == {"full", "prompt"}, \
+        f"闸门里 apply_chat_template 的赋值目标变了：{sorted(gate)}"
+
+    train = _extract_calls((root / "train_sft.py").read_text(encoding="utf-8"))
+    for tname, gname in (("full_text", "full"), ("prompt_text", "prompt")):
+        assert train[tname] == gate[gname], (
+            f"闸门的 {gname} 与 train_sft.py 的 {tname} 漂开了 —— 闸门量的不是训练"
+            f"实际吃的序列。train={train[tname]}  gate={gate[gname]}")
+
+    # ── 零梯度这一档必须被 assert 守住，不能只打印 ────────────────────────
+    assert re.search(r"assert not dead", body), \
+        "闸门只统计零梯度却不 assert，等于一个看起来在测量、实际不拦的埋点"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

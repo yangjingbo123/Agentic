@@ -62,6 +62,17 @@ MODEL_PATH=${MODEL_PATH:-${MODEL_PATH_OVERRIDE:-}}
 echo "MODEL_PATH = ${MODEL_PATH}"
 
 # ---------------------------------------------------------------------------
+# max_len —— **唯一来源**
+# ---------------------------------------------------------------------------
+# 下面的体检闸门与 train_sft.py 的 +sft.max_len 都读这一个变量。此前这两处各写
+# 一个字面量 1024，天然会漂：改了训练参数而忘了改闸门，闸门就在守一条谁也不用
+# 的线，而且不会报错。
+# 1024 → 1536 的依据是集群上真 tokenizer 的实测（见下面注释块的表）：超限
+# 164 → 8，零梯度 32 → 0。
+MAX_LEN=${MAX_LEN:-1536}
+echo "MAX_LEN    = ${MAX_LEN}"
+
+# ---------------------------------------------------------------------------
 # 数据：v23 = v2 + v3 现场派生（派生文件不入库，生成命令即此处）
 # v3.2 派生两件事（见 data/prepare_sft.py 的 docstring）：
 #   ① M1：把 `<interaction>` 块从开头机械搬到末尾；
@@ -87,35 +98,54 @@ wc -l data/sft_train_v2_m1.jsonl data/sft_train_v3_m1.jsonl data/sft_train_v23.j
 
 # v23 快速体检：episode 结构、v2 格式可解析率、max_len 截断率
 #
-# M1 的已知副作用（本地实测，chars/2.2 口径，与下面 assert 同一把尺）：
-# train_sft.py 的 `full_ids[:max_length]` 砍的是**尾部**，而 M1 把块搬去了尾部。
-#   截断 turn：30 → 34（1.03% → 1.17%，仍在 2% 阈内，全是 proposer 26/critic 5/verifier 3）
-#   丢 <interaction> 块：5 → 34（+29）      丢「最终答案：」：23 → 22（−1）
-# 即：这 34 条 turn 从此不再监督块的生成。判断是可接受的，理由：
-#   ① 绝对量 34/2030 = 1.7% 的带块 turn，另外 1996 条监督完好，格式学习靠的是
-#      分布主体，不是尾部这几条；
-#   ② 这 34 条里有 22 条**连答案标记一起丢**——它们在 M1 之前就已经是坏样本
-#      （教模型不输出「最终答案：」），M1 只是把坏的方式从「丢答案」换成
-#      「丢答案+丢块」，真正新增的只有 12 条「答案完好、只丢块」；
-#   ③ 更干净的做法是把超长 turn 整条剔除（截断样本无论砍哪头都在教「不输出
-#      EOS」），但那是与 M1 无关的数据卫生改动，混进来会污染 M1 的归因。
-# → 留作后续独立一步：剔除超长 turn，或把 max_len 抬到 1536 后重测。
+# ── 关于下面这段历史：它记的数曾经全是**错的**，因为尺子错了 ────────────────
+# 直到 v3.2 第八轮，这里的截断率一直用 `chars/2.2 > max_len` 这把代理尺子量。
+# 在集群上用**真 tokenizer** 跑 check_sft_template.py（见 submit_primus_probe.sh）
+# 之后拿到真值，两者差得很远：
 #
-# v3.2（加了 v2 prompt 重放之后重测）：上面那 34 是重放前的数。重放把 v2 的
-# `user` 从一句手写摘要换成结构化黑板转储（critic/verifier 还要带 300 字的
-# `对方内容`），prompt 变长，于是截断跟着涨：
-#   截断 turn：34 → 44（1.17% → 1.54%，仍在 2% 阈内）
-#   分布：proposer 28 / verifier 7 / critic 6 / controller 3
-#   同一把尺下把 max_len 抬到 1536：只剩 3 条（0.10%）
-# 也就是说「抬 max_len」这条待办的性价比比之前更清楚了——一个数字换掉 44 里的
-# 41 条。但**这一轮仍不动**：M1、重放、max_len 三件事同时改，跑出来的
-# `parse_rate` / `eff` 变化就没法归因给其中任何一件。等这次 SFT + 诊断跑出结果
-# 再单独做。
+#              代理尺 chars/2.2      真 tokenizer
+#   @1024        44 (1.54%)           164 (5.73%)   零梯度 32
+#   @1536         3 (0.10%)             8 (0.28%)   零梯度  0
+#   @2048         —                     0 (0.00%)   零梯度  0
+#   （full token 数：中位 426，最长 1797）
+#
+# 代理尺偏乐观约 3.7 倍，而阈值是 2%——也就是说 1024 下真实截断 5.73% 早已越阈，
+# 闸门却因为尺子偏软而放行。这是本项目第三次踩「两把尺子漂移」（前两次：
+# evaluate.py 的三把尺子、以及这里的 parse_interaction 返回 "none" 让 assert 恒真）。
+# 所以本轮把这把尺子换成真 tokenizer，见下面的 heredoc。
+#
+# 「零梯度」是比截断率更硬的读数，旧尺子完全没有这个概念：train_sft.py:42 的
+#   labels = ([-100]*len(prompt_ids) + full_ids[len(prompt_ids):])[:max_length]
+# 配合 :96 的 `if response_mask.sum() == 0: continue`，意味着**prompt 本身就超
+# max_len** 的 turn 整条不产生任何梯度——比丢尾巴严格更坏。1024 下有 32 条，
+# 按角色 verifier 17 / critic 12 / proposer 3 / controller 0（角色内占比 2.3% /
+# 1.8% / 0.5% / 0%）。恰好压在 critic 与 verifier 上，而 v3 观测到的「critic
+# 无差别 flag、对最终答案无因果通路」就在这两个角色身上——是否足以解释，未测。
+#
+# 而剩下 132 条「只丢尾巴」的，丢掉的**恰好是 <interaction> 块**：
+# `full_ids[:max_length]` 砍尾部，而 M1 把块搬去了尾部。也就是 132/2864 = 4.6%
+# 的 turn 在 SFT 阶段压根没被监督过交互决策——正是 M1 与 Eq (12) 要修的东西，
+# 且超限的都是黑板上下文最厚（轮次靠后、答案累积多、flaw 长）、最需要判断该不该
+# 求助的那些 turn，不是随机 dropout。
+# （这 132 条的**角色分布没量到**：探针只对零梯度那一档做了 byrole，超限那一档
+#  漏了，是探针的缺口，回头补。）
+#
+# → 本轮据此把 max_len 1024 → 1536：一个数字换掉 164 里的 156 条，且零梯度
+#   32 → 0。代价：train_sft.py:43 把每条 pad 到 1536，激活显存约 1.5 倍；以及
+#   KL 参考快照 sft_v3 是 1024 训的，本轮 sft_v3_m1 与它多一处不同。
+#   不上 2048 是因为 1536 已把零梯度清零、超限降到 0.28%，再抬只换那 8 条尾巴，
+#   而显存是每一条都要付的。
+#
+# 以下是换尺子之前留下的历史判断，**其中的数字都出自那把偏软的代理尺**，保留是
+# 为了让「当时为什么觉得可接受」这条推理链可追溯，不要再引用它的数字：
+#   旧记：截断 30 → 34（M1 引入）→ 44（v2 重放引入）；丢块 5 → 34；
+#   丢「最终答案：」23 → 22；当时认为可接受的理由是绝对量小、且 34 条里 22 条
+#   在 M1 之前就已经是坏样本。真值出来后这条理由不再成立（164 而非 44）。
 #
 # v3.2（第四轮，信道审计之后重测）：跨角色截断改为**带可见标记**（`CLIP_MARK`）
-# 之后，截断率**一点没动**——1024 仍是 44/2864（1.54%），1536 仍是 3（0.10%）。
-# 意料之中：一个标记约十个字符，而这把尺是 chars/2.2 > max_len，十个字符不足以
-# 把任何一条推过线。所以上面那些数与结论继续有效，不需要重写。
+# 之后，截断率**一点没动**——代理尺下 1024 仍是 44、1536 仍是 3。意料之中：
+# 一个标记约十个字符，不足以把任何一条推过线。这个「加标记不影响截断」的结论与
+# 尺子无关，继续有效。
 #
 # 顺带得到一个新读数：**148/2864（5.2%）的 turn，其 `user` 里带着截断标记**，
 # 按角色 critic 79 / verifier 65 / controller 3 / proposer 1。critic 与 verifier
@@ -126,11 +156,13 @@ wc -l data/sft_train_v2_m1.jsonl data/sft_train_v3_m1.jsonl data/sft_train_v23.j
 # 量它用 grep 而不是计数器：`to_text` 每个 turn 被调用多次（controller / critic /
 # verifier / 修正各一次），在函数里计数得到的是调用次数而非事件数；而落盘 prompt
 # 里的标记既能算率，又能指出是哪个 turn。
-python - <<'EOF'
+python - "${MODEL_PATH}" "${MAX_LEN}" <<'EOF'
 import json, re, sys
 sys.path.insert(0, ".")
 from agents.parsing import (has_answer_label, parse_decision, parse_reasoning,
                             parse_score)
+
+model_path, max_len = sys.argv[1], int(sys.argv[2])
 
 # 每个角色只查**下游真正会读**的那个字段。
 # 注意不要用 parse_interaction 来查 worker：它解析失败时返回 "none"，而 "none"
@@ -152,26 +184,77 @@ def key_field_ok(role, resp):
 
 
 n_turn = 0
-lens = []
+rows = []          # (role, prompt_tokens, full_tokens)
 ok = {}
 tot = {}
+turns = []
 for line in open("data/sft_train_v23.jsonl"):
     ep = json.loads(line)
     for t in ep.get("turns", []):
         n_turn += 1
-        lens.append(len(t["system"]) + len(t["user"]) + len(t["response"]))
+        turns.append(t)
         role = t["role_name"]
         tot[role] = tot.get(role, 0) + 1
         ok[role] = ok.get(role, 0) + key_field_ok(role, t["response"])
-trunc = sum(1 for l in lens if l / 2.2 > 1024) / max(len(lens), 1)
-print(f"v23: {n_turn} turns, max_len=1024 预计截断率 {trunc:.1%}")
 for role in sorted(tot):
     print(f"  {role:11s} 关键字段 {ok[role]}/{tot[role]}")
 # 要求 100%：prepare_sft.py 已经把解析不出来的整条剔除了，这里若还有漏网，说明
 # 两处的判据脱了钩（例如只改了一边的标签），必须停下来查，不能放宽阈值。
 bad = {r: (ok[r], tot[r]) for r in tot if ok[r] != tot[r]}
 assert not bad, f"存在关键字段解析不出来的 turn：{bad}（prepare_sft.py 的判据与此处脱钩了？）"
-assert trunc < 0.02, f"截断率 {trunc:.1%} 超阈"
+
+# ── 截断普查：真 tokenizer，不用 chars/2.2 ────────────────────────────────
+# 换尺子的理由见上面的注释块：代理尺在 1024 上给 1.54%，真值 5.73%，偏乐观
+# 3.7 倍，而阈值是 2%——闸门因此在越阈的情况下放行。
+# 下面这两行 apply_chat_template 必须与 train_sft.py:37-38 逐字一致（含
+# add_generation_prompt 的取值），否则又是一次两把尺子漂移。**注意也一并不传
+# enable_thinking**：不是疏漏，是刻意镜像 train_sft.py 的现状，那处缺陷已由
+# check_sft_template.py 量到（监督区从空 think 块开始），修法单独一步；这里
+# 若擅自补上，量出来的就不是训练实际吃的那份序列。
+from transformers import AutoTokenizer
+print(f"  tokenizer = {model_path}（真 token 计数，max_len={max_len}）", flush=True)
+tok = AutoTokenizer.from_pretrained(model_path)
+for t in turns:
+    messages = [
+        {"role": "system",    "content": t["system"]},
+        {"role": "user",      "content": t["user"]},
+        {"role": "assistant", "content": t["response"]},
+    ]
+    full = tok.apply_chat_template(messages, tokenize=False,
+                                   add_generation_prompt=False)
+    prompt = tok.apply_chat_template(messages[:-1], tokenize=False,
+                                     add_generation_prompt=True)
+    rows.append((t["role_name"],
+                 len(tok.encode(prompt, add_special_tokens=False)),
+                 len(tok.encode(full,   add_special_tokens=False))))
+
+over = [r for r in rows if r[2] > max_len]
+# 零梯度：prompt 本身就吃满 max_len ⇒ train_sft.py:42 切完 labels 全是 -100，
+# :96 的 `if response_mask.sum() == 0: continue` 把整条跳过。比丢尾巴更坏，
+# 因为丢尾巴至少还监督了前半段。
+dead = [r for r in over if r[1] >= min(r[2], max_len)]
+trunc = len(over) / max(len(rows), 1)
+
+
+def byrole(rs):
+    d = {}
+    for r in rs:
+        d[r[0]] = d.get(r[0], 0) + 1
+    return d
+
+
+srt = sorted(r[2] for r in rows)
+print(f"v23: {n_turn} turns, full token 中位 {srt[len(srt) // 2]}，最长 {srt[-1]}")
+print(f"  max_len={max_len}: 超限 {len(over)} ({trunc:.2%}) {byrole(over)}")
+print(f"  其中零梯度 {len(dead)} {byrole(dead)}")
+# 零梯度必须为 0：这些 turn 一点梯度都不产生，是纯浪费，且系统性偏向黑板上下文
+# 最厚的那些（轮次靠后、答案累积多），不是随机 dropout。1536 下实测为 0。
+assert not dead, (
+    f"有 {len(dead)} 条 turn 零梯度（prompt 本身超 max_len={max_len}）"
+    f"{byrole(dead)} —— 抬 max_len 或剔除这些 turn，别让它们静默白跑")
+# 超限（丢尾巴）仍留 2% 阈：砍的是尾部，而 M1 把 <interaction> 块搬去了尾部，
+# 所以每一条超限都等于一条「交互决策未被监督」的样本。
+assert trunc < 0.02, f"截断率 {trunc:.2%} 超阈（真 token 口径）"
 EOF
 
 # ---------------------------------------------------------------------------
@@ -200,7 +283,7 @@ python train_sft.py \
     llm.model_path="${MODEL_PATH}" \
     ++data.sft_path=data/sft_train_v23.jsonl \
     +sft.save_dir="${SAVE_DIR}" \
-    +sft.max_len=1024 \
+    +sft.max_len="${MAX_LEN}" \
     +sft.epochs="${EPOCHS:-3}" \
     +sft.batch="${BATCH:-2}" \
     +sft.lr="${LR:-2e-5}" \

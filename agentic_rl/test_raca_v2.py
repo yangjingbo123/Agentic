@@ -1901,6 +1901,178 @@ def test_parse_flags_are_wired_from_source_not_aliased():
         assert f'"{key}":' in src, f"{key} 没进 round record，指标会永远读成 0.0"
 
 
+def test_sft_template_probe_separates_the_three_think_block_outcomes():
+    """`check_sft_template.probe_template` 必须能分清三种结局，不能只会说"不对齐"。
+
+    背景：全仓 6 处 `apply_chat_template`，5 处显式传 `enable_thinking=False`
+    （executor / grpo_trainer / verify_sft_format / measure_channels /
+    generate_sft_v3），只有真正训练的那一处 `train_sft.py:37-38` 两行都不传。
+    这处不对称的**后果**取决于 Qwen3 模板怎么渲染末条 assistant 消息，而那要有
+    tokenizer 才量得出来，本地开发机没有 —— 所以探针本身必须先被证明是准的，
+    否则集群上那一行读数没人敢信。
+
+    三种结局的后果差很远，混成一句"不对齐"等于没测：
+      ① aligned                          —— 两处渲染一致，这处不对称无后果
+      ② think_block_in_supervised_region —— 推理 prompt 仍是 SFT 序列的前缀，
+         但空 think 块落在了 labels != -100 那段里：SFT 在教模型再吐一个块
+      ③ diverged                         —— 推理喂进去的前缀 SFT 从未见过
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    from check_sft_template import probe_template
+
+    class FakeQwen3:
+        """按 Qwen3 模板的两个关键分支复刻。
+
+        `inject_gen`  = `add_generation_prompt=True` 且 `enable_thinking=False`
+                        时是否注入空 think 块（真实 Qwen3 会注入）。
+        `inject_full` = 末条 assistant 消息是否也带上空 think 块（真实 Qwen3 的
+                        `loop.last` 分支会带）。
+        """
+
+        def __init__(self, inject_gen, inject_full):
+            self.inject_gen = inject_gen
+            self.inject_full = inject_full
+
+        def apply_chat_template(self, messages, tokenize=False,
+                               add_generation_prompt=False, enable_thinking=None):
+            s = ""
+            for m in messages:
+                body = m["content"]
+                if m["role"] == "assistant" and self.inject_full:
+                    body = "<think>\n\n</think>\n\n" + body
+                s += f"<|im_start|>{m['role']}\n{body}<|im_end|>\n"
+            if add_generation_prompt:
+                s += "<|im_start|>assistant\n"
+                if self.inject_gen and enable_thinking is False:
+                    s += "<think>\n\n</think>\n\n"
+            return s
+
+        # 按字符当 token（与 FakeTokenizer 同一套约定）
+        def encode(self, text, add_special_tokens=False):
+            return list(text)
+
+        def decode(self, ids):
+            return "".join(ids)
+
+    turn = {"role_name": "proposer", "system": "你是解题者", "user": "问题：1+1\n当前状态：尚无信息",
+            "response": "推理过程：显然\n最终答案：2\n<interaction>none</interaction>"}
+
+    cases = {
+        # 生成侧不注入 ⇒ 两处 prompt 逐字节相同
+        "aligned": FakeQwen3(inject_gen=False, inject_full=False),
+        # 生成侧注入、末条 assistant 也带 ⇒ 块落进监督区
+        "think_block_in_supervised_region": FakeQwen3(inject_gen=True, inject_full=True),
+        # 只有生成侧注入 ⇒ 推理 prompt 根本不是 SFT 序列的前缀
+        "diverged": FakeQwen3(inject_gen=True, inject_full=False),
+    }
+    got = {}
+    for want, tok in cases.items():
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            res = probe_template(tok, turn)
+        got[want] = res["verdict"]
+        assert res["verdict"] == want, \
+            f"{want} 这一档被判成了 {res['verdict']}（三档判混了，读数就没有意义）"
+        # 人读的那一行必须与返回值一致 —— 只算对不打对，等于集群上什么都没留下
+        out = buf.getvalue()
+        if want == "aligned":
+            assert "对齐" in out and "不对齐" not in out, out
+        elif want == "think_block_in_supervised_region":
+            assert "监督区里" in out, out
+        else:
+            assert "不对齐" in out, out
+
+    # 三档必须互不相同，否则上面三条断言可以被一个恒定返回值同时满足
+    assert len(set(got.values())) == 3, got
+
+    # ② 这一档最要紧的具体内容：监督区确实从空 think 块开始，而 response 本身没有它
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        res = probe_template(cases["think_block_in_supervised_region"], turn)
+    assert res["supervised"].startswith("<think>"), \
+        f"监督区没有以 think 块开头，那这一档的叙述就是错的：{res['supervised'][:40]!r}"
+    assert "<think>" not in turn["response"], "response 本身不该带 think 块"
+    # 推理 prompt 比 SFT prompt 长出的就是那个块
+    assert res["delta_tokens"] == len("<think>\n\n</think>\n\n"), res["delta_tokens"]
+
+    # ③ 走散那一档：前缀不成立，且不能被误判成 ②
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        res = probe_template(cases["diverged"], turn)
+    assert not res["prefix_ok"] and not res["same_prompt"], res
+
+
+def test_sft_template_probe_pins_the_train_sft_call_shape():
+    """探针复刻的是 `train_sft.py` 那两行，形状漂了必须当场喊过期而不是照样出数。
+
+    这条守的是探针最坏的失效方式：`train_sft.py` 改了调用形状、探针没跟上，于是
+    它量的是一个**已经不存在**的训练流程，却照样打印一行看起来正常的读数。
+    同时必须把"形状漂了"（该拦，exit 2）和"病灶被修好了"（该继续、只是退休）
+    分开 —— 第一版用 grep 字面串，一旦真把 `enable_thinking=False` 补进
+    `train_sft.py`，字面串立刻不匹配，**修 bug 反倒把作业弄挂**。
+    """
+    import pathlib
+
+    from check_sft_template import _extract_calls, assert_mirrors_train_sft
+
+    # 真实源码：两处都在，且病灶前提仍成立
+    assert assert_mirrors_train_sft() is True
+
+    src = pathlib.Path(__file__).with_name("train_sft.py").read_text(encoding="utf-8")
+    found = _extract_calls(src)
+    assert set(found) == {"full_text", "prompt_text"}, sorted(found)
+    # 病灶本身：训练侧两处都没传 enable_thinking，而推理侧五处都传了
+    for name, (_, kw) in found.items():
+        assert "enable_thinking" not in kw, \
+            f"{name} 已经传了 enable_thinking，本测试与探针的 A 段都该退休了"
+    assert found["full_text"][0] == ["messages"]
+    assert found["prompt_text"][0] == ["messages[:-1]"]
+
+    # 反向：把 enable_thinking 补上（= 病灶被修），探针必须**不**退出，只提示退休
+    tmp = pathlib.Path(__file__).with_name("_tmp_train_sft_fixed.py")
+    tmp.write_text(src.replace(
+        "apply_chat_template(messages, tokenize=False, add_generation_prompt=False)",
+        "apply_chat_template(messages, tokenize=False, "
+        "add_generation_prompt=False, enable_thinking=False)"), encoding="utf-8")
+    try:
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            premise = assert_mirrors_train_sft(str(tmp))
+        assert premise is False, "病灶被修好之后应当报 premise=False"
+        assert "退休" in buf.getvalue(), buf.getvalue()
+    finally:
+        tmp.unlink()
+
+    # 而形状漂了必须 exit 2（拦住，别出假读数）。两档都要盯：位置参数换了、以及
+    # 多传一个关键字（`tools=` 之类足以改变渲染，而探针复刻的是没有它的版本）。
+    drifts = {
+        "位置参数": src.replace("apply_chat_template(messages[:-1], tokenize=False",
+                                "apply_chat_template(messages, tokenize=False"),
+        "多传关键字": src.replace(
+            "apply_chat_template(messages[:-1], tokenize=False, "
+            "add_generation_prompt=True)",
+            "apply_chat_template(messages[:-1], tokenize=False, "
+            "add_generation_prompt=True, tools=[])"),
+    }
+    for label, mutated in drifts.items():
+        assert mutated != src, f"{label} 这一档的变异没生效，这条断言是空的"
+        tmp2 = pathlib.Path(__file__).with_name("_tmp_train_sft_drift.py")
+        tmp2.write_text(mutated, encoding="utf-8")
+        try:
+            raised = None
+            try:
+                assert_mirrors_train_sft(str(tmp2))
+            except SystemExit as e:
+                raised = e.code
+            assert raised == 2, f"{label} 漂了却没有 exit 2（拿到 {raised}）"
+        finally:
+            tmp2.unlink()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

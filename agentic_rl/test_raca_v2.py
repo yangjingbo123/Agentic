@@ -1231,12 +1231,18 @@ def test_strip_interaction_only_affects_display_copy():
 
 
 def test_flaw_window_fits_a_realistic_critic_message():
-    """flaw 窗口 80 → 300：v3「critic 说了等于没说」的直接成因。
+    """flaw 窗口 80 → 300 → **600**：v3「critic 说了等于没说」的直接成因。
 
-    实测 critic 真报错时中位 267 字、p75 341 字。80 的窗口只有 4% 能完整送达，
-    而块又固定占 68 字——真正传下去的实质内容约 11 字。这条测试用一段中位长度的
-    批评钉住修复：剥块之后，300 的窗口要能把结论部分带过去。
+    实测 critic 真报错时中位 267 字、p75 341 字、p90 494 字。80 的窗口只有 4% 能
+    完整送达，而块又固定占 68 字——真正传下去的实质内容约 11 字。300 是 63.3%，
+    第十轮抬到 600 是 96.3%。
+
+    这条测试**刻意仍只用中位长度的样例**，因为它钉的是语义（"结论句要真的到下游"）
+    而不是某个具体窗口值；换成 p90 长度的样例就变成在钉 600 这个数字本身，那样每
+    次调窗口都要改测试，而调窗口恰恰是允许的。窗口值本身由
+    `test_cross_role_truncation_is_visible` 那条按常量走的断言守。
     """
+    from agents.parsing import MAX_CHANNEL_CHARS
     from envs.blackboard import Blackboard, Message, MessageType
 
     bb = Blackboard()
@@ -1245,6 +1251,8 @@ def test_flaw_window_fits_a_realistic_critic_message():
     concl = "，所以第二步的 41 应为 42"
     flaw = ("第一步把条件抄错了：题目给的是 6×7，" + "复述与推导过程" * 31 + concl)
     assert 250 <= len(flaw) <= 340, f"样例长度 {len(flaw)} 不在实测中位区间"
+    assert len(flaw) <= MAX_CHANNEL_CHARS, \
+        f"样例({len(flaw)})超过了当前窗口({MAX_CHANNEL_CHARS})，本条测试的前提没了"
     bb.add_message(Message(1, MessageType.FLAW, {"content": flaw}))
 
     # 核心断言：结论句要真的出现在下游看到的文本里
@@ -1572,10 +1580,15 @@ def test_parser_label_tolerance():
 def test_correction_prompt_does_not_duplicate_critic_text():
     """critic 硬触发修正时，黑板的「发现问题」与 initiator_output 是同一段文本。
 
-    窗口从 80 放宽到 300 之后这份重复才显形：同一段批评在一个 prompt 里出现两次，
-    白占 300 字预算（`max_prompt_tokens` ≈ 3008，且黑板文本嵌进每个角色的 prompt）。
-    去重按**内容比对**而非「initiator 是不是 critic」——critic 未标错却主动请求
-    修正时 `flaws[-1]` 是更早的另一条，那份信息是真的、不能扔。
+    窗口从 80 放宽之后这份重复才显形：同一段批评在一个 prompt 里出现两次，白占
+    `MAX_CHANNEL_CHARS` 字预算（`max_prompt_tokens` ≈ 3008，且黑板文本嵌进每个
+    角色的 prompt）。去重按**内容比对**而非「initiator 是不是 critic」——critic
+    未标错却主动请求修正时 `flaws[-1]` 是更早的另一条，那份信息是真的、不能扔。
+
+    **这条只守 proposer 修正那一路。** 响应方（critic / verifier）那一路上同样的
+    重复直到第十轮才被量出来——`data/sft_train_v23.jsonl` 渲染出的 310 处「对方
+    内容」里 247 处是同 prompt 内逐字重复、每处约 263 字——由
+    `test_request_context_drops_the_duplicate_quote` 守。两路的判据不同，不能合并。
     """
     script = {
         "controller": [
@@ -2426,6 +2439,341 @@ def test_sft_health_gate_shares_one_ruler_with_train_sft():
     # ── 零梯度这一档必须被 assert 守住，不能只打印 ────────────────────────
     assert re.search(r"assert not dead", body), \
         "闸门只统计零梯度却不 assert，等于一个看起来在测量、实际不拦的埋点"
+
+
+def test_request_context_drops_the_duplicate_quote():
+    """响应方 prompt 里「对方内容」若与已给过的 `待审查解法` 同源，就不再重复一遍。
+
+    实测规模（`data/sft_train_v23.jsonl` 渲染出的 310 处「对方内容」）：**247 处是
+    同一个 prompt 内的逐字重复**（critic 132 / verifier 115），每处约 263 字，合计约
+    6.5 万字符；而且被 `MAX_CHANNEL_CHARS` 截断的恰恰是这份多余的拷贝——同 prompt
+    里那份走的是 `MAX_REASONING_CHARS`(1500)，更宽。所以"窗口不够"这个表象下面，
+    近一半其实是"同一段话发了两遍，第二遍被砍了"。
+
+    这条测试有三个断言，缺一个都不够：
+      ① 重复被去掉（推理正文在 critic 的 prompt 里只出现一次）；
+      ② **意图行必须留着**——`agents/parsing.py` 里剥块的理由正是"发起意图已由
+         `request_context` 的 action/reason 显式表达"，把意图行也省掉等于把那条
+         理由抽空；
+      ③ 阳性对照：发起方**不是** proposer 时（critic→verifier），「对方内容」是
+         critic 的批评而 `推理：` 是 proposer 的推理，两份不同，**必须保留**。
+         实测这类有 63 处，去重写错方向就会把它们误删——那是丢真信息，比重复更坏。
+    """
+    reasoning = "第一步设 x 为未知数，第二步代入得 6*7"
+    prop_out = f"推理过程：{reasoning}\n最终答案：41\n"
+
+    # ── ①② proposer → critic：对方内容与待审查解法同源，应去重 ────────────
+    # controller 必须先 continue：`stop_gate=False` 时第一句 stop 会让 episode 在
+    # proposer 之前就终止，交互链一跳都不发生，断言全部空跑（本条第一版就是这么
+    # 假绿的——`chain == []` 而 `count(reasoning) == 0` 也满足"只出现一次"以外的
+    # 任何弱断言）。
+    _CTRL = ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>",
+             "<meta-plan>\ndecision: stop\nreason: r\n</meta-plan>"]
+    script = {
+        "controller": list(_CTRL),
+        "proposer": [
+            prop_out + INTER.format(a="request", t="critic"),
+            # critic 标错会**机械触发** proposer 修正（`target="proposer"` 写死），
+            # 占掉 hop2，所以这里必须有第二条 proposer 脚本。本条第一版漏了它，
+            # 报的是 FakeEngine 的 `pop from empty list` —— 一个和被测逻辑毫无关系
+            # 的错误信息，查起来比断言失败慢得多。
+            "推理过程：fix\n最终答案：42\n" + INTER.format(a="none", t="none"),
+        ],
+        "critic": ["错误分析：第二步把 6*7 算成了 41\n" + INTER.format(a="none", t="none")],
+        "verifier": ["分数: 0.9\n验证说明：ok\n" + INTER.format(a="none", t="none")] * 4,
+    }
+    eng = FakeEngine(script)
+    _mk_executor(eng, stop_gate=False).run_episodes_batch(["6*7=?"], ["42"])
+
+    cp = [p for role, p in eng.prompts if role == "critic"][0]
+    assert cp.count(reasoning) == 1, \
+        f"推理在 critic 的 prompt 里出现了 {cp.count(reasoning)} 次（去重没生效）"
+    assert "对方内容：" not in cp, "重复的引述应整行省掉"
+    assert "发起了交互" in cp and "理由：" in cp, \
+        "意图行被一起省掉了——剥块的理由就建立在它还在上面"
+
+    # ── ③ 阳性对照：critic → verifier，两份内容不同，必须保留 ──────────────
+    # 这里 critic 必须输出「无错误」：`critic_found_errors` 为真时
+    # `if target == "critic" and flagged` 会把它自己写的 `request verifier`
+    # **覆盖**成写死的 proposer 修正，于是根本拿不到"发起方是 critic"的场景。
+    # 本条第一版就栽在这上面——写了 request verifier 却被硬触发吃掉，测的是另一件事。
+    script2 = {
+        "controller": list(_CTRL),
+        "proposer": [prop_out + INTER.format(a="request", t="critic")],
+        "critic": ["错误分析：无错误，推导可以再核一遍第二步\n"
+                   + INTER.format(a="request", t="verifier")],
+        "verifier": ["分数: 0.3\n验证说明：确有问题\n" + INTER.format(a="none", t="none")] * 4,
+    }
+    eng2 = FakeEngine(script2)
+    _mk_executor(eng2, stop_gate=False, max_hops=3).run_episodes_batch(["6*7=?"], ["42"])
+    vp = [p for role, p in eng2.prompts if role == "verifier"][0]
+    assert "对方内容：" in vp, \
+        "发起方是 critic 时「对方内容」与「推理：」是两份不同的东西，去重把真信息删了"
+    # 必须断到**具体内容**而不只是「对方内容：」这个标签：标签在而内容被截成空串
+    # 同样是丢信息，而那种失效方式恰恰不会动标签。
+    assert "推导可以再核一遍第二步" in vp, "critic 的实质意见没送到 verifier"
+
+    # ── ④ 空串守卫：`last[0]` 解析为空时不许判成"已经给过了" ────────────────
+    # 空串是**任何**字符串的子串，所以判据里少写 `_seen and` 这一半，就会在推理
+    # 解析失败的 turn 上把发起方的真内容全部误删——而那种 turn 恰恰是最需要下游
+    # 看到对方原文的（自己手里那份是空的）。上面 ③ 抓不到这一条：那里 `推理：`
+    # 非空，空串分支根本走不到。变异验证里去掉 `_seen and` 只有这一段会响。
+    script3 = {
+        "controller": list(_CTRL),
+        # 只输出块 → `parse_reasoning` 得到空串 → 黑板 trace 的推理是 ""
+        "proposer": [INTER.format(a="request", t="critic")],
+        "critic": ["错误分析：无错误，但请复核\n" + INTER.format(a="request", t="verifier")],
+        "verifier": ["分数: 0.5\n验证说明：信息不足\n" + INTER.format(a="none", t="none")] * 4,
+    }
+    eng3 = FakeEngine(script3)
+    _mk_executor(eng3, stop_gate=False, max_hops=3).run_episodes_batch(["6*7=?"], ["42"])
+    # 前置断言：确认 fixture 真的造出了"推理为空"的场景，否则这一段测不到空串分支
+    # （不要写 `assert ... or True` 那种恒真式——那正是本仓库反复在抓的假绿）。
+    from agents.parsing import parse_reasoning
+    assert parse_reasoning(INTER.format(a="request", t="critic"))[0] == "", \
+        "fixture 失效：proposer 只输出块时推理应解析为空串"
+    vp3 = [p for role, p in eng3.prompts if role == "verifier"][0]
+    assert "无错误，但请复核" in vp3, \
+        "推理解析为空时把发起方内容误删了——空串是任何串的子串，判据缺了空值守卫"
+
+    # ── ⑤ 超长推理：`_seen` 末尾带 CLIP_MARK，比较前必须剥掉 ────────────────
+    # `parse_reasoning` 对超 `MAX_REASONING_CHARS`(1500) 的推理会追加 `CLIP_MARK`，
+    # 而那个标记**不在发起方原文里** → 子串判断恒假 → 去重静默失效（不报错、只是
+    # prompt 又长了一倍）。实测这类 turn 占 8/599(1.3%)，量不大但失效方式是静默的，
+    # 而且恰恰发生在 prompt 已经最长的那些 turn 上——正是最不该浪费预算的时候。
+    from agents.parsing import CLIP_MARK, MAX_REASONING_CHARS
+    long_r = "第一步推导" * (MAX_REASONING_CHARS // 4)     # 远超 1500 字
+    assert len(long_r) > MAX_REASONING_CHARS
+    script4 = {
+        "controller": list(_CTRL),
+        "proposer": [
+            f"推理过程：{long_r}\n最终答案：41\n" + INTER.format(a="request", t="critic"),
+            "推理过程：fix\n最终答案：42\n" + INTER.format(a="none", t="none"),
+        ],
+        "critic": ["错误分析：第二步错了\n" + INTER.format(a="none", t="none")],
+        "verifier": ["分数: 0.9\n验证说明：ok\n" + INTER.format(a="none", t="none")] * 4,
+    }
+    eng4 = FakeEngine(script4)
+    _mk_executor(eng4, stop_gate=False).run_episodes_batch(["6*7=?"], ["42"])
+    cp4 = [p for role, p in eng4.prompts if role == "critic"][0]
+    assert CLIP_MARK in cp4, "fixture 失效：这段推理没触发 MAX_REASONING_CHARS 截断"
+    assert "对方内容：" not in cp4, \
+        "推理被 CLIP_MARK 截断时去重失效了——比较前没剥掉标记，子串判断恒假"
+
+
+def test_vote_counterfactual_arms_do_not_touch_the_production_path():
+    """2×2 反事实臂是旁挂观测；生产的 `final_answer` / `is_correct` 一位都不许变。
+
+    这条是本轮改动的**硬约束**。四臂的存在意义是"不必真打开 `correction_in_vote`
+    就知道该不该打开"，可一旦哪个臂的 `exclude` 串到生产那一路，acc 的变化就会被
+    误读成开关的效果——那比没有反事实更坏。
+
+    构造要小心**平票**：只有一轮时 `excl` 池是 `{'5':1}`、`incl` 是 `{'5':1,'42':1}`，
+    `Counter.most_common` 平票按插入序取第一个，于是两臂都判错、断言一点劲都吃不到
+    （本条第一版正是这样，被自己那句"两个臂必须真的分歧"的前置断言抓住了——这类
+    前置断言值得多写，它保护的是断言的**有效性**而不是被测代码）。
+    所以改成两轮：错答案分别是 5 和 7，两次修正都给 42。于是
+    `excl = {'5':1,'7':1}`（平票取 5，错），`incl = {'5':1,'7':1,'42':2}`（取 42，对）。
+    """
+    _W = "推理过程：{r}\n最终答案：{a}\n"
+
+    def _run(corr_in_vote):
+        script = {
+            "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>",
+                           "<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>",
+                           "<meta-plan>\ndecision: stop\nreason: r\n</meta-plan>"],
+            # 顺序 = 轮1 primary → 轮1 修正(hop2) → 轮2 primary → 轮2 修正(hop2)
+            "proposer": [
+                _W.format(r="x", a="5") + INTER.format(a="request", t="critic"),
+                _W.format(r="fix", a="42") + INTER.format(a="none", t="none"),
+                _W.format(r="y", a="7") + INTER.format(a="request", t="critic"),
+                _W.format(r="fix", a="42") + INTER.format(a="none", t="none"),
+            ],
+            "critic": ["错误分析：算错了\n" + INTER.format(a="none", t="none")] * 2,
+            "verifier": ["分数: 0.9\n验证说明：ok\n" + INTER.format(a="none", t="none")] * 4,
+        }
+        ex = _mk_executor(FakeEngine(script), stop_gate=False,
+                          correction_in_vote=corr_in_vote)
+        return ex.run_episodes_batch(["6*7=?"], ["42"])[0]
+
+    off = _run(False)
+    for k in ("is_correct_uni_excl", "is_correct_wt_excl",
+              "is_correct_uni_incl", "is_correct_wt_incl"):
+        assert k in off, f"四臂缺 {k}"
+    # 两个臂必须真的分歧，否则下面的断言不吃劲
+    assert off["is_correct_uni_excl"] is not off["is_correct_uni_incl"], \
+        "excl 与 incl 判定相同——这个 fixture 测不到任何东西，先修 fixture"
+    # 关闭时生产 == 排除臂
+    assert off["is_correct"] == off["is_correct_uni_excl"], \
+        "correction_in_vote=False 时生产路径应等于排除臂"
+
+    on = _run(True)
+    # 打开时生产 == 进池臂，而**四臂的语义一个都不许跟着翻**
+    assert on["is_correct"] == on["is_correct_uni_incl"], \
+        "correction_in_vote=True 时生产路径应等于进池臂"
+    for k in ("is_correct_uni_excl", "is_correct_wt_excl",
+              "is_correct_uni_incl", "is_correct_wt_incl"):
+        assert on[k] == off[k], (
+            f"{k} 随生产开关变了——四臂必须方向恒定，否则 d_corr 的符号会跟着翻，"
+            f"而图上完全看不出来")
+    # 旧名钉在排除臂上（wandb 历史曲线的含义不许静默漂移）
+    for r in (off, on):
+        assert r["is_correct_uniform"] == r["is_correct_uni_excl"]
+        assert r["is_correct_weighted"] == r["is_correct_wt_excl"]
+
+
+def test_correction_funnel_counts_both_directions():
+    """修正漏斗必须双向计数：flip（错→对）与 unflip（对→错）不能塌成一个数。
+
+    v3 step150 的 `fnl=561/566/76` 只有单向的 76，而 `correction_in_vote` 那条注释
+    记的是净效应为负——两者同时成立只能推出反向 **>76**，具体多少现有落盘一个字节
+    都查不到。于是"打开开关后 acc 变 0.01"分不清是"帮 76 毁 70"还是"帮 200 毁 194"，
+    而这两种情形下一步该做的事完全相反。
+
+    另断一条容易漏的语义：**没有修正 turn 的轮上两个计数都必须是 0**。`p_end` 在
+    无修正时缺省等于 `p_prim`，所以两个合取天然为假；写成别的形式（比如用
+    `corrected_answer is None` 当哨兵）就会在这里出错。
+    """
+    from agents.raca_rewards import compute_turn_data
+    from training.metrics import rollout_metrics
+
+    def _rec(prim, corr):
+        return {
+            "u": True, "forced": False, "target": "critic",
+            "primary_tid": 0, "primary_answer": prim,
+            "corrected_answer": corr, "primary_parsed": True,
+            "ctrl_tid": None, "gate_blocked": False,
+            "critic_turns": [{"tid": 1, "flagged": True, "reviewed_answer": prim,
+                              "correction_followed": corr is not None}],
+            "verifier_turns": [], "sigma": "verify",
+            "correction_turns": ([{"tid": 2, "answer": corr}] if corr else []),
+        }
+
+    # 三轮：错→对（flip）、对→错（unflip）、无修正（两者都不算）
+    recs = [_rec("5", "42"), _rec("42", "5"), _rec("42", None)]
+    _, meta = compute_turn_data(recs, "42", True, 4, CFG,
+                               stop_ctrl_tid=None, stop_sigma="verify")
+    assert [m["flip"] for m in meta] == [True, False, False], \
+        f"flip 方向错了：{[m['flip'] for m in meta]}"
+    assert [m["unflip"] for m in meta] == [False, True, False], \
+        f"unflip 方向错了：{[m['unflip'] for m in meta]}"
+
+    st = rollout_metrics([[{"is_correct": True, "raca_round_meta": meta,
+                            "raca_turn_data": {}, "stopped": True}]])
+    assert st["funnel_flip"] == 1 and st["funnel_unflip"] == 1, \
+        f"漏斗聚合塌了：flip={st['funnel_flip']} unflip={st['funnel_unflip']}"
+    assert st["funnel_corr"] == 2, "两次修正应都计入 corr"
+
+
+def test_funnel_unflip_survives_the_round_meta_whitelist():
+    """`unflip` 要走完 round_records → compute_turn_data → round_meta → metrics 四跳。
+
+    #23 正是在第三跳栽的：`round_meta` 是 `compute_turn_data` **重新拼的白名单
+    dict、不是 round_records 的透传**，漏带一手的后果是指标照样打印、但永远 0.00——
+    比不加埋点更坏，因为它长得和真读数一模一样。所以这条不测方向（上一条测了），
+    只测"这个键真的活着穿过了白名单"。
+    """
+    import inspect
+
+    from agents import raca_rewards
+    src = inspect.getsource(raca_rewards.compute_turn_data)
+    assert '"unflip"' in src, \
+        "round_meta 的白名单里没有 unflip —— metrics 会读到永远 0.00 的假读数"
+
+    from agents.raca_rewards import compute_turn_data
+    from training.metrics import rollout_metrics
+
+    # 用真实产物再把键删掉，模拟"旧 round record"——比手搓字典更贴近真实退化场景
+    # （手搓的还容易漏掉 metrics 需要的必填键，那样测的就是 fixture 而不是代码）。
+    rec = {
+        "u": True, "forced": False, "target": "critic",
+        "primary_tid": 0, "primary_answer": "5", "corrected_answer": "42",
+        "primary_parsed": True, "ctrl_tid": None, "gate_blocked": False,
+        "critic_turns": [{"tid": 1, "flagged": True, "reviewed_answer": "5",
+                          "correction_followed": True}],
+        "verifier_turns": [], "sigma": "verify",
+        "correction_turns": [{"tid": 2, "answer": "42"}],
+    }
+    _, meta = compute_turn_data([rec], "42", True, 4, CFG,
+                                stop_ctrl_tid=None, stop_sigma="verify")
+    old = [{k: v for k, v in meta[0].items() if k != "unflip"}]
+    st = rollout_metrics([[{"is_correct": True, "raca_turn_data": {},
+                            "stopped": True, "raca_round_meta": old}]])
+    assert st["funnel_unflip"] == 0, "缺键时应低报为 0，不能虚报"
+    assert st["funnel_flip"] == 1, "同一条记录里的 flip 仍应读得到"
+
+
+def test_three_hop_chain_can_reach_verifier():
+    """`max_hops: 3` 打开的那条新路径：critic 标错 → proposer 修正 → verifier 打分。
+
+    这条测试的存在本身是个警告：改到第十轮之前，**58 条测试里没有一条覆盖 3 跳链**
+    （`_mk_executor` 默认 max_hops=2，只有 max_hops=0 的消融），也就是说加预算之后
+    第一次真正跑这条路径会是在集群上。
+
+    要记住的限定：第 3 跳**没有机制把守**。第 2 跳里 critic 标错触发 proposer 修正
+    是写死的（`target="proposer"`），但第 3 跳要求**修正后的 proposer 自己写出**
+    `request verifier`。所以这条测试的脚本里那个块是刻意写出来的——它测的是"路径
+    通不通"，不是"模型会不会走"。会不会走由跑起来之后的 `hop=` 读数回答。
+    """
+    script = {
+        # 先 continue 再 stop —— 第一句 stop 会让 episode 在 proposer 之前就终止
+        "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>",
+                       "<meta-plan>\ndecision: stop\nreason: r\n</meta-plan>"],
+        "proposer": [
+            "推理过程：x\n最终答案：5\n" + INTER.format(a="request", t="critic"),
+            # 修正 turn 自己发起第 3 跳（没有机制会替它发）
+            "推理过程：fix\n最终答案：42\n" + INTER.format(a="request", t="verifier"),
+        ],
+        "critic": ["错误分析：第二步错了\n" + INTER.format(a="none", t="none")],
+        "verifier": ["分数: 0.9\n验证说明：修正后正确\n" + INTER.format(a="none", t="none")] * 3,
+    }
+    eng = FakeEngine(script)
+    ex = _mk_executor(eng, stop_gate=False, max_hops=3)
+    ex.run_episodes_batch(["6*7=?"], ["42"])
+    chain = [r for r in eng.calls if r != "controller"]
+    assert chain == ["proposer", "critic", "proposer", "verifier"], \
+        f"3 跳链没走通：{chain}"
+
+    # 对照：同一个脚本在 max_hops=2 下第 3 跳必须被预算拦掉
+    eng2 = FakeEngine({k: list(v) for k, v in script.items()})
+    _mk_executor(eng2, stop_gate=False, max_hops=2).run_episodes_batch(["6*7=?"], ["42"])
+    chain2 = [r for r in eng2.calls if r != "controller"]
+    assert chain2 == ["proposer", "critic", "proposer"], \
+        f"max_hops=2 下不该走到第 3 跳：{chain2}"
+
+
+def test_hop_depth_counter_matches_the_actual_chain():
+    """跳深计数器是 `max_hops` 2→3 的**唯一**验收读数，所以它自己得先准。
+
+    只统计真发出去的请求（空批次不记），并按响应方角色分开——`max_hops: 3` 想要的
+    具体事件是"第 3 跳到达 verifier"（修正后的答案在轮内被打分），只看总数分不出
+    它到的是 verifier 还是又一次 critic。
+    """
+    script = {
+        # 先 continue 再 stop —— 第一句 stop 会让 episode 在 proposer 之前就终止，
+        # 计数器就恒为空，断言反而"通过"不了但也测不到东西。
+        "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>",
+                       "<meta-plan>\ndecision: stop\nreason: r\n</meta-plan>"],
+        "proposer": [
+            "推理过程：x\n最终答案：5\n" + INTER.format(a="request", t="critic"),
+            "推理过程：fix\n最终答案：42\n" + INTER.format(a="request", t="verifier"),
+        ],
+        "critic": ["错误分析：第二步错了\n" + INTER.format(a="none", t="none")],
+        "verifier": ["分数: 0.9\n验证说明：ok\n" + INTER.format(a="none", t="none")] * 3,
+    }
+    eng = FakeEngine(script)
+    ex = _mk_executor(eng, stop_gate=False, max_hops=3)
+    ex.run_episodes_batch(["6*7=?"], ["42"])
+    hd = ex.n_hop_depth
+    assert hd[1] == 1 and hd[2] == 1 and hd[3] == 1, f"跳深总数不对：{dict(hd)}"
+    assert hd["1:critic"] == 1, "第 1 跳应到 critic"
+    assert hd["2:proposer"] == 1, "第 2 跳应是机械触发的 proposer 修正"
+    assert hd["3:verifier"] == 1, "第 3 跳应到 verifier —— 这正是加预算想买到的事件"
+    assert 4 not in hd, "max_hops=3 却记到了第 4 跳"
+
+    # 每批次必须重置，否则 train.py 读到的是累计值而不是本步值
+    ex.run_episodes_batch([], [])
+    assert not ex.n_hop_depth, "n_hop_depth 没有按批次重置"
 
 
 if __name__ == "__main__":

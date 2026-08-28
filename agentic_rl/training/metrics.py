@@ -65,13 +65,21 @@ def rollout_metrics(batch_rollouts: list) -> dict:
             [1.0 if m.get("no_label", False) else 0.0 for m in rounds]))
         out["empty_answer_rate"] = float(np.mean(
             [1.0 if m.get("empty_answer", False) else 0.0 for m in rounds]))
-        # ── 修正漏斗（v2.2）：flag → correction → flip ──────────────────
+        # ── 修正漏斗（v2.2）：flag → correction → flip / unflip ──────────────
         # v2.1 实测 eff≈0 的定位工具。计入全部轮（含 forced 注入）：
         # flag 高而 corr 低 = 修正跳断（hop 预算/机制）；
         # corr 高而 flip 低 = proposer 拿着反馈也修不对（反馈质量/能力上限）。
+        #
+        # 第十轮补 `funnel_unflip`（对 → 错）。**单向的 flip 结构上答不了"修正净效应"**：
+        # v3 step150 的 76 次只是"救回来多少"，而 `correction_in_vote` 的负测量说明
+        # 反向次数 >76。要读的是 `flip − unflip` 的符号——这才是"修正票该不该进投票
+        # 池"的判据，而它此前一个来源都没有。
+        # 缺键默认按"没失败"取（与 `no_label` / `empty_answer` 同口径）：这两个是
+        # 失败/事件计数，旧 round record 只会被读成 0，不会凭空造出一个率。
         out["funnel_flag"] = int(sum(m.get("n_flagged", 0) for m in rounds))
         out["funnel_corr"] = int(sum(m.get("n_corrections", 0) for m in rounds))
         out["funnel_flip"] = int(sum(1 for m in rounds if m.get("flip")))
+        out["funnel_unflip"] = int(sum(1 for m in rounds if m.get("unflip")))
 
     # ── stop 校准：P(correct | stop) vs P(correct | 耗尽轮次) ────────────────
     stopped   = [ep["is_correct"] for ep in eps if ep.get("stopped")]
@@ -83,6 +91,27 @@ def rollout_metrics(batch_rollouts: list) -> dict:
     if eps:
         out["stop_rate"] = float(np.mean(
             [1.0 if ep.get("stopped") else 0.0 for ep in eps]))
+
+    # ── 2×2 反事实计票（训练侧，第十轮） ─────────────────────────────────────
+    # 与下面票池埋点同一条理由：**eval 的 Δ 不能外推到训练分布**。eval 是 greedy
+    # 单样本，训练是 temperature 采样 n_samples 份，池子形态本就不同；而
+    # `correction_in_vote` / `vote_mode` 那两个负测量（Δ=−0.062/−0.018、d_vote 14/15
+    # 为负）**都是在 eval 上测的**，从没在训练分布上读过。这里补上。
+    #
+    # 方向恒定，不随生产开关变化（与 `agentic_executor` 四臂同一约定）：
+    #   d_vote = weighted − uniform（钉在「修正票排除」臂）
+    #   d_corr = 修正票进池 − 不进池（钉在 uniform 臂）
+    # 缺键退回 `is_correct`，于是旧 episode 上两个 Δ 都读成 0，不会凭空造出信号。
+    if eps:
+        def _acc(key):
+            return float(np.mean([1.0 if ep.get(key, ep["is_correct"]) else 0.0
+                                  for ep in eps]))
+        a_ue, a_we = _acc("is_correct_uni_excl"), _acc("is_correct_wt_excl")
+        a_ui, a_wi = _acc("is_correct_uni_incl"), _acc("is_correct_wt_incl")
+        out["acc_uni_excl"], out["acc_wt_excl"] = a_ue, a_we
+        out["acc_uni_incl"], out["acc_wt_incl"] = a_ui, a_wi
+        out["d_vote"] = a_we - a_ue
+        out["d_corr"] = a_ui - a_ue
 
     # ── 票池埋点（训练侧） ───────────────────────────────────────────────────
     # eval 侧早有 pool/dist/deg/marg，但**训练侧一直没报**：两边的采样条件不同

@@ -15,6 +15,7 @@ from collections import Counter
 
 from agents.grader import math_equal   # re-export：evaluate.py 从此模块导入
 from agents.parsing import (
+    CLIP_MARK,
     MAX_CHANNEL_CHARS,
     ROLE_NAMES,
     critic_found_errors,
@@ -70,6 +71,17 @@ class AgenticExecutor:
         self.n_prompt_clipped = 0
         self.n_gate_unlocked = 0    # 本批次闸门解锁次数（健康指标：应随训练下降）
         self.n_self_target = 0      # proposer 自指 target（被归一为 none）的次数
+        # 交互链按**跳深**分布（第十轮，`max_hops` 2→3 的配套读数）。
+        # 为什么非要这个数：第 1 跳（proposer→critic/verifier）由 proposer 的块决定，
+        # 第 2 跳里 critic 标错→proposer 修正是**机械触发**（写死 "proposer"），但
+        # 第 3 跳（修正→verifier）**没有机制**，它要求修正后的 proposer 自己写出
+        # `request verifier`。而这个仓库已经在同一个坑里栽过一次——`:377` 注释记着
+        # "v2.1 实测 eff≈0：修正跳由**未学会的行为**把守，correction_turns 几乎恒空
+        # → q≈0 → 发起恒负期望 → int_rate 塌"，所以才把它改成机械触发。
+        # 于是 `max_hops: 3` 买到的只是**可能性**，不是保证。这个计数器就是判据：
+        # depth3 若接近 0，说明该照 critic 那条的样子把它也做成机械触发（行为改动，
+        # 单独一步）；若明显非 0，才说明加预算本身就够了。
+        self.n_hop_depth = Counter()
         self._rng = random.Random()
 
     # ── batch entry point（N episodes 并行，逐 turn-slot 批量调 vLLM） ───────
@@ -83,6 +95,7 @@ class AgenticExecutor:
             eps_force = 0.0
         self.n_gate_unlocked = 0    # 每批次重置；train.py 读到的就是本步值
         self.n_self_target = 0      # 同上
+        self.n_hop_depth.clear()    # 同上（跳深分布）
 
         n = len(questions)
         blackboards    = [Blackboard() for _ in range(n)]
@@ -158,13 +171,16 @@ class AgenticExecutor:
                 # 去重：flaw 窗口放宽到 `MAX_CHANNEL_CHARS` 后，黑板的「发现问题」
                 # 与下面 `proposer_correction_user` 的 `initiator_output` 在 critic
                 # 硬触发路径上是**逐字节相同**的两份拷贝（同一个 `shown`、同样的
-                # 窗口），白占 300 字预算还让 prompt 自我重复。这里按内容比对来判定，
-                # 而不是推断"initiator 是不是 critic"——critic 未标错却主动请求修正时
-                # flaws[-1] 是更早的另一条，那份信息是真的、不能扔。
-                # 用常量而非字面量 300：这个比较**必须**与两处截断同宽。窄了会把
-                # 两份实际相同的拷贝判成不同（去重失效，白付预算），宽了会把两份
-                # 前 300 字相同、后文不同的内容判成同一条（误删真信息）。写成两个
-                # 恰好相等的字面量，等于把这条耦合交给记性——已经栽过五次了。
+                # 窗口），白占一整个 `MAX_CHANNEL_CHARS` 的预算还让 prompt 自我重复。
+                # 这里按内容比对来判定，而不是推断"initiator 是不是 critic"——critic
+                # 未标错却主动请求修正时 flaws[-1] 是更早的另一条，那份信息是真的、
+                # 不能扔。
+                # 用常量而非字面量：这个比较**必须**与两处截断同宽，否则就是第三把
+                # 尺子。比较宽度取小了，两份只在前缀相同、后文不同的内容会被判成同
+                # 一条（误删真信息）；取大了则会因为其中一份已被截断而判成不同（去
+                # 重失效，白付预算）。写成两个恰好相等的字面量，等于把这条耦合交给
+                # 记性——已经栽过五次了。**第十轮把常量从 300 改成 600 时这里不用动
+                # 一个字，这正是当初写成常量换来的。**
                 dup = (bool(bb.flaws)
                        and bb.flaws[-1]["content"][:MAX_CHANNEL_CHARS]
                        == init_out[:MAX_CHANNEL_CHARS])
@@ -172,8 +188,32 @@ class AgenticExecutor:
                     questions[i], ROLE_NAMES.get(initiator, initiator),
                     init_out, bb.to_text(include_flaws=not dup))
             if not forced and target != "proposer":
+                # 去重（第十轮）：上面 critic / verifier 那两路的 `usr` 开头已经带了
+                # `last[0]`（`待审查解法：` / `推理：`），而 `request_context` 的
+                # 「对方内容」在**发起方就是产出 last 的那个 proposer** 时是同一段
+                # 文本的第二份拷贝——且前者上限是 `MAX_REASONING_CHARS`(1500)、比
+                # 后者的 `MAX_CHANNEL_CHARS` 宽，所以被截断的恰恰是那份多余的。
+                # 实测（`data/sft_train_v23.jsonl` 渲染出的 310 处「对方内容」）：
+                # **247 处可判为重复**（critic 132 / verifier 115），每处白占约 263
+                # 字，合计约 6.5 万字符；**63 处是 verifier 独有**，那是发起方不是
+                # proposer 的情形（如 critic→verifier），此时「对方内容」是 critic 的
+                # 批评而 `推理：` 是 proposer 的推理，两份不同，扔了就是丢真信息。
+                #
+                # 所以判据**按内容比对，不按角色推断**——与上面 `dup` 同一条理由。
+                # 比的是 `last[0]`（已经在 prompt 里的那份）是否被 `init_out` 覆盖：
+                # `init_out` 是未解析的完整输出（含 `推理过程：` 标签与答案行），
+                # `last[0]` 是它过 `parse_reasoning` 之后的推理正文，所以方向只能是
+                # 「后者是前者的子串」，反过来写恒为假。空串不算重复（`last[0]` 为空
+                # 时任何 `in` 都真，会把独有内容误删——这是本条最容易写错的地方）。
+                # 一个会让这条去重静默失效的边界：`last[0]` 是 `parse_reasoning` 的
+                # 产物，推理超 `MAX_REASONING_CHARS`(1500) 时它**末尾带 `CLIP_MARK`**，
+                # 而那个标记不在 `init_out` 里 → 子串判断恒假 → 去重白做。实测这类
+                # turn 是 8/599（1.3%），量不大但失效方式是静默的，所以比较前剥掉。
+                _seen = last[0][:-len(CLIP_MARK)] \
+                    if last[0].endswith(CLIP_MARK) else last[0]
+                quoted = init_out if not (_seen and _seen in init_out) else None
                 usr += PromptTemplates.request_context(
-                    ROLE_NAMES.get(initiator, initiator), action, reason, init_out)
+                    ROLE_NAMES.get(initiator, initiator), action, reason, quoted)
             return sys, usr, (last[1] if bb.traces else "")
 
         for _ in range(self.max_rounds):
@@ -327,6 +367,14 @@ class AgenticExecutor:
                     batch_req.append((i, next_tid(i), target, sys, usr, reviewed))
                 if not batch_req:
                     break
+                # 跳深计数（从 1 起，与"第几跳"的口头说法一致）。放在 `break` 之后、
+                # `generate_batch` 之前：只统计**真的发出去**的请求，空批次不记。
+                # 同时按响应方角色分开记，因为 `max_hops: 3` 想要的具体事件是
+                # "第 3 跳到达 verifier"（修正后的答案在轮内被打分），只看总数分不出
+                # 它到的是 verifier 还是又一次 critic。
+                self.n_hop_depth[_hop + 1] += len(batch_req)
+                for _, _, _t, _, _, _ in batch_req:
+                    self.n_hop_depth[f"{_hop + 1}:{_t}"] += 1
 
                 res_all = self.vllm_engine.generate_batch(
                     [{"role": t, "prompt": make_prompt(s, u),
@@ -449,20 +497,33 @@ class AgenticExecutor:
         # ── finalise ─────────────────────────────────────────────────────────
         results = []
         for i in range(n):
+            # 生产路径：这三行是唯一决定交出去的答案的地方，下面的反事实臂**一行都
+            # 不许碰它**。四臂是旁挂的观测；哪个臂的 exclude 串到这里来，就等于悄悄
+            # 改了判定，而 acc 的变化会被误读成开关的效果。测试钉住了这条。
             exclude = None if self.correction_in_vote else corr_answers[i]
             final_answer = self._majority_vote(blackboards[i], exclude)
             is_correct = math_equal(final_answer, correct_answers[i])
-            # 消融对照（§19.3 判据①）：同一批 episode 上两种计票各自的正确性，
-            # 免二次 rollout 即可在线量化加权投票的 Δacc。两路都无条件计算，
-            # 使 d_vote 恒为「weighted − uniform」而不随生产 vote_mode 变化——
-            # v3.1 回退 uniform 后若只算生产那一路，d_vote 会恒等于 0，重开
-            # weighted 的判据就此失明。计票是纯本地运算，无额外采样开销。
-            uni_correct = math_equal(
-                self._majority_vote(blackboards[i], exclude, mode="uniform"),
-                correct_answers[i])
-            wt_correct = math_equal(
-                self._majority_vote(blackboards[i], exclude, mode="weighted"),
-                correct_answers[i])
+            # 消融对照（§19.3 判据①）：同一批 episode 上多种计票各自的正确性，
+            # 免二次 rollout 即可在线量化聚合方式的 Δacc。所有臂都**无条件**计算，
+            # 使读数方向恒定而不随生产开关变化——v3.1 回退 uniform 后若只算生产那
+            # 一路，d_vote 会恒等于 0，重开 weighted 的判据就此失明。
+            #
+            # 第十轮扩成 2×2：`correction_in_vote` 与 `vote_mode` 都是**黑板的后处理
+            # 函数**，同一批 rollout 上四种组合全算得出，`_majority_vote` 是纯本地
+            # 计数、零采样开销。于是：
+            #   d_vote = wt_excl − uni_excl   （钉在排除臂，与 v3 基线同口径）
+            #   d_corr = uni_incl − uni_excl  （钉在 uniform 臂，同理）
+            # **不必真打开 `correction_in_vote` 就能知道该不该打开**——这正是上面
+            # 那条"读数方向恒定"的原则第二次派上用场。
+            _excl, _incl = corr_answers[i], None
+            uni_excl = math_equal(self._majority_vote(
+                blackboards[i], _excl, mode="uniform"), correct_answers[i])
+            wt_excl = math_equal(self._majority_vote(
+                blackboards[i], _excl, mode="weighted"), correct_answers[i])
+            uni_incl = math_equal(self._majority_vote(
+                blackboards[i], _incl, mode="uniform"), correct_answers[i])
+            wt_incl = math_equal(self._majority_vote(
+                blackboards[i], _incl, mode="weighted"), correct_answers[i])
             turn_data, round_meta = compute_turn_data(
                 round_records[i], correct_answers[i], is_correct,
                 self.max_rounds, self.cfg,
@@ -486,8 +547,17 @@ class AgenticExecutor:
                 "raca_round_meta": round_meta,
                 "final_answer":    final_answer,
                 "is_correct":      is_correct,
-                "is_correct_uniform":  uni_correct,
-                "is_correct_weighted": wt_correct,
+                # 2×2 反事实臂（第十轮）。excl = 修正票不进池，incl = 进池。
+                "is_correct_uni_excl": uni_excl,
+                "is_correct_wt_excl":  wt_excl,
+                "is_correct_uni_incl": uni_incl,
+                "is_correct_wt_incl":  wt_incl,
+                # 旧名保留，供 wandb 历史曲线连续。**刻意钉在「排除臂」上而不是跟着
+                # 生产 `correction_in_vote` 走**：跟着走的话，开关一翻这两条曲线的
+                # 含义就静默变了，而图上完全看不出来——那正是本仓库反复栽的
+                # 「两把尺子」的种子。要读生产路径请用 `is_correct`。
+                "is_correct_uniform":  uni_excl,
+                "is_correct_weighted": wt_excl,
                 "stopped":         stop_ctrl_tids[i] is not None,
                 "n_votes":         n_votes,
                 "n_distinct":      len(pool),

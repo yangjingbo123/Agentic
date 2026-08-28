@@ -200,6 +200,20 @@ def compute_turn_data(
             "n_flagged":     sum(1 for ct in rnd["critic_turns"] if ct["flagged"]),
             "n_corrections": len(rnd["correction_turns"]),
             "flip":          (not p_prim) and p_end,
+            # 第十轮补的反向计数。**没有它，"修正到底值不值得进投票池"这个问题结构
+            # 上答不了。** v3 step150 的 `fnl=561/566/76` 只说"救回来 76 次"，而
+            # `configs/agentic/default.yaml` 里 `correction_in_vote` 那条注释记的是
+            # 净效应为负（Δ=−0.062/−0.018）——两者同时成立只能说明反向次数 **>76**，
+            # 但具体多少现有落盘一个字节都查不到（`train.py` 只 dump `{"step": step}`）。
+            # 于是打开开关之后 acc 变了 0.01，你分不清是"帮 76 毁 70"还是"帮 200 毁
+            # 194"，而这两种情形下一步该做的事完全相反。
+            #
+            # 注意 `p_end` 的缺省语义（见 `p_end_list` 的构造）：没有修正 turn 时
+            # `p_end = p_prim`，所以 `flip` 与 `unflip` 在无修正的轮上都为 False，
+            # 两个计数天然只统计真发生过修正的轮，不需要额外守卫。
+            # 又：`round_meta` 是**重新拼的白名单 dict、不是 `round_records` 的透传**，
+            # 漏带这一手的后果是指标照样打印、但永远 0.00（#23 已经在这一跳栽过一次）。
+            "unflip":        p_prim and (not p_end),
         })
 
     # ── Controller episode 结果奖励（§4.5，公式与 v1 一致） ─────────────────

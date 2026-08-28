@@ -19,9 +19,13 @@ v2 的 323 行**本身就是有序 episode**，且拓扑全部落在 RL 可达�
 worker 子序列只有六种：`prop→crit→veri` 195、`prop→veri` 104、
 `prop→crit→prop→veri` 16、`prop→veri→crit` 6、`prop→crit` 1、
 `prop→veri→prop→veri` 1；**323/323 行的第一个 worker 都是 proposer**，与 RL 的
-"proposer 固定起点"一致。四 worker 的那两种看着超了 `max_hops=2`，其实正是
-`gate_unlock` 那条**不占 hop 预算**的独立 verifier 批次（`agentic_executor.py`
-§3.5），所以依然可达。
+"proposer 固定起点"一致。四 worker 的那两种（`prop→crit→prop→veri` 16、
+`prop→veri→prop→veri` 1）在 `max_hops=2` 的年代看着超了预算，当时的解释是它们
+正是 `gate_unlock` 那条**不占 hop 预算**的独立 verifier 批次（`agentic_executor.py`
+§3.5），所以依然可达——**这条解释本身仍然成立**（那条通道没变）。
+第十轮把 `max_hops` 提到 3 之后它们又多了一条更直接的可达路径（第 3 跳），于是
+"是否可达"这个问题在两种预算下都是肯定的。这里保留旧解释而不是改写，因为这份
+数据是在 `max_hops=2` 时代生成的，用当时的预算去论证它的可达性才是忠实的。
 
 因此重建就是：按 turn 顺序把更早 turn 的 response 喂进一块真 `Blackboard`，再用
 `agentic_executor.py` 里那几行**同样的字面量**渲染 `user`。

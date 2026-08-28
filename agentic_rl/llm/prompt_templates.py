@@ -35,9 +35,12 @@ class PromptTemplates:
 
        M1 之后另两步已落地，此处一并记：块在**展示副本**上被显式剥离
        （`strip_interaction`，`5d4bac7`），窗口由 80 抬到
-       `MAX_CHANNEL_CHARS = 300`（`envs/blackboard.py`）。300 仍有 37%
+       `MAX_CHANNEL_CHARS`（第四轮 300，见 `envs/blackboard.py`）。300 仍有 37%
        （80/218）被截，故第四轮改为**带可见标记**截断（`clip_text`），
-       让接收方能分辨「说完了」与「被砍了」；继续加大窗口是另一回事。
+       让接收方能分辨「说完了」与「被砍了」；当时写的"继续加大窗口是另一回事"，
+       **第十轮把它做掉了**：窗口 300 → 600（完整送达 63.3% → 96.3%），预算由同轮
+       补的 `request_context` 去重腾出（实测 310 处「对方内容」里 247 处是同 prompt
+       内的逐字重复，每处约 263 字）。所以当前值不是 300，请以常量为准。
 
     注：`parse_interaction` 全文搜索块，不依赖位置；但 `parse_reasoning` 的
     `最终答案：` 正则原先缺块开标签的 lookahead，已同步修正（见 parsing.py）。
@@ -110,16 +113,36 @@ reason: [一句话]
 说明：先打分再据此决定是否交互。分数低时可用 request + proposer 要求改进，或 request + critic 请求审查。"""
 
     @staticmethod
-    def request_context(initiator: str, action: str, reason: str, initiator_output: str):
+    def request_context(initiator: str, action: str, reason: str,
+                        initiator_output):
         """拼在响应方标准 user prompt 末尾的请求上下文（响应方仍按标准格式输出）。
+
+        `initiator_output`: 字符串 = 照常引述；**`None` = 省掉引述那一行**。
+        刻意不写 `str | None` 类型标注：那是 PEP 604 语法、要 Python 3.10+，
+        而本机是 3.9、集群镜像版本未核实——为一个标注引入版本依赖不值得。
 
         `对方内容` 走 `clip_text` 而非硬切片：响应方要**基于这段内容**给判断，
         分不清"对方说完了"和"被砍了"就会对半句话下结论。窗口与黑板 flaw 同源。
+
+        `initiator_output=None` → **省掉引述那一行，只留发起意图。** 这一路是第十轮
+        补的去重（判据在 `agentic_executor.responder_prompt`，按内容比对、不按角色
+        推断）。实测在 `data/sft_train_v23.jsonl` 上渲染出的 310 处「对方内容」里
+        **247 处（critic 132 / verifier 115）是同一个 prompt 里已经完整给过一遍的
+        逐字重复**——响应方 prompt 开头的 `待审查解法：` / `推理：` 就是同一段文本，
+        且那一路的上限是 `MAX_REASONING_CHARS`(1500) 比这里宽，所以被截的恰恰是
+        那份多余的拷贝。每处白占约 263 字，合计约 6.5 万字符。
+
+        **意图行（协作者/action/理由）必须保留，它不是冗余的**：`agents/parsing.py`
+        里剥块的理由正是"发起意图已由 `request_context` 的 action/reason 显式表达"，
+        把这两行也省掉就等于把那条理由抽空了。
         """
+        head = f"\n协作者（{initiator}）发起了交互：{action}，理由：{reason}\n"
+        if initiator_output is None:
+            return head + "请按你的标准输出格式回应。"
         return (
-            f"\n协作者（{initiator}）发起了交互：{action}，理由：{reason}\n"
-            f"对方内容：{clip_text(initiator_output, MAX_CHANNEL_CHARS)}\n"
-            f"请按你的标准输出格式回应。"
+            head
+            + f"对方内容：{clip_text(initiator_output, MAX_CHANNEL_CHARS)}\n"
+            + "请按你的标准输出格式回应。"
         )
 
     @staticmethod
@@ -127,9 +150,13 @@ reason: [一句话]
                                  initiator_output: str, blackboard_text: str):
         """proposer 被要求修正解法时的 user prompt（输出标准 proposer 格式）。
 
-        同 `request_context`：被指出的问题若在第 300 字处断掉而不留痕迹，
-        proposer 会把半句批评当成完整意见去改，这是 v3 `flip/corr` 低的一个
+        同 `request_context`：被指出的问题若在第 `MAX_CHANNEL_CHARS` 字处断掉而不留
+        痕迹，proposer 会把半句批评当成完整意见去改，这是 v3 `flip/corr` 低的一个
         可疑来源（未证实，但至少先别自己制造这个歧义）。
+
+        这一路**刻意不做上面那种去重**：它的引述是 critic 的批评，而同 prompt 里的
+        `当前状态：` 已由 `agentic_executor` 的 `dup` 判据决定是否带「发现问题」段，
+        两处去重的判据不同、不能合并。
         """
         return (
             f"问题：{question}\n"

@@ -194,13 +194,19 @@ def main(cfg: DictConfig):
         _eval_hist.append(acc)
         _tail = _eval_hist[-_EVAL_TAIL_K:]
         acc_tail = float(np.mean(_tail))
-        # §19.3 判据①：两种计票各自的 acc。d_vote = weighted − uniform，与当前
-        # 生产 vote_mode 无关——v3.1 跑 uniform 时仍能持续监测加权投票能不能重开。
-        acc_uni = sum(ep.get("is_correct_uniform", ep["is_correct"])
-                      for ep in episodes) / len(episodes)
-        acc_wt  = sum(ep.get("is_correct_weighted", ep["is_correct"])
-                      for ep in episodes) / len(episodes)
+        # §19.3 判据①：多种计票各自的 acc。两个 Δ 的方向都恒定、与当前生产开关
+        # 无关——v3.1 跑 uniform 时仍能持续监测加权投票能不能重开，同理第十轮
+        # 起 `correction_in_vote` 无论开关如何都能读到"修正票进池的净收益"。
+        #   d_vote = weighted − uniform （钉在「修正票排除」臂）
+        #   d_corr = 进池 − 不进池      （钉在 uniform 臂）
+        def _eacc(key):
+            return sum(1 for ep in episodes
+                       if ep.get(key, ep["is_correct"])) / len(episodes)
+        acc_uni = _eacc("is_correct_uni_excl")
+        acc_wt  = _eacc("is_correct_wt_excl")
+        acc_uni_incl = _eacc("is_correct_uni_incl")
         d_vote = acc_wt - acc_uni
+        d_corr = acc_uni_incl - acc_uni
         # reward_mean: mean total RACA reward per episode (sum of all turn rewards)
         reward_mean = float(np.mean([
             sum(v["reward"] for v in ep.get("raca_turn_data", {}).values())
@@ -231,10 +237,18 @@ def main(cfg: DictConfig):
         # 正好相反。fgate 高而 int 低 = 交互全是机制撑的，别把它读成学会了求助。
         eval_forced_rate = float(np.mean([m["forced"] for m in _rounds])) if _rounds else 0.0
         eval_gate_rate   = float(np.mean([m["gate_blocked"] for m in _rounds])) if _rounds else 0.0
+        # eval 侧此前完全没报过修正漏斗（只有训练侧有）。两边采样条件不同
+        # （greedy 单样本 vs temperature 多份），所以训练侧的 flip/unflip 不能外推。
+        ev_flag = int(sum(m.get("n_flagged", 0) for m in _rounds))
+        ev_corr = int(sum(m.get("n_corrections", 0) for m in _rounds))
+        ev_flip = int(sum(1 for m in _rounds if m.get("flip")))
+        ev_unflip = int(sum(1 for m in _rounds if m.get("unflip")))
         print(f"  [eval] step={step} eval_acc={acc:.3f} "
               f"acc_tail{len(_tail)}={acc_tail:.3f} acc300={acc_300:.3f} "
               f"acc_uniform={acc_uni:.3f} acc_weighted={acc_wt:.3f} "
-              f"d_vote={d_vote:+.3f} "
+              f"acc_corr_in={acc_uni_incl:.3f} "
+              f"d_vote={d_vote:+.3f} d_corr={d_corr:+.3f} "
+              f"fnl={ev_flag}/{ev_corr}/{ev_flip}/{ev_unflip} "
               f"reward={reward_mean:.3f} "
               f"avg_turns={avg_turns:.1f} int_rate={eval_int_rate:.2f} "
               f"forced={eval_forced_rate:.2f} gate={eval_gate_rate:.2f} "
@@ -245,7 +259,11 @@ def main(cfg: DictConfig):
                    "eval_accuracy_n300": acc_300,
                    "eval_accuracy_uniform": acc_uni,
                    "eval_accuracy_weighted": acc_wt,
-                   "eval_vote_gain": d_vote, "eval_reward": reward_mean,
+                   "eval_accuracy_corr_in": acc_uni_incl,
+                   "eval_vote_gain": d_vote, "eval_corr_gain": d_corr,
+                   "eval_funnel_flag": ev_flag, "eval_funnel_corr": ev_corr,
+                   "eval_funnel_flip": ev_flip, "eval_funnel_unflip": ev_unflip,
+                   "eval_reward": reward_mean,
                    "eval_avg_turns": avg_turns, "eval_int_rate": eval_int_rate,
                    "eval_forced_rate": eval_forced_rate,
                    "eval_gate_rate": eval_gate_rate,
@@ -401,6 +419,14 @@ def main(cfg: DictConfig):
         # selfT 非 0 说明 proposer 在写 `target: proposer`（自指）。已被归一为
         # none 且不再计入 int_rate/r_int，但计数本身是 prompt 是否讲清楚的信号。
         _n_self = getattr(trainer.executor, "n_self_target", 0)
+        # 跳深分布（第十轮，`max_hops` 2→3 的验收指标）。第 3 跳**没有机制把守**，
+        # 它要求修正后的 proposer 自己写出 `request verifier`；depth3 若接近 0，说明
+        # 加预算没被用上，该照 critic 标错那条的样子做成机械触发。`3v` 单列"第 3 跳
+        # 到达 verifier"的次数，因为只看总数分不出它到的是 verifier 还是又一次 critic。
+        _hd = getattr(trainer.executor, "n_hop_depth", None) or {}
+        _hop_s = "/".join(f"{d}:{_hd.get(d, 0)}" for d in (1, 2, 3) if _hd.get(d))
+        if _hop_s and _hd.get("3:verifier"):
+            _hop_s += f"(3v={_hd['3:verifier']})"
         print(
             f"step={step} t={_dt_rollout:.0f}+{time.time() - _t_train0:.0f}s "
             f"reward={stats['mean_reward']:.3f} acc={stats['accuracy']:.2f} "
@@ -422,13 +448,17 @@ def main(cfg: DictConfig):
             f"gate={stats.get('gate_blocked', 0)}"
             f"→{getattr(trainer.executor, 'n_gate_unlocked', 0)} "
             f"fnl={stats.get('funnel_flag', 0)}/{stats.get('funnel_corr', 0)}"
-            f"/{stats.get('funnel_flip', 0)} "
+            f"/{stats.get('funnel_flip', 0)}/{stats.get('funnel_unflip', 0)} "
+            # dC = 训练侧 d_corr（修正票进池 − 不进池）。它是"修正票该不该进投票池"
+            # 的直接判据，且**不需要真打开 correction_in_vote** 就有读数。
+            f"dC={stats.get('d_corr', 0.0):+.3f} "
             f"dist={stats.get('pool_distinct', 0.0):.2f}"
             f"/deg={stats.get('pool_degenerate', 0.0):.2f}"
             f"/marg={stats.get('vote_margin', 0.0):.2f} "
             f"stop_rate={stats.get('stop_rate', 0.0):.2f} eps={eps_force:.2f}"
             + (f" clip_prompt={_n_clip}" if _n_clip else "")
-            + (f" selfT={_n_self}" if _n_self else ""),
+            + (f" selfT={_n_self}" if _n_self else "")
+            + (f" hop={_hop_s}" if _hop_s else ""),
             flush=True,
         )
         log_data = {
@@ -448,7 +478,9 @@ def main(cfg: DictConfig):
                     "q_forced", "int_critic_share",
                     "forced_rate", "stop_rate", "stop_acc", "exhaust_acc",
                     "gate_blocked",
-                    "funnel_flag", "funnel_corr", "funnel_flip",
+                    "funnel_flag", "funnel_corr", "funnel_flip", "funnel_unflip",
+                    "acc_uni_excl", "acc_wt_excl", "acc_uni_incl", "acc_wt_incl",
+                    "d_vote", "d_corr",
                     "pool_votes", "pool_distinct", "pool_degenerate",
                     "vote_margin"):
             if _mk in stats:
@@ -456,6 +488,10 @@ def main(cfg: DictConfig):
         log_data["gate_unlocked"] = getattr(trainer.executor, "n_gate_unlocked", 0)
         log_data["prompt_clipped"] = _n_clip
         log_data["self_target"] = _n_self
+        # 跳深分布逐深度上报（键为 int，wandb 需要字符串名）。
+        for _d in (1, 2, 3):
+            log_data[f"hop_depth_{_d}"] = int(_hd.get(_d, 0))
+        log_data["hop3_verifier"] = int(_hd.get("3:verifier", 0))
         if _g_total:
             # Fraction of question-groups that produced a usable advantage. A
             # sustained drop means rollouts are collapsing to identical rewards

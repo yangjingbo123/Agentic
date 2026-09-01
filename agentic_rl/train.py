@@ -367,11 +367,19 @@ def main(cfg: DictConfig):
             _chunks_a = [all_a[i::_k] for i in range(_k)]
             def _run_chunk(eng, qs, ans):
                 ex = AgenticExecutor(model, tokenizer, _agentic_cfg, vllm_engine=eng)
-                return ex.run_episodes_batch(qs, ans, eps_force=eps_force)
+                # **必须把 ex 一起返回。** 诊断计数器（n_hop_depth / n_gate_unlocked
+                # / n_self_target / n_prompt_clipped）挂在这个**临时**实例上，而 step
+                # 行读的是 trainer.executor —— 一个从未跑过 rollout 的对象。不聚合
+                # 回去，那四个读数就在集群上恒为 0（08-28 两跑全程如此，导致
+                # max_hops 2→3 与窗口 600 两项改动都没法验收）。见
+                # `AgenticExecutor.absorb_counters` 的 docstring。
+                return ex.run_episodes_batch(qs, ans, eps_force=eps_force), ex
             with _TPE(max_workers=_k) as _pool:
                 _futures = [_pool.submit(_run_chunk, eng, qs, ans)
                             for eng, qs, ans in zip(_engines, _chunks_q, _chunks_a)]
-                _chunks_out = [f.result() for f in _futures]
+                _pairs = [f.result() for f in _futures]
+            _chunks_out = [p[0] for p in _pairs]
+            trainer.executor.absorb_counters([p[1] for p in _pairs])
             all_eps = [None] * len(all_q)
             for _ei, _res in enumerate(_chunks_out):
                 for _j, _ep in enumerate(_res):

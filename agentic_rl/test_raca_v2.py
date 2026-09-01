@@ -2916,6 +2916,115 @@ def test_hop_depth_counter_matches_the_actual_chain():
     assert not ex.n_hop_depth, "n_hop_depth 没有按批次重置"
 
 
+def test_absorb_counters_keeps_batch_and_cumulative_semantics_apart():
+    """分片计数器聚合：批次级用赋值、累计级用累加，两者不能混。
+
+    背景：`train.py` 多引擎时走分片 rollout，每步为每个分片新建临时 executor，
+    而 step 行读 `trainer.executor`。08-28 两跑（7 个引擎）因此四个诊断读数全程
+    是假的 0 —— `hop=` 一次没打印（`max_hops` 2→3 的唯一验收指标失效）、
+    `clip_prompt=0` 不能证明 prompt 没超预算（窗口 600 的第一号风险项）。
+
+    这条测试钉的是**最容易写错的那一点**：两类计数器语义不同。
+      - 批次级（`run_episodes_batch` 开头重置）→ 赋值。写成 `+=` 会变成整轮累计，
+        只增不减，被误读成"越来越糟"。
+      - 累计级（只在 `__init__` 归零）→ 累加。写成赋值会每步覆盖、丢掉历史，
+        而"整轮有没有超过预算过"只有累计值答得了。
+    所以要连着 absorb 两次，才能把这两种错法都暴露出来 —— 只 absorb 一次的话，
+    赋值和累加在数值上看不出区别。
+    """
+    from collections import Counter
+
+    from agents.agentic_executor import AgenticExecutor
+
+    class _Fake:
+        def __init__(self, gate, self_t, clip, hops):
+            self.n_gate_unlocked = gate
+            self.n_self_target = self_t
+            self.n_prompt_clipped = clip
+            self.n_hop_depth = Counter(hops)
+
+    dst = object.__new__(AgenticExecutor)
+    dst.n_gate_unlocked = 0
+    dst.n_self_target = 0
+    dst.n_prompt_clipped = 0
+    dst.n_hop_depth = Counter()
+
+    shards = [_Fake(2, 1, 3, {1: 10, 2: 4, "1:critic": 7}),
+              _Fake(5, 0, 1, {1: 6, 3: 2, "3:verifier": 2})]
+
+    dst.absorb_counters(shards)
+    assert dst.n_gate_unlocked == 7 and dst.n_self_target == 1
+    assert dst.n_prompt_clipped == 4, "累计级应累加"
+    assert dst.n_hop_depth[1] == 16 and dst.n_hop_depth[2] == 4
+    assert dst.n_hop_depth[3] == 2, "跳深要按键相加，不能只取最后一个分片"
+    assert dst.n_hop_depth["1:critic"] == 7
+    assert dst.n_hop_depth["3:verifier"] == 2, "按角色分的键不能丢"
+
+    # 第二步（模拟下一个 step）：批次级必须**重新赋值**，累计级必须继续累加
+    dst.absorb_counters(shards)
+    assert dst.n_gate_unlocked == 7, \
+        f"批次级被累加了（{dst.n_gate_unlocked}）—— 会被误读成越来越糟"
+    assert dst.n_hop_depth[1] == 16, "跳深没有按批次重置"
+    assert dst.n_prompt_clipped == 8, \
+        f"累计级被覆盖了（{dst.n_prompt_clipped}）—— 丢掉了历史"
+
+    # 空分片列表：批次级归零，累计级不动（对应"这一步没有任何分片"）
+    dst.absorb_counters([])
+    assert dst.n_gate_unlocked == 0 and not dst.n_hop_depth
+    assert dst.n_prompt_clipped == 8
+
+
+def test_sharded_rollout_path_absorbs_counters():
+    """源码级不变量：`train.py` 的分片路径必须把分片计数器聚合回 trainer.executor。
+
+    为什么只能用源码级：分片路径要求 `vllm_engine.engines` 存在且 >1，没有真 vLLM
+    引擎任何行为测试都到不了 —— 这正是那四个计数器能在集群上静默失效整整两跑的
+    原因（本地单引擎路径读 `trainer.executor`，恰好是对的，所以本地永远看不出问题）。
+    第三次遇到"测不到的代码"，手法照旧：跑不到就用源码守，并做变异验证。
+
+    **为什么走 AST 而不是原文 grep**：第一版写的是 `assert "absorb_counters" in src`，
+    变异验证当场打脸 —— 把真实调用删掉换成 `pass`，断言**照样通过**，因为
+    `_run_chunk` 里我自己写的注释提到了 `AgenticExecutor.absorb_counters`。
+    这与第四轮 `test_no_bare_lt_lookahead_in_parsers` 栽的是同一个坑（被自己的
+    文档绊倒），已经是第三次。AST 天然排除注释与 docstring，只看会真正执行的代码。
+    """
+    import ast
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parent / "train.py").read_text(
+        encoding="utf-8")
+    tree = ast.parse(src)
+
+    # ① 必须有真实的 absorb_counters 调用（注释里提到不算）
+    absorb = [n for n in ast.walk(tree)
+              if isinstance(n, ast.Call)
+              and getattr(n.func, "attr", "") == "absorb_counters"]
+    assert absorb, \
+        "分片路径没有真正调用 absorb_counters —— hop/clip_prompt/selfT 会恒为 0"
+
+    # ② 聚合必须发生在**读计数器之前**，顺序错了照样读到聚合前的值
+    reads = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call)
+             and getattr(n.func, "id", "") == "getattr"
+             and len(n.args) >= 2
+             and isinstance(n.args[1], ast.Constant)
+             and n.args[1].value == "n_hop_depth"]
+    assert reads, "找不到读取 n_hop_depth 的位置，本不变量的前提变了"
+    assert min(a.lineno for a in absorb) < min(r.lineno for r in reads), \
+        "absorb_counters 在读取跳深之后 —— 顺序错了，读到的仍是聚合前的 0"
+
+    # ③ `_run_chunk` 的 return 必须是二元组且第二项是 executor 本身，
+    #    否则外面拿不到分片实例，聚合无从谈起
+    fn = [n for n in ast.walk(tree)
+          if isinstance(n, ast.FunctionDef) and n.name == "_run_chunk"]
+    assert fn, "分片路径的 _run_chunk 不见了，本不变量的前提变了"
+    rets = [n for n in ast.walk(fn[0]) if isinstance(n, ast.Return)]
+    assert len(rets) == 1 and isinstance(rets[0].value, ast.Tuple), \
+        "_run_chunk 应恰好返回一个二元组（结果, executor）"
+    second = rets[0].value.elts[1]
+    assert isinstance(second, ast.Name) and second.id == "ex", \
+        f"_run_chunk 返回的第二项不是 executor（实际 {ast.dump(second)[:60]}）"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

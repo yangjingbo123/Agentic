@@ -567,6 +567,38 @@ class AgenticExecutor:
             })
         return results
 
+    # ── 分片计数器聚合（v3.2 第十三轮） ─────────────────────────────────────
+    def absorb_counters(self, others) -> None:
+        """把分片 executor 的诊断计数器聚合到本实例。
+
+        为什么需要它：`train.py` 在多 vLLM 引擎时走**分片 rollout**，每步为每个
+        分片新建一个临时 `AgenticExecutor`，而 step 行读的是 `trainer.executor`
+        —— 一个从未跑过 rollout 的实例。于是 `n_hop_depth` / `n_gate_unlocked` /
+        `n_self_target` / `n_prompt_clipped` 在集群上**结构性恒为 0**。
+        08-28 两跑（`v32_m1` / `v32_open`，实测 7 个引擎）四个读数全程是假的 0：
+        `gate=363→0` 里那个 0 没有意义；`hop=` 一次都没打印，于是 `max_hops` 2→3
+        的**唯一**验收指标失效；`clip_prompt` 为 0 **不能**证明 prompt 没超预算，
+        而那正是窗口 600 的第一号风险项。
+        这与 #23 的 `round_meta` 白名单是同一类病：**指标照样打印、永远是 0。**
+
+        **两类计数器语义不同，聚合方式必须不同——这是本方法最容易写错的地方：**
+        - 批次级（`run_episodes_batch` 开头会重置）：`n_gate_unlocked`、
+          `n_self_target`、`n_hop_depth` → **赋值**为各分片之和。
+        - 累计级（只在 `__init__` 归零、跨步累加）：`n_prompt_clipped` → **累加**。
+
+        一律写 `+=` 会让批次级的数变成整轮累计（只增不减，被误读成"越来越糟"）；
+        一律写赋值会让 `clip_prompt` 每步被覆盖，丢掉历史 —— 而"整轮有没有超过
+        预算过"这个问题只有累计值答得了。
+        """
+        others = list(others)
+        self.n_gate_unlocked = sum(getattr(o, "n_gate_unlocked", 0) for o in others)
+        self.n_self_target = sum(getattr(o, "n_self_target", 0) for o in others)
+        self.n_prompt_clipped += sum(
+            getattr(o, "n_prompt_clipped", 0) for o in others)
+        self.n_hop_depth.clear()
+        for o in others:
+            self.n_hop_depth.update(getattr(o, "n_hop_depth", None) or {})
+
     # ── 单条入口（batch 路径的薄包装，评测脚本兼容） ─────────────────────────
     def run_episode(self, question: str, correct_answer: str) -> dict:
         return self.run_episodes_batch([question], [correct_answer])[0]

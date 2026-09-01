@@ -226,16 +226,30 @@ def test_r_int_useless_and_overkill():
 
 
 def test_r_int_no_unconditional_subsidy():
-    """v2.1 核心回归：不发起一律 0，不得给无条件补贴。
+    """v2.1 核心回归：不发起**且答对**一律 0，不得给无条件补贴。
 
     v2.0 给“不发起+答对”+0.1，这笔补贴与画蛇添足惩罚共同使 p>0.5 时
     发起的边缘期望恒为负（即使 q=1.0）→ int_rate 必然塌到 0。
+
+    **这条测试有一处历史局限，值得写下来当教训**：下面那段"边缘期望校准"用的是
+    **假设的** q=0.5，而 08-28 两跑实测 q（=`eff`）只有 **0.12**。于是这几条断言
+    一直全绿，而真实的边缘期望是负的、int_rate 在 40 步内塌到 0.01。
+    **它验证的是设计意图，不是运行现实** —— 把假设值写进断言，等于只证明了
+    "如果世界如我所愿，则设计成立"。这和本仓库反复栽的"两把尺子"是同一类错误，
+    只不过尺子这次量的是一个还没发生的世界。
+    实测 q 那一档的判据现在由 `test_int_reward_zero_crossing_is_inside_operating_range`
+    承担，那条按 `configs/agentic/default.yaml` 的**活配置** + **实测 q** 算零点。
     """
     # 不发起 + 对：只有 r_prop=1.0，无额外奖励
     td, _ = compute_turn_data([make_round(0, primary="4")], "4", True, 4, CFG)
     assert approx(td[1]["reward"], 1.0)
     assert td[1]["layer_key"] == 1
-    # 不发起 + 错：0（机会成本已由 r_prop=0 体现，不双重计罚）
+    # 不发起 + 错：0 —— **仅在 int_miss=0（消融）时成立**。CFG 刻意不带 int_miss，
+    # 所以这里走的是 v2.1 的退化路径。原注释写的"机会成本已由 r_prop=0 体现，不
+    # 双重计罚"**已被第十二轮推翻**：r_prop 对「问不问」没有区分度（答错就是 0，
+    # 问了也 0、不问也 0），给发起决策的梯度恒为 0。启用后的行为由
+    # `test_r_int_miss_prices_inaction` 守。
+    assert CFG.get("int_miss", 0.0) == 0.0, "本行断言的前提是 miss 被消融"
     td, _ = compute_turn_data([make_round(0, primary="5")], "4", False, 4, CFG)
     assert approx(td[1]["reward"], 0.0)
 
@@ -251,6 +265,132 @@ def test_r_int_no_unconditional_subsidy():
     p = 0.85
     marginal = p * (-c - B) + (1 - p) * (-c + A * 1.0)
     assert marginal < 0, f"p=0.85 时即使 q=1 也不应求助，实测 {marginal:+.4f}"
+
+
+def test_r_int_miss_prices_inaction():
+    """`int_miss`：「不发起 + 答错」从 0 改为 −miss，给不作为定价。
+
+    为什么需要它（08-28 两跑实测）：int_rate 从 step1 的 0.75 在 40 步内塌到 0.01，
+    两跑一致、`sel` 从未转负。根因是矩阵里**不作为零成本**——求助犯的错（画蛇添足）
+    扣 0.05，不求助犯的错（该问而没问）扣 0，于是从发起决策的视角看"错而不问"与
+    "对而不问"完全等价，没有任何压力去问。
+
+    四格必须逐个钉住，因为只改对角线的任何一格都会破坏双向压力：
+      不发起+对 → 0        （penalty-only，绝不为不作为发奖；v2.0 那笔补贴已证伪）
+      不发起+错 → −miss    （本轮新增）
+      求助+对   → −overkill（保持！否则塌向"全都问"，v3 已实测 sel≈0）
+      forced    → 0        （决策不是发起方做的，miss 不该影响它）
+    """
+    M = 0.10
+    cfg_on = {**CFG, "int_miss": M}
+
+    # 不发起 + 错 → r_prop(0) + λ·(−miss)
+    td, _ = compute_turn_data([make_round(0, primary="5")], "4", False, 4, cfg_on)
+    assert approx(td[1]["reward"], -M), \
+        f"不发起+答错应罚 −{M}，实测 {td[1]['reward']:+.4f}"
+    # 不发起 + 对 → 仍是 1.0，**miss 不许溢到这一格**（那就变成罚"答对"了）
+    td, _ = compute_turn_data([make_round(0, primary="4")], "4", True, 4, cfg_on)
+    assert approx(td[1]["reward"], 1.0), "miss 溢到了「不发起+答对」格"
+    # forced 轮不受影响：决策不是发起方做的
+    td, _ = compute_turn_data(
+        [make_round(0, primary="5", forced=True)], "4", False, 4, cfg_on)
+    assert approx(td[1]["reward"], 0.0), "forced 轮不该被 miss 罚"
+    # 画蛇添足惩罚必须还在（否则双向压力塌成单向）
+    td, _ = compute_turn_data(
+        [make_round(0, primary="4", u=True, target="critic")], "4", True, 4, cfg_on)
+    assert approx(td[1]["reward"], 1.0 - CFG["c_int"] - CFG["int_overkill"]), \
+        "求助+答对 的画蛇添足惩罚被 miss 改动波及了"
+    # miss=0 必须与启用前**逐位等价**（这一项要可消融）
+    for prim, ok in (("5", False), ("4", True)):
+        a, _ = compute_turn_data([make_round(0, primary=prim)], "4", ok, 4, CFG)
+        b, _ = compute_turn_data([make_round(0, primary=prim)], "4", ok, 4,
+                                 {**CFG, "int_miss": 0.0})
+        assert approx(a[1]["reward"], b[1]["reward"]), "miss=0 不等价于消融"
+
+
+def test_int_reward_zero_crossing_is_inside_operating_range():
+    """边缘期望的零点必须落在**模型真实的工作区间**内，否则 int_rate 必然塌。
+
+    这条测试存在的理由，是上面 `test_r_int_no_unconditional_subsidy` 那个教训：
+    它用**假设的** q=0.5 校准边缘期望，于是一直全绿，而实测 q=0.12 时边缘期望是
+    负的、int_rate 在 40 步内塌到 0.01。**所以这条改用实测值，并读活配置。**
+
+    边缘期望（c=c_int, A=int_gain, B=int_overkill, M=int_miss, x=P(错)）：
+        E[求助]   = x·q·A + (1−x)·(−B) − c
+        E[不求助] = x·(−M)
+        差 = x·(q·A + B + M) − B − c
+    零点：x* = (B + c) / (q·A + B + M)
+    x > x* 时求助划算。**要求 x* 明显低于工作区间下沿**，否则策略会先学会闭嘴。
+
+    实测输入（08-28 两跑）：q = eff = 0.12；轮级 P(错) ≈ 0.35~0.45（由 acc 反推，
+    区间偏宽正是因为 `p_primary_rate` 此前没埋点——同一轮已补上，下一跑可核准）。
+    """
+    import pathlib
+    import re
+    root = pathlib.Path(__file__).resolve().parent
+    y = (root / "configs/agentic/default.yaml").read_text(encoding="utf-8")
+
+    def cfgnum(key):
+        m = re.search(rf'^{key}:\s*([\d.]+)', y, re.M)
+        assert m, f"default.yaml 里找不到 {key}"
+        return float(m.group(1))
+
+    c, A, B, M = (cfgnum("c_int"), cfgnum("int_gain"),
+                  cfgnum("int_overkill"), cfgnum("int_miss"))
+    Q_MEASURED = 0.12          # 08-28 两跑的 eff（对照 0.118 / 打开 0.123）
+    X_LOW = 0.35               # 工作区间下沿（轮级答错率的保守估计）
+
+    def crossing(miss):
+        return (B + c) / (Q_MEASURED * A + B + miss)
+
+    x_star = crossing(M)
+    assert x_star < X_LOW, (
+        f"边缘期望零点 x*={x_star:.3f} 没有落在工作区间（下沿 {X_LOW}）之内 —— "
+        f"策略会先学会不求助。当前 c={c} A={A} B={B} M={M}，q(实测)={Q_MEASURED}。"
+        f"要么抬 int_miss，要么先用 p_primary_rate 核准工作区间。")
+
+    # 反向：把 miss 消融回 0，零点必须落在工作区间**之外** ——
+    # 这一条把 08-28 实测的崩塌钉成回归。它不是在测代码，是在钉住"为什么要有 miss"。
+    x0 = crossing(0.0)
+    assert x0 > 0.5, (
+        f"miss=0 时零点应在 0.5 以上（08-28 实测 0.581，对应 int_rate 40 步塌到 "
+        f"0.01），实测 {x0:.3f} —— 若这条失败说明 gain/overkill 被人动过，"
+        f"那 miss 的取值理由需要重算")
+    # 且启用 miss 必须把零点显著往下推，而不是聊胜于无
+    assert x0 - x_star > 0.2, \
+        f"miss 只把零点从 {x0:.3f} 推到 {x_star:.3f}，幅度不足以脱离工作区间"
+
+    # 条件方向不许被 miss 破坏：自认为错时求助更优、自认为对时不求助更优
+    assert (Q_MEASURED * A) > (-M), "自认为答错时，求助必须优于不求助"
+    assert (-c - B) < 0.0, "自认为答对时，求助必须不划算（双向压力的另一半）"
+
+
+def test_p_primary_rate_is_round_level_not_episode_accuracy():
+    """`p_primary_rate` 必须报出来，且必须是**轮级首答**正确率，不是 episode 的 acc。
+
+    它是 `int_miss` 零点位置的唯一直接输入（零点 = (B+c)/(q·A+B+M) 与工作区间
+    P(错)=1−p_primary_rate 比较）。此前这个数**一直被算出来却从来没报过** ——
+    `ps` 就是它，只用来算 `sel` 的相关系数 —— 所以 08-28 定 miss 时只能从 acc
+    反推出 0.35~0.45 这么宽的区间。
+
+    这条测试专门防一种"化简"：有人看到 `accuracy` 也在，就把这一项接到那上面。
+    两者差十几个点（acc 是**投票之后**的 episode 结果，这个是逐轮 proposer 首答），
+    接错了零点就算错，而错法是静默的——数照样打印。所以构造一个两者必然不等的场景。
+    """
+    from training.metrics import rollout_metrics
+
+    # 两轮：一轮首答对、一轮首答错 → 轮级 p_primary_rate 必须是 0.5
+    rounds = [make_round(0, primary="4"), make_round(1, primary="5")]
+    _, meta = compute_turn_data(rounds, "4", True, 4, CFG)
+    # episode 层面刻意标成 is_correct=True（投票救回来了）→ 与 0.5 必然不等
+    st = rollout_metrics([[{"is_correct": True, "raca_round_meta": meta,
+                            "raca_turn_data": {}, "stopped": True}]])
+    assert "p_primary_rate" in st, \
+        "p_primary_rate 没被报出来 —— int_miss 的零点位置就没有直接输入了"
+    assert approx(st["p_primary_rate"], 0.5), \
+        f"应是轮级均值 0.5，实测 {st['p_primary_rate']}"
+    assert st["p_primary_rate"] != st.get("accuracy", 1.0), \
+        "p_primary_rate 被接到了 episode 级 accuracy 上（两者相差十几个点）"
 
 
 def test_r_int_no_initiation_and_forced():

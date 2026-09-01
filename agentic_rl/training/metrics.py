@@ -30,6 +30,15 @@ def rollout_metrics(batch_rollouts: list) -> dict:
         us = [1.0 if m["u"] else 0.0 for m in rounds]
         ps = [1.0 if m["p_primary"] else 0.0 for m in rounds]
         out["int_rate"]     = float(np.mean(us))
+        # 轮级 primary 正确率。**这个数一直被算出来（`ps` 就是它）却从来没报过** ——
+        # 只报了它与 u 的相关系数 `sel`。第十二轮补上，因为 `int_miss` 的零点位置
+        #     P(错)_零点 = overkill / (q·gain + overkill + miss)
+        # 直接依赖 P(错) = 1 − p_primary_rate，而此前这个数只能从 episode 级 acc
+        # 反推（acc 是投票之后的，轮级首答更低），只拿到 0.35~0.45 这么宽的区间。
+        # 没有它，miss 取 0.05 还是 0.10 只能拍；有了它下一跑就能事后核准。
+        # 它与 `accuracy` **不是一回事**：那个是 episode 投票后的结果，这个是逐轮
+        # proposer 首答的正确率，两者能差十几个点，别混着读。
+        out["p_primary_rate"] = float(np.mean(ps))
         out["forced_rate"]  = float(np.mean([m["forced"] for m in rounds]))
         out["gate_blocked"] = int(sum(m["gate_blocked"] for m in rounds))
         # 交互有效率：P(轮末修对 | 自发求助且 primary 错)（即 q_spont）

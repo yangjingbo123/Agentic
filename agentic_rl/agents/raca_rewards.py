@@ -26,7 +26,7 @@ from agents.grader import math_equal
 
 
 def _r_int(u: bool, forced: bool, p_primary: bool, p_end: bool,
-           c_int: float, gain: float, overkill: float) -> float:
+           c_int: float, gain: float, overkill: float, miss: float = 0.0) -> float:
     """§4.2 交互发起奖励矩阵（v2.1 重设计，见 RACA_ALGORITHM.md §13）。
 
     v2.0 的矩阵有数学缺陷：「不发起+答对」给 +0.1 是一笔**无条件补贴**，
@@ -39,6 +39,46 @@ def _r_int(u: bool, forced: bool, p_primary: bool, p_end: bool,
     - 画蛇添足惩罚 −0.2 → −overkill(0.05)，交互成本 0.05 → c_int(0.02)
     使边缘期望在现实区间跨越零点：弱（p≈0.3）时求助划算、强（p≈0.85）时不划算，
     模型的自我置信度成为决定因素（即“选择性交互”）。
+
+    ── v3.2 第十二轮：`miss`（该问而没问的机会成本） ────────────────────────
+    **v2.1 只移动了零点，没有改变"工作点落在负期望区"这个性质——于是 v2.0 的
+    病原样复发了。** 08-28 两跑（`v32_m1` 对照 / `v32_open`）实测：int_rate 从
+    step1 的 0.75 在 40 步内塌到 **0.01**，随后 160 步不动；两跑一致，`sel` 始终
+    在 +0.01~+0.05、从未转负。
+
+    用实测数字复算（`c_int=0`、`gain=0.3`、`overkill=0.05`、实测 `eff`=q=0.12）：
+
+        E[求助] = P(错)·q·gain − P(对)·overkill = 0.086·P(错) − 0.05
+
+    零点在 **P(错)=0.581**，而模型的实际轮级答错率约 0.35~0.45 —— 零点落在工作
+    区间**之外**，且与 v2.0 同在一侧。所以"塌"不是训练不稳，是策略把这道题算对了。
+
+    崩塌还是**吸收态**：`forced` 轮 r_int=0（见下），所以 ε 注入只维持 critic /
+    修正链的数据供给，**给发起决策零梯度**；int_rate 一旦到 0.01 就再也学不回来。
+    量级上也能看出它为什么塌得快——推向不作为的梯度 0.05×P(对)≈0.030，推向
+    "该问时问"的只有 0.3×q×P(错)≈0.014，前者是后者的两倍多。
+
+    **修法不是调 gain/overkill。** 那两个方向都只把边缘期望整体推正 → 无差别求助
+    → v3 已实测（int_rate=0.78 而 sel≈0）。两端都踩过了，问题不在系数大小。
+
+    真正缺的一项是**不作为的定价**：求助犯的错（画蛇添足）有价，不求助犯的错
+    （该问而没问）免费。补上 `miss` 之后零点变成 0.05/(0.086+miss)：
+    miss=0.05 → 0.368；**miss=0.10 → 0.269**（取后者，因为 P(错) 目前只有从 acc
+    反推的区间 0.35~0.45，没有直接埋点；选不依赖精确值的那个。同一轮已补
+    `p_primary_rate`，下一跑起 δ 可事后核）。条件方向上的 gap 也从 0.036 放大到
+    0.136，而"对的时候问仍扣 overkill"保持不变——**双向压力都在，不会塌向另一端。**
+
+    **原注释里那句反对意见保留在这里，因为它半对半错，值得记住**：
+    > "错而不求助的机会成本已由 r_prop=0 体现，不需双重计罚。"
+    对 `r_prop` 这一半是对的——答错确实已经被罚过一次。错的是"不需双重计罚"这个
+    推论：`r_prop` 对「问不问」**没有区分度**（答错就是 0，问了也 0、不问也 0），
+    所以它给发起决策贡献的梯度**恒为零**。两者定价的是不同信道上的不同动作：
+    `r_prop` 定价"答案对不对"，`miss` 定价"错了要不要求助"。不是同一件事罚两遍。
+
+    已知副作用（预期，不是 bug）：会出现**保险式求助**——自认为可能错时，即使求助
+    救不回来（拿 0）也优于不求助（拿 −miss）。所以 int_rate 会偏高，其中混着一部分
+    无效求助。这一点由 `eff` 如实暴露（eff 低而 int_rate 高 = 保险式求助多）；若偏
+    得过头，下一步是把 `c_int` 从 0 抬起来给求助加固定门槛，**但那是另一轮的事**。
     """
     if forced:
         return 0.0                        # 决策不是发起方做的，不奖不罚
@@ -50,9 +90,10 @@ def _r_int(u: bool, forced: bool, p_primary: bool, p_end: bool,
         else:
             g = -overkill                 # 画蛇添足：本来就对
         return -c_int + g
-    # 不发起：一律 0。给“正确的自信”发奖会造成不发起的无条件补贴，
-    # 把交互压到零；错而不求助的机会成本已由 r_prop=0 体现，不需双重计罚。
-    return 0.0
+    # 不发起：答对 → 0（penalty-only，绝不为"什么都不做"发奖，v2.0 那笔无条件
+    # 补贴已证伪）；答错 → −miss（该问而没问的机会成本）。miss=0 时退化为 v2.1
+    # 的行为，所以这一项是可消融的。
+    return 0.0 if p_primary else -miss
 
 
 def _r_critic(flagged: bool, p_reviewed: bool, q: float | None) -> float:
@@ -97,6 +138,9 @@ def compute_turn_data(
     lambda_int = cfg.get("lambda_int", 1.0)
     gain       = cfg.get("int_gain", 0.3)        # 有效求助收益
     overkill   = cfg.get("int_overkill", 0.05)   # 画蛇添足惩罚（正数，内部取负）
+    # 该问而没问的机会成本（正数，内部取负）。**默认 0.0 而不是 0.10**：缺配置时
+    # 退化成 v2.1 行为，不会静默改掉历史口径；要启用必须在 yaml 里显式写。
+    miss       = cfg.get("int_miss", 0.0)
 
     def eq(ans: str | None) -> bool:
         return bool(ans) and math_equal(ans, correct_answer)
@@ -128,7 +172,7 @@ def compute_turn_data(
         # ── proposer 主 turn：r_prop + λ·r_int ────────────────────────────
         r_prop = 1.0 if p_prim else 0.0
         r_int = _r_int(rnd["u"], rnd["forced"], p_prim, p_end,
-                       c_int, gain, overkill)
+                       c_int, gain, overkill, miss)
         turn_data[rnd["primary_tid"]] = {
             "role": "proposer", "round": t, "sigma": sigma,
             "is_response": False, "reward": r_prop + lambda_int * r_int,

@@ -436,6 +436,10 @@ def main(cfg: DictConfig):
             f"len={stats.get('resp_len', 0.0):.0f} "
             f"groups={_g_kept}/{_g_total} "
             f"int_rate={stats.get('int_rate', 0.0):.2f} "
+            # pP = 轮级 primary 首答正确率（**不是** acc，acc 是投票后的）。
+            # 它是 int_miss 零点位置的现场判据：零点 = 0.05/(0.086+miss)，
+            # miss=0.10 时是 0.269，所以要 (1−pP) > 0.27 交互才不会塌回去。
+            f"pP={stats.get('p_primary_rate', 0.0):.2f} "
             f"eff={'--' if _eff is None else f'{_eff:.2f}'} "
             f"qF={'--' if _qf is None else f'{_qf:.2f}'} "
             f"tgtC={'--' if _tc is None else f'{_tc:.2f}'} "
@@ -475,6 +479,7 @@ def main(cfg: DictConfig):
                     "all_pass_frac", "all_fail_frac", "group_reward_std",
                     "parse_rate", "no_label_rate", "empty_answer_rate",
                     "int_rate", "int_effectiveness", "int_selectivity",
+                    "p_primary_rate",
                     "q_forced", "int_critic_share",
                     "forced_rate", "stop_rate", "stop_acc", "exhaust_acc",
                     "gate_blocked",

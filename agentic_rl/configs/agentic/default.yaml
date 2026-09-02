@@ -46,8 +46,14 @@ int_overkill: 0.05   # 画蛇添足惩罚（v2.1：0.05 → v3：0.0 → v3.2：
 #     E[求助] = P(错)·q·gain − P(对)·overkill = 0.086·P(错) − 0.05
 # 零点在 **P(错)=0.581**，而实际轮级答错率约 0.35~0.45 —— 零点落在工作区间**之外**，
 # 且与 v2.0 同在一侧。所以"塌"不是训练不稳，是策略把这道题算对了。
-# 而且它是**吸收态**：forced 轮 r_int=0（正确，决策不是发起方做的），所以 ε 注入只
-# 维持 critic/修正链的数据供给，给发起决策零梯度，塌了就再也学不回来。
+# 而且原实现把它变成了**吸收态**：forced 轮在奖励函数里 r_int=0，本意是「决策
+# 不是发起方做的，所以零梯度」，但 08-28 `v32_miss` 的 50 步实测将这句话推翻：
+# int_rate 仅从 step10 的 0.73 延后到 step25 才塌到 0，eval step30/40/50 全为 0。
+# 原因是 r_int 按 p_primary 分层 z-score，数值 0 仍参与排名；在首答错层里 forced
+# 的 0 高于自发不求助的 −miss，而两者模型都实际输出 `action:none`，于是 forced
+# 反而给 none 正优势。int_rate 越低，ε forced 占比越高，这个反向信号越强。
+# 第十四轮修为 forced 的 r_int_w=None（通道缺席）：保留 r_prop、响应角色训练与
+# q_forced 对照，但完全退出 int anchor group。**0 不等于无梯度，缺席才是。**
 #
 # 修法**不是**调 gain/overkill：那两个方向只把边缘期望整体推正 → 无差别求助 →
 # v3 已实测（int_rate=0.78 而 sel≈0）。"全不问"和"全都问"两端都踩过了，问题不在
@@ -130,8 +136,10 @@ correction_in_vote: true
 # 唯一的混淆项，判读结论时必须点出这一点。
 flaw_in_primary_prompt: true
 eps_force_init: 0.3  # 强制注入审查/验证的初始概率（冷启动保护，随 step 线性衰减）
-# v2.3：ε 底数 0.05→0.25 基本不衰减——它不给发起决策梯度（forced 轮 r_int=0，
-# 正确），但保证 critic/修正链与 q 测量始终有数据供给。
+# v2.3：ε 底数 0.05→0.25 基本不衰减，保证 critic/修正链与 q_forced 随机对照
+# 始终有数据。原注释写“forced r_int=0，所以不给发起决策梯度”——**这句被
+# v32_miss 的 50 步实测推翻**：0 进入分层 z-score 后仍有相对优势。第十四轮改为
+# `r_int_w=None`、完全退出 int anchor group，才真正不给发起决策梯度。
 eps_force_min: 0.25
 # 强制注入时选 verifier 的概率；v2.0 固定注 critic 导致 verifier 零训练数据，
 # 而它恰好是 stop 闸门的看门人 → stop_rate 跟着塌。

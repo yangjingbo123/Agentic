@@ -6,8 +6,13 @@
     两通道各自组内归一化后相加。r_prop 通道不按 p_t 分层（v2.1 的全量分层
     使 int_rate=0 后主 turn 组内零方差→整组被丢→解题能力停训，v2.2 首跑
     实测 acc 横盘）；r_int 通道保留 p_t 分层（v2.1 的隔离目的不变）。
-    副作用修复：int_rate=0 时 r_int 通道自然失活，但 r_prop 通道仍供梯度
-    ——主 turn 不再整组消失，int_rate=0 不再是吸收态。
+  - 副作用修复：int_rate=0 时 r_int 通道自然失活，但 r_prop 通道仍供梯度
+    ——主 turn 不再整组消失、**解题能力**可继续训练。注意：此前把这句话写成
+    “int_rate=0 不再是吸收态”说过头了；恢复的是 r_prop，不是交互动作本身。
+    08-28 两跑实测 int_rate 到 0 后 160 步不恢复，交互决策仍是吸收态。
+  - v3.2 第十四轮：forced 轮的 r_int_w=None，完全退出 int anchor group。
+    forced 的数值 0 在组相对归一化里并非零梯度：它会高于 −int_miss，并给模型
+    实际输出的 action:none 正优势。forced 仍保留 r_prop、响应角色奖励和 q_forced。
   - 旧格式兼容：无 r_prop/r_int_w 字段的 turn 走单通道（reward + layer_key）。
 - 组内去重（v2 §5.2）：同一 episode 同一轮的同角色多 turn 携带相同 reward 时，
   只以一个代表样本参与 μ/σ 计算，优势再广播回全部 turn——防重复样本
@@ -56,12 +61,20 @@ def compute_raca_advantages(turn_data_list: list, delta: float = 1e-4) -> list:
             sigma   = v.get("sigma", "explore")
             is_resp = bool(v.get("is_response", False))
             if v["role"] == "proposer" and not is_resp and "r_prop" in v:
-                # v2.3 双通道：r_prop 不分层，r_int 按 p_t 分层
-                chans = [
-                    (("proposer", sigma, False, "prop", None), v["r_prop"]),
-                    (("proposer", sigma, False, "int", v.get("layer_key")),
-                     v["r_int_w"]),
-                ]
+                # v2.3 双通道：r_prop 不分层，r_int 按 p_t 分层。
+                chans = [(('proposer', sigma, False, "prop", None), v["r_prop"])]
+                # v3.2 第十四轮：forced 轮的 r_int_w=None 表示**通道缺席**，不是
+                # 数值奖励 0。数值 0 仍会进入本组 μ/σ：在「首答错」层里它高于
+                # 自发不求助的 −int_miss，因而给模型实际输出的 `action:none`
+                # 正优势 —— 08-28 v32_miss 实测 int_rate 仍在 step25 塌到 0，正是
+                # 这条泄漏。forced 轮继续进上面的 r_prop 通道，响应角色也照常计分；
+                # 只是不训练一个并非 proposer 自己作出的交互决策。
+                r_int_w = v.get("r_int_w")
+                if r_int_w is not None:
+                    chans.append((
+                        ("proposer", sigma, False, "int", v.get("layer_key")),
+                        r_int_w,
+                    ))
             else:
                 chans = [((v["role"], sigma, is_resp, "rew",
                            v.get("layer_key")), v["reward"])]

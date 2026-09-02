@@ -394,20 +394,58 @@ def test_p_primary_rate_is_round_level_not_episode_accuracy():
 
 
 def test_r_int_no_initiation_and_forced():
-    # forced 注入：发起方不计 r_int → reward = r_prop
+    """forced 保留 r_prop，但必须用 `r_int_w=None` 完全退出交互优势通道。
+
+    旧测试只断 total reward 等于 r_prop，以为 `r_int=0` 就是“不奖不罚”。
+    `v32_miss` 的 50 步反证了它：r_int 按 p_primary 分层 z-score，数值 0 仍参与
+    排名；在首答错层里 0 高于 −miss，给模型实际输出的 `action:none` 正优势。
+    所以总 reward 断言还要保留（历史口径不变），但真正承重的是 `r_int_w is None`。
+    """
+    # forced + 答错：总 reward 仍只有 r_prop=0，但 int 通道必须缺席
     rounds = [make_round(0, primary="5", forced=True,
                          critic_turns=[{"tid": 2, "flagged": True,
                                         "reviewed_answer": "5",
                                         "correction_followed": False}])]
     td, meta = compute_turn_data(rounds, "4", False, 4, CFG)
     assert approx(td[1]["reward"], 0.0)
+    assert td[1]["r_int_w"] is None, \
+        "forced 写成数值 0 仍会进入 z-score；必须是 None（通道缺席）"
+    assert 2 in td, "forced critic 响应 turn 被整条跳过了"
+    assert approx(td[2]["reward"], 0.2), \
+        "forced 只应屏蔽 proposer 的 int 通道，critic 响应奖励必须保留"
     assert meta[0]["forced"] and not meta[0]["u"]
-    # forced 且答对：仍只有 r_prop，不因被强制调用而被罚
+    # forced + 答对：仍只有 r_prop=1；同样不进 int 通道
     rounds = [make_round(0, primary="4", forced=True,
                          verifier_turns=[{"tid": 2, "score": 0.9,
                                           "reviewed_answer": "4"}])]
     td, _ = compute_turn_data(rounds, "4", True, 4, CFG)
     assert approx(td[1]["reward"], 1.0)
+    assert td[1]["r_prop"] == 1.0 and td[1]["r_int_w"] is None
+    assert 2 in td, "forced verifier 响应 turn 被整条跳过了"
+    assert approx(td[2]["reward"], 0.9), \
+        "forced verifier 的校准奖励必须保留"
+
+    # q_forced 随机对照必须保留：forced 只退出优势，不退出 round_meta / metrics。
+    # 构造一条 forced 后错→对，q_forced 应为 1.0。
+    fixed = [make_round(
+        0, primary="5", corrected="4", forced=True,
+        correction_turns=[{"tid": 3, "answer": "4"}],
+    )]
+    td_fixed, meta_fixed = compute_turn_data(fixed, "4", True, 4, CFG)
+    from training.metrics import rollout_metrics
+    st = rollout_metrics([[{"is_correct": True, "raca_round_meta": meta_fixed,
+                            "raca_turn_data": td_fixed, "stopped": True}]])
+    assert approx(st["q_forced"], 1.0), \
+        "forced 退出 int 优势后 q_forced 随机对照被误删了"
+
+    # 用**真实 compute_turn_data 产物**走进 advantage，而不是只测手搓字典：
+    # 一条 forced 错、一条 forced 对，二者 int 通道都缺席，但 r_prop 仍给 ±1。
+    wrong = [make_round(0, primary="5", forced=True)]
+    td_wrong, _ = compute_turn_data(wrong, "4", False, 4, CFG)
+    adv = compute_raca_advantages([td_wrong, td])
+    assert 1 in adv[0] and 1 in adv[1], \
+        "真实 forced turn 连 r_prop 优势也丢了（只该退出 int 通道）"
+    assert approx(adv[0][1], -1.0) and approx(adv[1][1], 1.0)
 
 
 def test_critic_matrix():
@@ -591,11 +629,60 @@ def test_dual_channel_advantage():
     assert approx(adv[2][1], 0.0) and approx(adv[3][1], -2.0)
 
 
-def test_dual_channel_no_absorbing_state():
+def test_forced_turn_exits_int_advantage_but_keeps_prop_advantage():
+    """forced proposer 不进入 int anchor group，但仍然正常进入 r_prop 通道。
+
+    这是第十四轮的核心测试。只断 `r_int_w is None` 还不够：优势聚合若忘了识别
+    None，仍可能把它塞进组里（报错或被误当 0）；反过来若粗暴跳过整个 turn，
+    r_prop 也丢了，解题能力会停训。两种坏法要分别造场景抓住。
+
+    场景 A（全是首答错，r_prop 全 0）：
+      自发不求助 −0.10、主动求助但未修对 0、forced None。
+    正确结果：int 通道只比较前两者（±1），forced 完全没有优势条目。旧代码把
+    forced 写成 0 时，它会与主动求助并列高于 −0.10，从而给 action:none 正优势。
+
+    场景 B（只有 forced，一对一错）：int 通道两条都缺席，但 r_prop={0,1} 仍应
+    产生 ±1，证明我们跳过的是**通道**而不是整个 proposer turn。
+    """
+    def prop(r_prop, r_int_w, p_t):
+        v = mk_turn("proposer", 0, "explore", False,
+                    r_prop + (r_int_w if r_int_w is not None else 0.0))
+        v["r_prop"], v["r_int_w"], v["layer_key"] = r_prop, r_int_w, p_t
+        return v
+
+    # A：forced 必须完全退出 int 通道
+    eps = [
+        {1: prop(0.0, -0.10, 0)},   # 自发 none + 错 → miss
+        {1: prop(0.0, 0.00, 0)},    # 自发求助但未修对
+        {1: prop(0.0, None, 0)},    # forced：模型也写 none，但决策不是它做的
+    ]
+    adv = compute_raca_advantages(eps)
+    assert approx(adv[0][1], -1.0) and approx(adv[1][1], 1.0)
+    assert 1 not in adv[2], (
+        "forced 获得了 int 优势 —— 数值 0 仍在组内排名；必须用 None 完全退出通道")
+
+    # B：forced 仍保留 r_prop 通道（不能粗暴跳过整个 turn）
+    forced_only = [
+        {1: prop(0.0, None, 0)},
+        {1: prop(1.0, None, 1)},
+    ]
+    adv = compute_raca_advantages(forced_only)
+    assert all(1 in ep for ep in adv), \
+        "forced 整个 proposer turn 被跳过了；只应退出 int 通道，r_prop 必须保留"
+    assert approx(adv[0][1], -1.0) and approx(adv[1][1], 1.0), \
+        "forced 连 r_prop 也被跳过了 —— 只该退出 int 通道，解题能力必须继续训练"
+
+
+def test_dual_channel_keeps_prop_training_when_int_channel_flat():
     """v2.3：int_rate=0（r_int 全 0）时 int 通道失活，但 r_prop 通道仍供梯度。
 
     v2.1/v2.2 的全量分层在此场景下组内零方差 → 主 turn 整组被丢 →
-    解题能力停训（v2.2 首跑实测 acc 横盘、len 组成坍缩）。"""
+    解题能力停训（v2.2 首跑实测 acc 横盘、len 组成坍缩）。
+
+    旧函数名叫 `test_dual_channel_no_absorbing_state`，**说过头了**：它只证明
+    r_prop 仍有梯度、解题能力不停训，并不证明交互动作能从 int_rate=0 恢复。
+    08-28 两跑已实测交互率到 0 后 160 步不恢复，交互决策仍是吸收态。
+    """
     def prop(r_prop, p_t):
         v = mk_turn("proposer", 0, "explore", False, r_prop)
         v["r_prop"], v["r_int_w"], v["layer_key"] = r_prop, 0.0, p_t

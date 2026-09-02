@@ -17,7 +17,10 @@
   3) 末轮且无修正 → 固定 +0.2（§4.3 末轮修正，切断幸存者偏差回流）
 - r_int 只挂在 primary proposer turn（发起决策是它做的）；响应方在链上
   再发起的下一跳属于链机制，不单独计交互奖励。
-- forced 注入轮：发起方 r_int = 0（决策不是它做的）；响应方正常计分。
+- forced 注入轮：发起方数值 r_int = 0，**但 r_int_w=None、完全不进入交互优势
+  通道**（决策不是它做的）；r_prop 与响应方奖励照常。注意 0 与 None 不等价：
+  组相对归一化中 0 仍参与排名，08-28 v32_miss 已实测它会高于 −int_miss、给
+  模型实际输出的 action:none 正优势，使 int_rate 再次塌到 0。
 """
 
 from __future__ import annotations
@@ -53,10 +56,12 @@ def _r_int(u: bool, forced: bool, p_primary: bool, p_end: bool,
     零点在 **P(错)=0.581**，而模型的实际轮级答错率约 0.35~0.45 —— 零点落在工作
     区间**之外**，且与 v2.0 同在一侧。所以"塌"不是训练不稳，是策略把这道题算对了。
 
-    崩塌还是**吸收态**：`forced` 轮 r_int=0（见下），所以 ε 注入只维持 critic /
-    修正链的数据供给，**给发起决策零梯度**；int_rate 一旦到 0.01 就再也学不回来。
-    量级上也能看出它为什么塌得快——推向不作为的梯度 0.05×P(对)≈0.030，推向
-    "该问时问"的只有 0.3×q×P(错)≈0.014，前者是后者的两倍多。
+    08-28 `v32_miss` 又补了一层反证：加 miss 后 int_rate 先维持到 step15，但仍在
+    step25 塌到 0。此前说“forced 轮 r_int=0，所以给发起决策零梯度”**不完整**：
+    在下面这层奖励函数里 0 确实表示不加总奖励，但后面的 GRPO 会按 p_primary 分层
+    z-score，**数值 0 仍参与排名**。在首答错层里它高于自发不求助的 −miss，给 forced
+    轮模型实际写出的 `action:none` 正优势。真正的零梯度必须由调用方用
+    `r_int_w=None` 让该 turn 完全退出 int anchor group，而不是在这里返回一个 0。
 
     **修法不是调 gain/overkill。** 那两个方向都只把边缘期望整体推正 → 无差别求助
     → v3 已实测（int_rate=0.78 而 sel≈0）。两端都踩过了，问题不在系数大小。
@@ -81,7 +86,9 @@ def _r_int(u: bool, forced: bool, p_primary: bool, p_end: bool,
     得过头，下一步是把 `c_int` 从 0 抬起来给求助加固定门槛，**但那是另一轮的事**。
     """
     if forced:
-        return 0.0                        # 决策不是发起方做的，不奖不罚
+        # 这里只保持 total reward 的历史口径为 0；**不能把这个 0 送进组相对优势**。
+        # 调用方在 turn_data 里写 r_int_w=None，使该 turn 完全退出 int 通道。
+        return 0.0
     if u:
         if not p_primary and p_end:
             g = gain                      # 有效求助：错 → 对
@@ -181,7 +188,19 @@ def compute_turn_data(
             # int_rate=0 后主 turn 组内零方差、解题能力停训）；r_int 通道
             # 仍按 layer_key=p_t 分层（v2.1 的隔离目的不变）。
             "r_prop": r_prop,
-            "r_int_w": lambda_int * r_int,
+            # **forced 必须是 None（通道缺席），不能是数值 0。** 08-28 的 `v32_miss`
+            # 已经给了反证：int_miss 把崩塌从 step10 延后到 step25，但 eval 从
+            # step30 起仍是 int_rate=0。根因是 r_int 按 p_primary 分层 z-score：
+            # 在「首答错」层里，自发不求助是 −miss，而 forced 轮虽然模型也输出
+            # `action:none`，旧代码给 0。标准化后 0 > −miss，forced 的 `none` 反而
+            # 获得**正优势**，在训练模型不交互；int_rate 越低，ε forced 占比越高，
+            # 这个反向信号越强，最终再次塌到 0。
+            #
+            # `None` 的语义是：该 turn **不进入 int anchor group**（见 raca_adv.py），
+            # 真正做到「决策不是 proposer 做的，所以没有交互梯度」。它仍保留：
+            # ① r_prop 解题通道；② critic/verifier 响应奖励；③ q_forced 随机对照读数。
+            # total reward 继续用上面的 r_int=0，所以历史日志的 reward 口径不变。
+            "r_int_w": None if rnd["forced"] else lambda_int * r_int,
             "layer_key": int(p_prim),
         }
 

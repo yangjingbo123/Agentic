@@ -60,6 +60,108 @@ def test_parse_decision():
     assert parse_decision("乱码 without decision") == "continue"   # 保守默认
 
 
+def test_trailing_interaction_span_only_accepts_a_complete_final_block():
+    """credit split 只认**末尾完整块**，正文示例/残块/块后正文都不能切。
+
+    这条比 `parse_interaction` 故意更严格：解析器可以宽容地从全文找动作，但 token
+    credit 一旦切错边界会把两门优势施加到错误 token，所以宁可返回 None。
+    """
+    from agents.parsing import trailing_interaction_span
+
+    block = ("<interaction>\naction: request\ntarget: critic\n"
+             "reason: 请审查\n</interaction>")
+    text = "推理过程：x\n最终答案：4\n" + block + "  \n"
+    span = trailing_interaction_span(text)
+    assert span is not None
+    start, end = span
+    assert text[start:].lstrip().startswith("<interaction>")
+    assert end == len(text)
+    assert "最终答案：4" in text[:start]
+
+    # 正文里引用一个块，但最后仍有真正的决策块：只能取最后一个。
+    earlier = ("<interaction>\naction: challenge\ntarget: verifier\n"
+               "reason: 仅是正文示例\n</interaction>")
+    quoted = "示例：" + earlier + "\n最终答案：4\n" + block
+    start2, _ = trailing_interaction_span(quoted)
+    assert quoted[start2:].lstrip() == block
+    assert quoted[:start2].count("<interaction>") == 1
+    assert parse_interaction(quoted) == ("request", "critic", "请审查"), \
+        "执行的动作与获得 interaction credit 的末尾块不是同一个"
+
+    malformed_prefix = ("正文里误写 <interaction> 但没闭合\n最终答案：4\n" + block)
+    start3, _ = trailing_interaction_span(malformed_prefix)
+    assert malformed_prefix[start3:].lstrip() == block, \
+        "前一个未闭合标签吞到了最终闭标签，credit span 选错块"
+    assert parse_interaction(malformed_prefix) == ("request", "critic", "请审查")
+
+    extra_close = "最终答案：4\n" + block + "\n</interaction>"
+    assert trailing_interaction_span(extra_close) is None, \
+        "重复闭标签使 credit span 延伸到 parser 实际执行块之外"
+
+    assert trailing_interaction_span("正文 " + block + " 后面继续解释") is None
+    assert trailing_interaction_span("正文 <interaction>\naction:none") is None
+    assert trailing_interaction_span("只有答案：4") is None
+
+
+def test_token_credit_components_route_channels_without_overlap():
+    """solution / interaction 优势只能落到各自 token，且旧 scalar 保持整段兼容。"""
+    from training.raca_adv import token_credit_components
+
+    spec = {"solution": 1.5, "interaction": -0.25}
+    # 原始位置 6 假设是被可见文本省略的 EOS：span=[4,6) 不应把它收进任一 PG 通道。
+    parts = token_credit_components(spec, interaction_span=(4, 6),
+                                    original_positions=[0, 1, 3, 4, 5, 6])
+    assert parts == [
+        ("solution", 1.5, [0, 1, 2]),
+        ("interaction", -0.25, [3, 4]),
+    ]
+    covered = [idx for _, _, ids in parts for idx in ids]
+    assert len(set(covered)) == len(covered), "两个通道 token 不能重叠"
+    assert 5 not in covered, "文本外 EOS/special token 不应收到任一 PG credit"
+
+    # forced：只有 solution，interaction block 与尾部 EOS 都没有 PG credit（仍有 KL）。
+    forced = token_credit_components({"solution": -1.0}, (4, 6), range(7))
+    assert forced == [("solution", -1.0, [0, 1, 2, 3])]
+
+    # 无精确/越界边界：结构化 credit 整 turn fail-closed；不能猜测性广播。
+    assert token_credit_components(spec, None, range(7)) == []
+    assert token_credit_components(spec, (4, 99), range(7)) == [], \
+        "span.end 超出原始 response_ids 仍被接受"
+    # 旧 episode / 其它角色 scalar：整段广播，保持向后兼容。
+    assert token_credit_components(0.7, None, [0, 2, 4]) == [
+        ("default", 0.7, [0, 1, 2])]
+
+
+def test_trainer_routes_channel_advantages_to_token_spans():
+    """源码级不变量：torch 训练路径必须按 channel token span 算 PG。
+
+    本地测试环境没有 torch/bitsandbytes，无法执行 `_compute_loss`；但如果这里只测
+    `token_credit_components`，训练器仍可能把返回值忽略、继续用旧的 whole-turn
+    scalar。故用 AST/源码守住接线，并通过变异验证确认它承重。
+    """
+    import ast
+    import pathlib
+
+    src = (pathlib.Path(__file__).resolve().parent /
+           "training/grpo_trainer.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    assert any(getattr(n.func, "id", "") == "token_credit_components" for n in calls), \
+        "训练器没有消费结构化 channel advantage"
+    assert any(getattr(n.func, "attr", "") == "index_select" for n in calls), \
+        "训练器没有按 token 索引切分 solution / interaction span"
+    assert "pg_parts.append" in src and "torch.stack(pg_parts).sum()" in src, \
+        "两个通道没有先各自取 token mean 再相加"
+    assert "-advantage * ratio_tok" not in src, \
+        "旧的 whole-turn scalar 广播仍在，会让 solution / interaction 信号再次混合"
+    assert 'len(ids) != lp_count.get(tid, 0)' in src, \
+        "预计数没检查 response/logprob 长度，实际跳过的 turn 仍会稀释 normalization"
+    assert "any(tok < 0 or tok >= vocab_size for tok in ids)" in src, \
+        "非法 token 仍可能在预计数中算有效、训练时再被跳过"
+    assert src.count('msg.get("logprob_aligned", True)') >= 2, \
+        "预计数与实际 loss 没有同时拒绝被 0.0 补齐的假 logprob"
+
+
 def test_parse_interaction():
     ok = "<interaction>\naction: request\ntarget: critic\nreason: 需要审查\n</interaction>"
     assert parse_interaction(ok) == ("request", "critic", "需要审查")
@@ -445,7 +547,24 @@ def test_r_int_no_initiation_and_forced():
     adv = compute_raca_advantages([td_wrong, td])
     assert 1 in adv[0] and 1 in adv[1], \
         "真实 forced turn 连 r_prop 优势也丢了（只该退出 int 通道）"
-    assert approx(adv[0][1], -1.0) and approx(adv[1][1], 1.0)
+    assert set(adv[0][1]) == set(adv[1][1]) == {"solution"}
+    assert approx(adv[0][1]["solution"], -1.0)
+    assert approx(adv[1][1]["solution"], 1.0)
+
+    # 同一个 p_t=0 anchor 里混入 spontaneous none / spontaneous request / forced。
+    # forced 若退化成 raw r_int=0，就会与 request 一起高于 none=-0.1，并给模型
+    # 实际输出的 action:none 正优势；正确实现中它必须完全没有 interaction key。
+    cfg_miss = {**CFG, "c_int": 0.0, "int_miss": 0.10}
+    spontaneous_none = [make_round(0, primary="5")]
+    spontaneous_ask = [make_round(0, primary="5", u=True, target="critic")]
+    forced_none = [make_round(0, primary="5", forced=True, target="critic")]
+    td_none, _ = compute_turn_data(spontaneous_none, "4", False, 4, cfg_miss)
+    td_ask, _ = compute_turn_data(spontaneous_ask, "4", False, 4, cfg_miss)
+    td_forced, _ = compute_turn_data(forced_none, "4", False, 4, cfg_miss)
+    mixed = compute_raca_advantages([td_none, td_ask, td_forced])
+    assert mixed[0][1]["interaction"] < 0 < mixed[1][1]["interaction"]
+    assert 1 not in mixed[2] or "interaction" not in mixed[2][1], \
+        "forced 数值 0 泄漏回 int anchor group，正在奖励 action:none"
 
 
 def test_critic_matrix():
@@ -629,6 +748,63 @@ def test_dual_channel_advantage():
     assert approx(adv[2][1], 0.0) and approx(adv[3][1], -2.0)
 
 
+def test_lambda_int_weights_the_standardized_interaction_advantage():
+    """lambda_int 必须乘在 z-score **之后**，否则任何正值都被尺度不变性消掉。
+
+    旧实现把 `r_int_w=lambda*r_int` 送入标准化，因此
+    `z(0.25*r)==z(2*r)`，配置里的 0.25/1/2 实际完全相同。这里构造两个 raw
+    interaction reward（−0.1 / +0.3），solution reward 相同而零方差，断言最终
+    interaction advantage 随 lambda 线性缩放，而不是永远 ±1。
+    """
+    def run(weight):
+        def turn(r_int):
+            v = mk_turn("proposer", 0, "verify", False, r_int)
+            v.update({"r_prop": 0.0, "r_int": r_int,
+                      "r_int_w": weight * r_int, "lambda_int": weight,
+                      "layer_key": 0, "token_credit": True})
+            return {1: v}
+        return compute_raca_advantages([turn(-0.1), turn(0.3)])
+
+    zero, low, high = run(0.0), run(0.25), run(2.0)
+    assert zero == [{}, {}], "lambda_int=0 必须精确关闭 interaction 通道"
+    for adv in (low, high):
+        assert set(adv[0][1]) == set(adv[1][1]) == {"interaction"}, adv
+    assert approx(low[0][1]["interaction"], -0.25)
+    assert approx(low[1][1]["interaction"], +0.25)
+    assert approx(high[0][1]["interaction"], -2.0)
+    assert approx(high[1][1]["interaction"], +2.0)
+    assert approx(abs(high[0][1]["interaction"] /
+                      low[0][1]["interaction"]), 8.0), \
+        "lambda 在标准化前被消掉了：2.0/0.25 应让优势强度相差 8 倍"
+
+
+def test_structured_proposer_advantages_do_not_cancel_before_token_routing():
+    """solution 与 interaction 两门成绩必须保持分离，不能先相加成一个 turn 标量。
+
+    构造「答案好但交互坏」与「答案坏但交互好」：两者若先相加都会变成 0，
+    正确答案得不到强化、错误求助也不受罚。结构化返回应分别保留 ±1，供训练侧
+    路由到不同 token span。
+    """
+    def turn(r_prop, r_int, p_t):
+        v = mk_turn("proposer", 0, "verify", False, r_prop + r_int)
+        v.update({"r_prop": r_prop, "r_int": r_int, "r_int_w": r_int,
+                  "lambda_int": 1.0, "layer_key": p_t, "token_credit": True})
+        return {1: v}
+
+    # solution 通道要有对/错差异；每个 p_t 层内 interaction 也各有好/坏比较。
+    eps = [
+        turn(1.0, 0.0, 1),      # 对 + 不问（两门都好）
+        turn(1.0, -0.05, 1),    # 对 + 多问（solution好 / interaction坏）
+        turn(0.0, 0.30, 0),     # 错 + 求助修对（solution坏 / interaction好）
+        turn(0.0, -0.10, 0),    # 错 + 不问（两门都坏）
+    ]
+    adv = compute_raca_advantages(eps)
+    assert adv[1][1]["solution"] > 0 > adv[1][1]["interaction"]
+    assert adv[2][1]["solution"] < 0 < adv[2][1]["interaction"]
+    assert set(adv[1][1]) == {"solution", "interaction"}
+    assert set(adv[2][1]) == {"solution", "interaction"}
+
+
 def test_forced_turn_exits_int_advantage_but_keeps_prop_advantage():
     """forced proposer 不进入 int anchor group，但仍然正常进入 r_prop 通道。
 
@@ -806,8 +982,10 @@ def test_end_to_end_rewards_to_advantages():
     adv = compute_raca_advantages([td_a, td_b])
     # controller：A 对（rem=0.75… 无 stop，rem=(4−1)/4）vs B 错 → A 正 B 负
     assert adv[0][0] > 0 > adv[1][0]
-    # proposer 主 turn：A 0.25 vs B 0.0 → A 正 B 负
-    assert adv[0][1] > 0 > adv[1][1]
+    # proposer 主 turn：两者首答都错，solution 通道零方差被丢；interaction 通道
+    # 比较「求助并修对」与「不求助仍错」，返回结构化 ±1。
+    assert set(adv[0][1]) == set(adv[1][1]) == {"interaction"}
+    assert adv[0][1]["interaction"] > 0 > adv[1][1]["interaction"]
 
 
 # ── 端到端集成：Fake 引擎跑通 executor 主流程 ──────────────────────────
@@ -844,15 +1022,189 @@ class FakeEngine:
         return out
 
 
-def _mk_executor(engine, eval_mode=False, **cfg_over):
+def _mk_executor(engine, eval_mode=False, tokenizer=None, **cfg_over):
     from agents.agentic_executor import AgenticExecutor
     cfg = {"max_rounds": 4, "max_hops": 2, "stop_gate": True, **CFG, **cfg_over}
-    # eval_mode 是构造函数参数而非 cfg 项，不能混进 cfg_over
-    return AgenticExecutor(None, FakeTokenizer(), cfg, vllm_engine=engine,
-                           eval_mode=eval_mode)
+    # eval_mode / tokenizer 是构造参数而非 cfg 项，不能混进 cfg_over
+    return AgenticExecutor(None, tokenizer or FakeTokenizer(), cfg,
+                           vllm_engine=engine, eval_mode=eval_mode)
 
 
 INTER = "<interaction>\naction: {a}\ntarget: {t}\nreason: r\n</interaction>\n"
+
+
+def test_executor_records_exact_interaction_token_boundary():
+    """primary proposer 的 interaction_start 必须直接索引原始 response_ids。
+
+    用字符充当 token，使预期边界可以逐位验证；这条同时守住三件事：response 文本
+    与 IDs 不被重写、只有 primary proposer 带 credit split、无法切分时 fail-closed
+    并留下计数。真实 tokenizer 走 offset_mapping / exact re-encode 的同一协议。
+    """
+    class CharEngine(FakeEngine):
+        def generate_batch(self, requests):
+            out = []
+            for r in requests:
+                self.calls.append(r["role"])
+                self.prompts.append((r["role"], r["prompt"]))
+                self.temps.append(r.get("temperature"))
+                text = self.script[r["role"]].pop(0)
+                out.append((text, [-0.5] * len(text), list(text)))
+            return out
+
+    block = INTER.format(a="none", t="none").strip()
+    response = "推理过程：1+1=2\n最终答案：2\n" + block + "\n"
+    script = {
+        "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>",
+                       "<meta-plan>\ndecision: stop\nreason: r\n</meta-plan>"],
+        "proposer": [response], "critic": [], "verifier": [],
+    }
+    eng = CharEngine(script)
+    ex = _mk_executor(eng, stop_gate=False, max_rounds=2)
+    result = ex.run_episodes_batch(["1+1=?"], ["2"])[0]
+    primary = [m for m in result["messages"] if m["role_name"] == "proposer"][0]
+    span = primary["interaction_span"]
+    assert isinstance(span, tuple) and 0 < span[0] < span[1]
+    assert primary["response_ids"] == list(response), "原始 vLLM IDs 被重写了"
+    assert "".join(primary["response_ids"][:span[0]]).rstrip().endswith("最终答案：2")
+    assert "".join(primary["response_ids"][span[0]:span[1]]).lstrip().startswith(
+        "<interaction>")
+    assert span[1] == len(response), "可见文本的末端 token 边界不对"
+    assert ex.n_credit_split_failed == 0
+
+    # vLLM 可能在 IDs 末尾附带被文本 decode 隐去的 EOS。它可以参与 KL，但不属于
+    # solution 或 interaction 内容，故 interaction_span.end 必须停在可见文本末端。
+    class SpecialTokenizer(FakeTokenizer):
+        all_special_ids = [999]
+
+        def __call__(self, text, add_special_tokens=False,
+                     return_offsets_mapping=False):
+            assert return_offsets_mapping
+            return {"input_ids": list(text),
+                    "offset_mapping": [(i, i + 1) for i in range(len(text))]}
+
+    class SpecialEngine(CharEngine):
+        def generate_batch(self, requests):
+            out = []
+            for r in requests:
+                self.calls.append(r["role"])
+                self.prompts.append((r["role"], r["prompt"]))
+                self.temps.append(r.get("temperature"))
+                text = self.script[r["role"]].pop(0)
+                ids = list(text) + [999]
+                out.append((text, [-0.5] * len(ids), ids))
+            return out
+
+    eos_script = {
+        "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>",
+                       "<meta-plan>\ndecision: stop\nreason: r\n</meta-plan>"],
+        "proposer": [response], "critic": [], "verifier": [],
+    }
+    eos_ex = _mk_executor(SpecialEngine(eos_script), stop_gate=False, max_rounds=2,
+                          tokenizer=SpecialTokenizer())
+    eos_res = eos_ex.run_episodes_batch(["1+1=?"], ["2"])[0]
+    eos_msg = [m for m in eos_res["messages"] if m["role_name"] == "proposer"][0]
+    assert eos_msg["interaction_span"][1] == len(response)
+    assert len(eos_msg["response_ids"]) == len(response) + 1
+
+    # 无完整末尾块：不能猜边界，必须 fail-closed 并计数。
+    bad_script = {
+        "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>",
+                       "<meta-plan>\ndecision: stop\nreason: r\n</meta-plan>"],
+        "proposer": ["推理过程：1+1=2\n最终答案：2"],
+        "critic": [], "verifier": [],
+    }
+    bad_ex = _mk_executor(CharEngine(bad_script), stop_gate=False, max_rounds=2)
+    bad = bad_ex.run_episodes_batch(["1+1=?"], ["2"])[0]
+    bad_primary = [m for m in bad["messages"] if m["role_name"] == "proposer"][0]
+    assert bad_primary["interaction_span"] is None
+    assert bad_ex.n_credit_split_failed == 1
+
+    # logprob 少于 token_ids 时，扁平数组仍补位以免后续 turn 错位，但 message 必须
+    # 标成无效，训练器会整 turn 跳过；不能把补出的 0.0 当成真实 old logprob。
+    class MismatchEngine(CharEngine):
+        def generate_batch(self, requests):
+            out = []
+            for r in requests:
+                self.calls.append(r["role"])
+                self.prompts.append((r["role"], r["prompt"]))
+                self.temps.append(r.get("temperature"))
+                text = self.script[r["role"]].pop(0)
+                ids = list(text)
+                lps = ([-0.5] if r["role"] == "proposer" else [-0.5] * len(ids))
+                out.append((text, lps, ids))
+            return out
+
+    mm_script = {
+        "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>",
+                       "<meta-plan>\ndecision: stop\nreason: r\n</meta-plan>"],
+        "proposer": [response], "critic": [], "verifier": [],
+    }
+    mm_ex = _mk_executor(MismatchEngine(mm_script), stop_gate=False, max_rounds=2)
+    mm = mm_ex.run_episodes_batch(["1+1=?"], ["2"])[0]
+    mm_primary = [m for m in mm["messages"] if m["role_name"] == "proposer"][0]
+    assert mm_primary["logprob_aligned"] is False
+    assert mm_ex.n_logprob_mismatch == 1
+    assert len(mm["log_probs"]) == len(mm["turn_ids"]), \
+        "即使 turn 无效，扁平占位也必须保持后续 turn 的全局索引对齐"
+
+
+def test_rollout_preserves_the_exact_prompt_used_for_sampling():
+    """prompt 被截断时，训练必须复用 rollout 真正发送给 vLLM 的字符串。"""
+    from pathlib import Path
+
+    class CharEngine(FakeEngine):
+        def generate_batch(self, requests):
+            out = []
+            for req in requests:
+                self.calls.append(req["role"])
+                self.prompts.append((req["role"], req["prompt"]))
+                self.temps.append(req.get("temperature"))
+                text = self.script[req["role"]].pop(0)
+                out.append((text, [-0.5] * len(text), list(text)))
+            return out
+
+    response = ("推理过程：1+1=2\n最终答案：2\n"
+                + INTER.format(a="none", t="none").strip())
+    script = {
+        "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>"],
+        "proposer": [response], "critic": [], "verifier": [],
+    }
+    tokenizer = FakeTokenizer()
+    engine = CharEngine(script)
+    executor = _mk_executor(
+        engine, tokenizer=tokenizer, max_rounds=1, max_hops=0,
+        stop_gate=False, max_prompt_tokens=500, token_credit=False)
+    episode = executor.run_episodes_batch(["Q" * 1000], ["2"])[0]
+
+    assert executor.n_prompt_clipped > 0, "测试没有真正触发 prompt 截断"
+    assert len(episode["messages"]) == len(engine.prompts)
+    for message, (role, sampled_prompt) in zip(episode["messages"], engine.prompts):
+        assert message["role_name"] == role
+        assert message["prompt_text"] == sampled_prompt, \
+            "message 没保存 rollout 实际使用的 prompt"
+        rebuilt_from_original = tokenizer.apply_chat_template(
+            [{"role": "system", "content": message["system"]},
+             {"role": "user", "content": message["user"]}],
+            tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        assert rebuilt_from_original != sampled_prompt, \
+            "测试没有覆盖原始 user 与截断 prompt 不一致的场景"
+
+    trainer_src = (Path(__file__).resolve().parent /
+                   "training/grpo_trainer.py").read_text(encoding="utf-8")
+    assert 'prompt_text = msg.get("prompt_text")' in trainer_src, \
+        "训练器没有优先复用 rollout 保存的精确 prompt"
+
+
+def test_token_credit_can_be_disabled_for_ablation():
+    """配置开关关闭时恢复旧的整 turn 标量优势，便于严格消融。"""
+    cfg = {**CFG, "token_credit": False}
+    td_ok, _ = compute_turn_data([make_round(0, primary="4")], "4", True, 4, cfg)
+    td_bad, _ = compute_turn_data([make_round(0, primary="5")], "4", False, 4, cfg)
+    assert td_ok[1]["token_credit"] is False
+    assert td_bad[1]["token_credit"] is False
+    adv = compute_raca_advantages([td_ok, td_bad])
+    assert isinstance(adv[0][1], float) and isinstance(adv[1][1], float), \
+        "关闭 token_credit 后没有回退到旧的整 turn 标量优势"
 
 
 def test_integration_full_episode():
@@ -3024,23 +3376,29 @@ def test_absorb_counters_keeps_batch_and_cumulative_semantics_apart():
     from agents.agentic_executor import AgenticExecutor
 
     class _Fake:
-        def __init__(self, gate, self_t, clip, hops):
+        def __init__(self, gate, self_t, split_f, lp_f, clip, hops):
             self.n_gate_unlocked = gate
             self.n_self_target = self_t
+            self.n_credit_split_failed = split_f
+            self.n_logprob_mismatch = lp_f
             self.n_prompt_clipped = clip
             self.n_hop_depth = Counter(hops)
 
     dst = object.__new__(AgenticExecutor)
     dst.n_gate_unlocked = 0
     dst.n_self_target = 0
+    dst.n_credit_split_failed = 0
+    dst.n_logprob_mismatch = 0
     dst.n_prompt_clipped = 0
     dst.n_hop_depth = Counter()
 
-    shards = [_Fake(2, 1, 3, {1: 10, 2: 4, "1:critic": 7}),
-              _Fake(5, 0, 1, {1: 6, 3: 2, "3:verifier": 2})]
+    shards = [_Fake(2, 1, 2, 3, 3, {1: 10, 2: 4, "1:critic": 7}),
+              _Fake(5, 0, 4, 5, 1, {1: 6, 3: 2, "3:verifier": 2})]
 
     dst.absorb_counters(shards)
     assert dst.n_gate_unlocked == 7 and dst.n_self_target == 1
+    assert dst.n_credit_split_failed == 6, "credit split 失败数没有跨分片求和"
+    assert dst.n_logprob_mismatch == 8, "logprob mismatch 没有跨分片求和"
     assert dst.n_prompt_clipped == 4, "累计级应累加"
     assert dst.n_hop_depth[1] == 16 and dst.n_hop_depth[2] == 4
     assert dst.n_hop_depth[3] == 2, "跳深要按键相加，不能只取最后一个分片"
@@ -3051,6 +3409,8 @@ def test_absorb_counters_keeps_batch_and_cumulative_semantics_apart():
     dst.absorb_counters(shards)
     assert dst.n_gate_unlocked == 7, \
         f"批次级被累加了（{dst.n_gate_unlocked}）—— 会被误读成越来越糟"
+    assert dst.n_credit_split_failed == 6, "split failure 被错误地跨批次累加了"
+    assert dst.n_logprob_mismatch == 8, "logprob mismatch 被错误地跨批次累加了"
     assert dst.n_hop_depth[1] == 16, "跳深没有按批次重置"
     assert dst.n_prompt_clipped == 8, \
         f"累计级被覆盖了（{dst.n_prompt_clipped}）—— 丢掉了历史"
@@ -3058,6 +3418,8 @@ def test_absorb_counters_keeps_batch_and_cumulative_semantics_apart():
     # 空分片列表：批次级归零，累计级不动（对应"这一步没有任何分片"）
     dst.absorb_counters([])
     assert dst.n_gate_unlocked == 0 and not dst.n_hop_depth
+    assert dst.n_credit_split_failed == 0
+    assert dst.n_logprob_mismatch == 0
     assert dst.n_prompt_clipped == 8
 
 

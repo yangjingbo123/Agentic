@@ -25,6 +25,7 @@ from agents.parsing import (
     parse_reasoning,
     parse_score,
     strip_interaction,
+    trailing_interaction_span,
 )
 from agents.raca_rewards import compute_turn_data
 from envs.blackboard import Blackboard, Message, MessageType
@@ -59,6 +60,9 @@ class AgenticExecutor:
         # v3 测量（§19）：旧错解+批评的上下文对下一轮重答有锚定伤害
         # （通道② Δ=−0.085/−0.055）；False = FLAW 不进 primary prompt。
         self.flaw_in_primary = config.get("flaw_in_primary_prompt", True)
+        # 新版将 proposer 的解题/交互优势路由到各自 token span；关闭时回退到
+        # 历史的整 turn 标量优势，便于做严格消融和紧急回滚。
+        self.token_credit = config.get("token_credit", True)
         # ── prompt 长度保险（v3.1） ────────────────────────────────────────
         # v3 实测 step 151：decoder prompt 5036 > max_model_len 4096 直接崩作业。
         # 已在 parsing/blackboard 侧堵住已知无界点，但任何嵌入自由文本的 prompt
@@ -71,6 +75,13 @@ class AgenticExecutor:
         self.n_prompt_clipped = 0
         self.n_gate_unlocked = 0    # 本批次闸门解锁次数（健康指标：应随训练下降）
         self.n_self_target = 0      # proposer 自指 target（被归一为 none）的次数
+        # Proposer primary 的文本块边界无法与 vLLM 原始 token_ids 精确对齐的次数。
+        # 这类结构化 turn 整体 fail-closed 跳过 PG（仍可在其它统计中出现），因此
+        # 必须可见；否则 tokenizer 一旦整体不匹配，双通道会静默停止训练。
+        self.n_credit_split_failed = 0
+        # vLLM 返回的 response_ids / log_probs 长度不一致。扁平数组仍需补位保持后续
+        # turn 对齐，但该 turn 必须标成无效并在 PPO 前整条跳过，不能把补的 0 当真值。
+        self.n_logprob_mismatch = 0
         # 交互链按**跳深**分布（第十轮，`max_hops` 2→3 的配套读数）。
         # 为什么非要这个数：第 1 跳（proposer→critic/verifier）由 proposer 的块决定，
         # 第 2 跳里 critic 标错→proposer 修正是**机械触发**（写死 "proposer"），但
@@ -95,6 +106,8 @@ class AgenticExecutor:
             eps_force = 0.0
         self.n_gate_unlocked = 0    # 每批次重置；train.py 读到的就是本步值
         self.n_self_target = 0      # 同上
+        self.n_credit_split_failed = 0  # 同上（双通道 token 边界）
+        self.n_logprob_mismatch = 0     # 同上（response/logprob 对齐）
         self.n_hop_depth.clear()    # 同上（跳深分布）
 
         n = len(questions)
@@ -140,20 +153,94 @@ class AgenticExecutor:
                     + "\n…（中段已省略）…\n"
                     + self.tokenizer.decode(ids[-(budget - head):]))
 
-        def record(i, role, system, user, result, tid):
+        def interaction_token_span(text, token_ids):
+            """把末尾 interaction 字符边界映射到原始 vLLM IDs 的 ``[start,end)``。
+
+            禁止用「重新 tokenize 后大概取长度」：BPE token 可能跨过 ``\n<`` 边界，
+            猜错一位就会把 solution / interaction 的优势施加到错误 token。优先使用
+            fast tokenizer 的 offset_mapping，并要求可见文本重编码 IDs 与 vLLM IDs
+            逐位相同；不支持 offsets 时只接受精确前缀。``end`` 是可见文本的 token
+            数，因此 vLLM 可能附带但不显示的 EOS/special IDs 不会误收进 interaction
+            credit（它们仍参与 KL）。任何歧义都返回 None，训练侧整 turn fail-closed，
+            并通过计数器暴露。
+            """
+            span = trailing_interaction_span(text)
+            if span is None:
+                return None
+            char_start, _ = span
+            ids = list(token_ids)
+
+            def matches_visible_text(full_ids):
+                """允许 vLLM 在可见文本 IDs 后附带被 decode 隐去的 EOS/special token。"""
+                full_ids = list(full_ids)
+                if ids[:len(full_ids)] != full_ids:
+                    return False
+                extras = ids[len(full_ids):]
+                special = set(getattr(self.tokenizer, "all_special_ids", []) or [])
+                return all(tok in special for tok in extras)
+
+            try:
+                encoded = self.tokenizer(
+                    text, add_special_tokens=False, return_offsets_mapping=True)
+                full_ids = encoded["input_ids"]
+                offsets = encoded["offset_mapping"]
+                # 某些 tokenizer 即使单条输入也返回一层 batch 维。
+                if full_ids and isinstance(full_ids[0], list):
+                    full_ids, offsets = full_ids[0], offsets[0]
+                if matches_visible_text(full_ids) and len(offsets) == len(full_ids):
+                    for idx, (lo, hi) in enumerate(offsets):
+                        if lo == char_start:
+                            return idx, len(full_ids)
+                        if lo < char_start < hi:
+                            return None       # token 横跨边界，不能安全拆
+            except (TypeError, KeyError, NotImplementedError, AttributeError):
+                pass
+
+            try:
+                full_ids = list(self.tokenizer.encode(
+                    text, add_special_tokens=False))
+                prefix_ids = list(self.tokenizer.encode(
+                    text[:char_start], add_special_tokens=False))
+            except (TypeError, AttributeError):
+                return None
+            if (matches_visible_text(full_ids)
+                    and len(prefix_ids) < len(full_ids)
+                    and full_ids[:len(prefix_ids)] == prefix_ids):
+                return len(prefix_ids), len(full_ids)
+            return None
+
+        def record(i, role, system, user, result, tid, *, prompt_text=None,
+                   split_credit=False):
             text, turn_lps, token_ids = result
+            token_ids = list(token_ids)
             n_resp = len(token_ids)
-            aligned = list(turn_lps) + [0.0] * (n_resp - len(turn_lps))
+            logprob_aligned = len(turn_lps) == n_resp
+            if not logprob_aligned:
+                self.n_logprob_mismatch += 1
+            # 扁平存储必须保持每个 token 都有占位，否则后续 turn_ids 整体错位；
+            # 但补出的 0 只用于维持索引，message 标记会让训练器整 turn 跳过。
+            aligned = list(turn_lps) + [0.0] * max(0, n_resp - len(turn_lps))
             log_probs_list[i].extend(aligned[:n_resp])
             turn_ids_list[i].extend([tid] * n_resp)
-            all_messages[i].append({
+            message = {
                 "role_name":    role,
                 "turn_id":      tid,
                 "system":       system,
                 "user":         user,
+                # 保存 rollout 真正使用的完整 prompt。user 可能在 make_prompt() 内
+                # 被截断；训练时重新从原始 system/user 渲染会改变条件上下文，导致
+                # old/new logprob 不再对应同一序列。旧数据没有此字段时训练器再回退重建。
+                "prompt_text":  prompt_text,
                 "response":     text,
                 "response_ids": token_ids,
-            })
+                "logprob_aligned": logprob_aligned,
+            }
+            if split_credit:
+                span = interaction_token_span(text, token_ids)
+                message["interaction_span"] = span
+                if span is None:
+                    self.n_credit_split_failed += 1
+            all_messages[i].append(message)
             return text
 
         def responder_prompt(i, target, initiator, action, reason, init_out, forced):
@@ -228,17 +315,20 @@ class AgenticExecutor:
             for i in active:
                 sys = PromptTemplates.controller_system()
                 usr = f"问题：{questions[i]}\n当前状态：{blackboards[i].to_text()}"
-                ctrl_info.append((i, next_tid(i), sys, usr))
+                prompt = make_prompt(sys, usr)
+                ctrl_info.append((i, next_tid(i), sys, usr, prompt))
 
             ctrl_res = self.vllm_engine.generate_batch(
-                [{"role": "controller", "prompt": make_prompt(s, u),
-                  "temperature": self.temperature} for _, _, s, u in ctrl_info]
+                [{"role": "controller", "prompt": prompt,
+                  "temperature": self.temperature}
+                 for _, _, _, _, prompt in ctrl_info]
             )
 
             still_active = []
             ep_st = {}   # 本轮活跃 episode 的 round 状态
-            for (i, tid, sys, usr), res in zip(ctrl_info, ctrl_res):
-                text = record(i, "controller", sys, usr, res, tid)
+            for (i, tid, sys, usr, prompt), res in zip(ctrl_info, ctrl_res):
+                text = record(i, "controller", sys, usr, res, tid,
+                              prompt_text=prompt)
                 gate_blocked = False
                 if parse_decision(text) == "stop":
                     # stop 闸门：黑板存在 verifier 分数才允许终止（§2.1 约束）
@@ -268,15 +358,18 @@ class AgenticExecutor:
                 sys = PromptTemplates.proposer_system()
                 usr = (f"问题：{questions[i]}\n当前状态："
                        f"{blackboards[i].to_text(include_flaws=self.flaw_in_primary)}")
-                prop_info.append((i, next_tid(i), sys, usr))
+                prompt = make_prompt(sys, usr)
+                prop_info.append((i, next_tid(i), sys, usr, prompt))
 
             prop_res = self.vllm_engine.generate_batch(
-                [{"role": "proposer", "prompt": make_prompt(s, u),
-                  "temperature": self.temperature} for _, _, s, u in prop_info]
+                [{"role": "proposer", "prompt": prompt,
+                  "temperature": self.temperature}
+                 for _, _, _, _, prompt in prop_info]
             )
 
-            for (i, tid, sys, usr), res in zip(prop_info, prop_res):
-                out = record(i, "proposer", sys, usr, res, tid)
+            for (i, tid, sys, usr, prompt), res in zip(prop_info, prop_res):
+                out = record(i, "proposer", sys, usr, res, tid,
+                             prompt_text=prompt, split_credit=self.token_credit)
                 reasoning, answer = parse_reasoning(out)
                 blackboards[i].add_message(Message(0, MessageType.TRACE, (reasoning, answer)))
                 # 展示副本：交给别的角色看的文本一律剥掉 <interaction> 块。
@@ -364,7 +457,8 @@ class AgenticExecutor:
                         continue
                     sys, usr, reviewed = responder_prompt(
                         i, target, initiator, action, reason, init_out, forced)
-                    batch_req.append((i, next_tid(i), target, sys, usr, reviewed))
+                    prompt = make_prompt(sys, usr)
+                    batch_req.append((i, next_tid(i), target, sys, usr, reviewed, prompt))
                 if not batch_req:
                     break
                 # 跳深计数（从 1 起，与"第几跳"的口头说法一致）。放在 `break` 之后、
@@ -373,15 +467,17 @@ class AgenticExecutor:
                 # "第 3 跳到达 verifier"（修正后的答案在轮内被打分），只看总数分不出
                 # 它到的是 verifier 还是又一次 critic。
                 self.n_hop_depth[_hop + 1] += len(batch_req)
-                for _, _, _t, _, _, _ in batch_req:
+                for _, _, _t, _, _, _, _ in batch_req:
                     self.n_hop_depth[f"{_hop + 1}:{_t}"] += 1
 
                 res_all = self.vllm_engine.generate_batch(
-                    [{"role": t, "prompt": make_prompt(s, u),
-                      "temperature": self.temperature} for _, _, t, s, u, _ in batch_req]
+                    [{"role": t, "prompt": prompt,
+                      "temperature": self.temperature}
+                     for _, _, t, _, _, _, prompt in batch_req]
                 )
-                for (i, tid, target, sys, usr, reviewed), res in zip(batch_req, res_all):
-                    out = record(i, target, sys, usr, res, tid)
+                for (i, tid, target, sys, usr, reviewed, prompt), res in zip(
+                        batch_req, res_all):
+                    out = record(i, target, sys, usr, res, tid, prompt_text=prompt)
                     # 展示副本（不影响 record 存下的训练目标）：黑板文本会嵌进
                     # controller / critic / verifier 每一个 prompt，而 flaw 窗口只有
                     # `_MAX_FLAW_CHARS`；块占着窗口就是 v3 "critic 说了等于没说"
@@ -454,17 +550,20 @@ class AgenticExecutor:
                         continue
                     bb = blackboards[i]
                     last = bb.traces[-1] if bb.traces else ("", "")
-                    unlock_info.append((
-                        i, next_tid(i), PromptTemplates.verifier_system(),
-                        f"待验证答案：{last[1]}\n推理：{last[0]}\n"
-                        f"当前状态：{bb.to_text()}", last[1]))
+                    sys = PromptTemplates.verifier_system()
+                    usr = (f"待验证答案：{last[1]}\n推理：{last[0]}\n"
+                           f"当前状态：{bb.to_text()}")
+                    prompt = make_prompt(sys, usr)
+                    unlock_info.append((i, next_tid(i), sys, usr, last[1], prompt))
                 if unlock_info:
                     unlock_res = self.vllm_engine.generate_batch(
-                        [{"role": "verifier", "prompt": make_prompt(s, u),
+                        [{"role": "verifier", "prompt": prompt,
                           "temperature": self.temperature}
-                         for _, _, s, u, _ in unlock_info])
-                    for (i, tid, sys, usr, reviewed), res in zip(unlock_info, unlock_res):
-                        out = record(i, "verifier", sys, usr, res, tid)
+                         for _, _, _, _, _, prompt in unlock_info])
+                    for (i, tid, sys, usr, reviewed, prompt), res in zip(
+                            unlock_info, unlock_res):
+                        out = record(i, "verifier", sys, usr, res, tid,
+                                     prompt_text=prompt)
                         score = parse_score(out)
                         blackboards[i].add_message(Message(
                             2, MessageType.SCORE,
@@ -574,7 +673,8 @@ class AgenticExecutor:
         为什么需要它：`train.py` 在多 vLLM 引擎时走**分片 rollout**，每步为每个
         分片新建一个临时 `AgenticExecutor`，而 step 行读的是 `trainer.executor`
         —— 一个从未跑过 rollout 的实例。于是 `n_hop_depth` / `n_gate_unlocked` /
-        `n_self_target` / `n_prompt_clipped` 在集群上**结构性恒为 0**。
+        `n_self_target` / `n_credit_split_failed` / `n_logprob_mismatch` /
+        `n_prompt_clipped` 若不聚合，都会在集群上**结构性恒为 0**。
         08-28 两跑（`v32_m1` / `v32_open`，实测 7 个引擎）四个读数全程是假的 0：
         `gate=363→0` 里那个 0 没有意义；`hop=` 一次都没打印，于是 `max_hops` 2→3
         的**唯一**验收指标失效；`clip_prompt` 为 0 **不能**证明 prompt 没超预算，
@@ -583,7 +683,8 @@ class AgenticExecutor:
 
         **两类计数器语义不同，聚合方式必须不同——这是本方法最容易写错的地方：**
         - 批次级（`run_episodes_batch` 开头会重置）：`n_gate_unlocked`、
-          `n_self_target`、`n_hop_depth` → **赋值**为各分片之和。
+          `n_self_target`、`n_credit_split_failed`、`n_logprob_mismatch`、
+          `n_hop_depth` → **赋值**为各分片之和。
         - 累计级（只在 `__init__` 归零、跨步累加）：`n_prompt_clipped` → **累加**。
 
         一律写 `+=` 会让批次级的数变成整轮累计（只增不减，被误读成"越来越糟"）；
@@ -593,6 +694,10 @@ class AgenticExecutor:
         others = list(others)
         self.n_gate_unlocked = sum(getattr(o, "n_gate_unlocked", 0) for o in others)
         self.n_self_target = sum(getattr(o, "n_self_target", 0) for o in others)
+        self.n_credit_split_failed = sum(
+            getattr(o, "n_credit_split_failed", 0) for o in others)
+        self.n_logprob_mismatch = sum(
+            getattr(o, "n_logprob_mismatch", 0) for o in others)
         self.n_prompt_clipped += sum(
             getattr(o, "n_prompt_clipped", 0) for o in others)
         self.n_hop_depth.clear()

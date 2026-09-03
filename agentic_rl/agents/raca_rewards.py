@@ -143,6 +143,7 @@ def compute_turn_data(
     gamma      = cfg.get("ctrl_gamma", 0.3)
     c_int      = cfg.get("c_int", 0.02)
     lambda_int = cfg.get("lambda_int", 1.0)
+    token_credit = bool(cfg.get("token_credit", True))
     gain       = cfg.get("int_gain", 0.3)        # 有效求助收益
     overkill   = cfg.get("int_overkill", 0.05)   # 画蛇添足惩罚（正数，内部取负）
     # 该问而没问的机会成本（正数，内部取负）。**默认 0.0 而不是 0.10**：缺配置时
@@ -183,10 +184,10 @@ def compute_turn_data(
         turn_data[rnd["primary_tid"]] = {
             "role": "proposer", "round": t, "sigma": sigma,
             "is_response": False, "reward": r_prop + lambda_int * r_int,
-            # v2.3 双通道（§18）：优势阶段 r_prop 与 λ·r_int 各自组内归一化后
-            # 相加。r_prop 通道不分层（恢复解题信号：v2.1 的全量分层使
-            # int_rate=0 后主 turn 组内零方差、解题能力停训）；r_int 通道
-            # 仍按 layer_key=p_t 分层（v2.1 的隔离目的不变）。
+            # 双 token 通道：r_prop 与 r_int 各自组内归一化；solution advantage
+            # 只训练推理+答案 token，lambda_int*A_int 只训练末尾 interaction block。
+            # r_prop 不按 p_t 分层（否则组内奖励恒定、解题信号消失）；r_int 仍按
+            # layer_key=p_t 分层，分别比较「答对时问/不问」与「答错时问/不问」。
             "r_prop": r_prop,
             # **forced 必须是 None（通道缺席），不能是数值 0。** 08-28 的 `v32_miss`
             # 已经给了反证：int_miss 把崩塌从 step10 延后到 step25，但 eval 从
@@ -200,6 +201,14 @@ def compute_turn_data(
             # 真正做到「决策不是 proposer 做的，所以没有交互梯度」。它仍保留：
             # ① r_prop 解题通道；② critic/verifier 响应奖励；③ q_forced 随机对照读数。
             # total reward 继续用上面的 r_int=0，所以历史日志的 reward 口径不变。
+            # 新的 token-credit 路径必须先标准化 raw r_int，再乘 lambda_int：
+            # z(lambda*r)=z(r)（lambda>0），旧 `r_int_w=lambda*r_int` 把权重放在
+            # z-score 前，导致 0.1/1/10 三个配置训练效果完全相同，只有 0 能关掉
+            # 通道。这里把原始值与权重分开保存；`r_int_w` 仅保留给旧 episode / 诊断
+            # 兼容，不再作为新优势计算的输入。
+            "r_int": None if rnd["forced"] else r_int,
+            "lambda_int": lambda_int,
+            "token_credit": token_credit,
             "r_int_w": None if rnd["forced"] else lambda_int * r_int,
             "layer_key": int(p_prim),
         }

@@ -73,7 +73,12 @@ int_overkill: 0.05   # 画蛇添足惩罚（v2.1：0.05 → v3：0.0 → v3.2：
 # （eff 低而 int_rate 高即是）。若过头，下一步抬 c_int 给求助加固定门槛，本轮不动。
 # 0.0 = 消融（退回 v2.1 行为）；代码侧默认也是 0.0，必须在这里显式开启。
 int_miss: 0.10
-lambda_int: 1.0      # 交互奖励合成权重；0 = 消融B（有交互不训练交互，即 v1 行为）
+# 交互优势权重：interaction block token 使用 λ·z(r_int)。必须乘在 z-score **之后**；
+# 旧版 z(λr_int) 会把所有正 λ 的尺度完全消掉。0 = 关闭交互 credit。
+lambda_int: 1.0
+# true：解题与交互优势按各自 token span 路由；false：回退旧的整 turn 标量优势。
+# 保留该开关用于严格消融，正式配置默认启用。
+token_credit: true
 # 每轮交互链响应跳数上限；0 = 消融A（完全禁用交互）。
 # v3.2 第十轮 2 → 3。**2 不是"给少了"，是被机械硬触发吃满了**：标准路径
 # proposer 出解 → hop1 critic 审查 → hop2 critic 标错硬触发 proposer 修正

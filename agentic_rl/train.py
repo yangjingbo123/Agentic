@@ -406,11 +406,27 @@ def main(cfg: DictConfig):
             raise
 
         _g_kept, _g_total = stats.get("groups_kept", 0), stats.get("groups_total", 0)
+        # 先读 fail-closed 诊断，再判断 skipped；否则所有 primary 因 token 边界或
+        # logprob 错位被跳过时，只会看到泛化的「无有效组」，真正原因反而不打印。
+        _n_split = getattr(trainer.executor, "n_credit_split_failed", 0)
+        _n_lp_bad = getattr(trainer.executor, "n_logprob_mismatch", 0)
+        # 绝对计数会随 batch 大小、平均轮数变化，补充稳定的比例口径。
+        _all_msgs = [msg for ep in all_eps if ep is not None
+                     for msg in ep.get("messages", [])]
+        _n_split_total = sum(1 for msg in _all_msgs if "interaction_span" in msg)
+        _n_lp_total = len(_all_msgs)
+        _split_rate = _n_split / max(_n_split_total, 1)
+        _lp_bad_rate = _n_lp_bad / max(_n_lp_total, 1)
         if stats.get("skipped", False):
             # Reusing the current step index for wandb would also clash with the
             # point already logged there, so skip the log entirely and fold the
             # running total into the next real step.
-            note_skip(f"no usable groups (0/{_g_total})")
+            detail = (
+                f", splitF={_n_split}/{_n_split_total}({_split_rate:.2%}), "
+                f"lpF={_n_lp_bad}/{_n_lp_total}({_lp_bad_rate:.2%})"
+                if (_n_split or _n_lp_bad) else ""
+            )
+            note_skip(f"no usable groups (0/{_g_total}{detail})")
             continue
 
         consecutive_skips = 0
@@ -470,6 +486,10 @@ def main(cfg: DictConfig):
             f"stop_rate={stats.get('stop_rate', 0.0):.2f} eps={eps_force:.2f}"
             + (f" clip_prompt={_n_clip}" if _n_clip else "")
             + (f" selfT={_n_self}" if _n_self else "")
+            + (f" splitF={_n_split}/{_n_split_total}({_split_rate:.2%})"
+               if _n_split else "")
+            + (f" lpF={_n_lp_bad}/{_n_lp_total}({_lp_bad_rate:.2%})"
+               if _n_lp_bad else "")
             + (f" hop={_hop_s}" if _hop_s else ""),
             flush=True,
         )
@@ -495,12 +515,22 @@ def main(cfg: DictConfig):
                     "acc_uni_excl", "acc_wt_excl", "acc_uni_incl", "acc_wt_incl",
                     "d_vote", "d_corr",
                     "pool_votes", "pool_distinct", "pool_degenerate",
-                    "vote_margin"):
+                    "vote_margin",
+                    "solution_pg_loss", "interaction_pg_loss",
+                    "solution_adv_abs", "interaction_adv_abs",
+                    "solution_channel_count", "interaction_channel_count",
+                    "solution_token_count", "interaction_token_count"):
             if _mk in stats:
                 log_data[_mk] = stats[_mk]
         log_data["gate_unlocked"] = getattr(trainer.executor, "n_gate_unlocked", 0)
         log_data["prompt_clipped"] = _n_clip
         log_data["self_target"] = _n_self
+        log_data["credit_split_failed"] = _n_split
+        log_data["credit_split_attempted"] = _n_split_total
+        log_data["credit_split_failure_rate"] = _split_rate
+        log_data["logprob_mismatch"] = _n_lp_bad
+        log_data["logprob_checked"] = _n_lp_total
+        log_data["logprob_mismatch_rate"] = _lp_bad_rate
         # 跳深分布逐深度上报（键为 int，wandb 需要字符串名）。
         for _d in (1, 2, 3):
             log_data[f"hop_depth_{_d}"] = int(_hd.get(_d, 0))

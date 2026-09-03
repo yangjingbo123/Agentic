@@ -26,7 +26,16 @@ def parse_interaction(text: str) -> tuple[str, str, str]:
     仅 action ∈ {request, challenge} 且 target 为合法角色时视为发起；
     其余（none/support/解析失败）一律 ("none", "none", "")。
     """
-    block = re.search(r"<interaction>(.*?)</interaction>", text, re.S)
+    # M1 后规范动作在末尾。token credit 也只切末尾完整块，因此解析必须优先读取
+    # **同一个块**；否则多块输出会出现「执行第一个动作、训练最后一个动作」的
+    # 信用错位。对旧数据/非规范输出保留首块 fallback，只用于兼容，不做 token split。
+    trailing = trailing_interaction_span(text)
+    if trailing is not None:
+        block = re.search(
+            r"<interaction>(.*?)</interaction>",
+            text[trailing[0]:trailing[1]], re.S)
+    else:
+        block = re.search(r"<interaction>(.*?)</interaction>", text, re.S)
     if not block:
         return "none", "none", ""
     content = block.group(1)
@@ -50,6 +59,41 @@ def parse_interaction(text: str) -> tuple[str, str, str]:
 
 
 _INTER_BLOCK = re.compile(r"\s*<interaction>.*?</interaction>\s*", re.S)
+
+def trailing_interaction_span(text: str) -> tuple[int, int] | None:
+    """返回末尾完整 ``<interaction>...</interaction>`` 块的字符区间。
+
+    token 级信用路由只能在边界**可证明**时切分：Proposer primary 的解题优势
+    作用于块前 token，交互优势只作用于块内 token。这里选择最后一个完整块，并
+    要求闭标签之后只有空白；正文里引用的示例块、缺闭标签的残块、块后继续输出
+    正文都拒绝切分。起点向左包含紧邻块的空白，使通常的换行也归到 interaction
+    span，减少 tokenizer 在 ``\n<`` 处跨边界合并的概率。
+
+    返回的是 Python slice 风格 ``(start, end)``，其中 ``end == len(text)``；
+    找不到唯一安全的末尾块时返回 ``None``。这不改变 ``parse_interaction`` 的
+    宽容解析语义，只是给训练侧一个更严格的 credit boundary。
+    """
+    close_tag = "</interaction>"
+    close_start = text.rfind(close_tag)
+    if close_start < 0:
+        return None
+    close_end = close_start + len(close_tag)
+    if text[close_end:].strip():
+        return None
+    # 与最后一个闭标签配对的只能是它前面的**最后一个**开标签。若用非贪婪正则
+    # finditer，前面一个未闭合 `<interaction>` 会一路吞到最后闭标签，导致执行和
+    # credit 都落在错误块上。
+    open_tag = "<interaction>"
+    open_start = text.rfind(open_tag, 0, close_start)
+    if open_start < 0:
+        return None
+    inner = text[open_start + len(open_tag):close_start]
+    if open_tag in inner or close_tag in inner:
+        return None
+    start = open_start
+    while start > 0 and text[start - 1].isspace():
+        start -= 1
+    return start, len(text)
 
 
 def strip_interaction(text: str, *, trim: bool = True) -> str:

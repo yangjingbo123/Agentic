@@ -166,9 +166,18 @@ def check_config():
     dat = _load_flat_yaml("configs/data/math.yaml")
     check(str(dat.get("sft_path", "")).endswith("sft_train_v2.jsonl"),
           f"data.sft_path 指向 v2 数据（当前 {dat.get('sft_path')}）")
-    for k in ("c_int", "lambda_int", "max_hops", "stop_gate",
+    for k in ("c_int", "int_miss", "lambda_int", "token_credit",
+              "max_hops", "stop_gate",
               "eps_force_init", "eps_force_min"):
         check(k in cfg, f"v2 超参 {k} = {cfg.get(k)}")
+    check(isinstance(cfg.get("token_credit"), bool),
+          f"token_credit 必须是布尔值（当前 {cfg.get('token_credit')!r}）")
+    try:
+        _lambda_int = float(cfg.get("lambda_int"))
+        check(_lambda_int >= 0.0,
+              f"lambda_int 必须 >= 0（当前 {_lambda_int}）")
+    except (TypeError, ValueError):
+        check(False, f"lambda_int 必须是数值（当前 {cfg.get('lambda_int')!r}）")
     # 消融组合合法性
     if cfg.get("max_hops", 0) == 0 and cfg.get("stop_gate"):
         check(False, "max_hops=0（禁交互）时 stop_gate 必须为 false，"

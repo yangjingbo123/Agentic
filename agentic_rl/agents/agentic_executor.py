@@ -79,6 +79,7 @@ class AgenticExecutor:
         # 这类结构化 turn 整体 fail-closed 跳过 PG（仍可在其它统计中出现），因此
         # 必须可见；否则 tokenizer 一旦整体不匹配，双通道会静默停止训练。
         self.n_credit_split_failed = 0
+        self.n_credit_split_failures = Counter()  # 失败原因分布（定位格式 vs tokenizer）
         # vLLM 返回的 response_ids / log_probs 长度不一致。扁平数组仍需补位保持后续
         # turn 对齐，但该 turn 必须标成无效并在 PPO 前整条跳过，不能把补的 0 当真值。
         self.n_logprob_mismatch = 0
@@ -107,6 +108,7 @@ class AgenticExecutor:
         self.n_gate_unlocked = 0    # 每批次重置；train.py 读到的就是本步值
         self.n_self_target = 0      # 同上
         self.n_credit_split_failed = 0  # 同上（双通道 token 边界）
+        self.n_credit_split_failures.clear()
         self.n_logprob_mismatch = 0     # 同上（response/logprob 对齐）
         self.n_hop_depth.clear()    # 同上（跳深分布）
 
@@ -154,45 +156,53 @@ class AgenticExecutor:
                     + self.tokenizer.decode(ids[-(budget - head):]))
 
         def interaction_token_span(text, token_ids):
-            """把末尾 interaction 字符边界映射到原始 vLLM IDs 的 ``[start,end)``。
+            """把末尾 interaction 字符边界映射到原始 vLLM IDs。
 
-            禁止用「重新 tokenize 后大概取长度」：BPE token 可能跨过 ``\n<`` 边界，
-            猜错一位就会把 solution / interaction 的优势施加到错误 token。优先使用
-            fast tokenizer 的 offset_mapping，并要求可见文本重编码 IDs 与 vLLM IDs
-            逐位相同；不支持 offsets 时只接受精确前缀。``end`` 是可见文本的 token
-            数，因此 vLLM 可能附带但不显示的 EOS/special IDs 不会误收进 interaction
-            credit（它们仍参与 KL）。任何歧义都返回 None，训练侧整 turn fail-closed，
-            并通过计数器暴露。
+            返回 ``((start, end), None)`` 或 ``(None, reason)``。失败原因必须保留，
+            否则 ``splitF`` 升高时无法区分模型格式续写和 tokenizer round-trip 问题。
             """
             span = trailing_interaction_span(text)
             if span is None:
-                return None
+                close_tag = "</interaction>"
+                close_start = text.rfind(close_tag)
+                if close_start < 0:
+                    return None, "no_close_tag"
+                close_end = close_start + len(close_tag)
+                if text[close_end:].strip():
+                    return None, "text_after_block"
+                open_tag = "<interaction>"
+                open_start = text.rfind(open_tag, 0, close_start)
+                if open_start < 0:
+                    return None, "no_open_tag"
+                return None, "malformed_tail_block"
+
             char_start, _ = span
             ids = list(token_ids)
 
-            def matches_visible_text(full_ids):
-                """允许 vLLM 在可见文本 IDs 后附带被 decode 隐去的 EOS/special token。"""
+            def visible_match(full_ids):
                 full_ids = list(full_ids)
                 if ids[:len(full_ids)] != full_ids:
-                    return False
+                    return False, "visible_id_mismatch"
                 extras = ids[len(full_ids):]
                 special = set(getattr(self.tokenizer, "all_special_ids", []) or [])
-                return all(tok in special for tok in extras)
+                if not all(tok in special for tok in extras):
+                    return False, "extra_non_special"
+                return True, None
 
             try:
                 encoded = self.tokenizer(
                     text, add_special_tokens=False, return_offsets_mapping=True)
                 full_ids = encoded["input_ids"]
                 offsets = encoded["offset_mapping"]
-                # 某些 tokenizer 即使单条输入也返回一层 batch 维。
                 if full_ids and isinstance(full_ids[0], list):
                     full_ids, offsets = full_ids[0], offsets[0]
-                if matches_visible_text(full_ids) and len(offsets) == len(full_ids):
+                matched, _ = visible_match(full_ids)
+                if matched and len(offsets) == len(full_ids):
                     for idx, (lo, hi) in enumerate(offsets):
                         if lo == char_start:
-                            return idx, len(full_ids)
+                            return (idx, len(full_ids)), None
                         if lo < char_start < hi:
-                            return None       # token 横跨边界，不能安全拆
+                            return None, "boundary_inside_token"
             except (TypeError, KeyError, NotImplementedError, AttributeError):
                 pass
 
@@ -202,12 +212,16 @@ class AgenticExecutor:
                 prefix_ids = list(self.tokenizer.encode(
                     text[:char_start], add_special_tokens=False))
             except (TypeError, AttributeError):
-                return None
-            if (matches_visible_text(full_ids)
-                    and len(prefix_ids) < len(full_ids)
-                    and full_ids[:len(prefix_ids)] == prefix_ids):
-                return len(prefix_ids), len(full_ids)
-            return None
+                return None, "tokenizer_error"
+
+            matched, reason = visible_match(full_ids)
+            if not matched:
+                return None, reason
+            if len(prefix_ids) >= len(full_ids):
+                return None, "empty_interaction_span"
+            if full_ids[:len(prefix_ids)] != prefix_ids:
+                return None, "prefix_not_stable"
+            return (len(prefix_ids), len(full_ids)), None
 
         def record(i, role, system, user, result, tid, *, prompt_text=None,
                    split_credit=False):
@@ -236,10 +250,12 @@ class AgenticExecutor:
                 "logprob_aligned": logprob_aligned,
             }
             if split_credit:
-                span = interaction_token_span(text, token_ids)
+                span, split_error = interaction_token_span(text, token_ids)
                 message["interaction_span"] = span
                 if span is None:
+                    message["interaction_span_error"] = split_error
                     self.n_credit_split_failed += 1
+                    self.n_credit_split_failures[split_error or "unknown"] += 1
             all_messages[i].append(message)
             return text
 
@@ -683,8 +699,8 @@ class AgenticExecutor:
 
         **两类计数器语义不同，聚合方式必须不同——这是本方法最容易写错的地方：**
         - 批次级（`run_episodes_batch` 开头会重置）：`n_gate_unlocked`、
-          `n_self_target`、`n_credit_split_failed`、`n_logprob_mismatch`、
-          `n_hop_depth` → **赋值**为各分片之和。
+          `n_self_target`、`n_credit_split_failed`、`n_credit_split_failures`、
+          `n_logprob_mismatch`、`n_hop_depth` → **赋值**为各分片之和。
         - 累计级（只在 `__init__` 归零、跨步累加）：`n_prompt_clipped` → **累加**。
 
         一律写 `+=` 会让批次级的数变成整轮累计（只增不减，被误读成"越来越糟"）；
@@ -696,6 +712,10 @@ class AgenticExecutor:
         self.n_self_target = sum(getattr(o, "n_self_target", 0) for o in others)
         self.n_credit_split_failed = sum(
             getattr(o, "n_credit_split_failed", 0) for o in others)
+        self.n_credit_split_failures.clear()
+        for o in others:
+            self.n_credit_split_failures.update(
+                getattr(o, "n_credit_split_failures", None) or {})
         self.n_logprob_mismatch = sum(
             getattr(o, "n_logprob_mismatch", 0) for o in others)
         self.n_prompt_clipped += sum(

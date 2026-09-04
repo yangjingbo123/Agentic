@@ -15,6 +15,16 @@ _ROLE_TO_ADAPTER = {
 }
 
 
+def _stop_for_role(role: str) -> list[str]:
+    """返回角色输出的结构化终止标签。
+
+    M1 已把 worker 的 ``<interaction>`` 块移到实质内容末尾，因此在闭标签处
+    停止既不会截掉答案/评分，也能防止模型继续生成尾随正文，保证 token-credit
+    的 trailing-block 不变量。
+    """
+    return ["</meta-plan>"] if role == "controller" else ["</interaction>"]
+
+
 def _log(message: str):
     print(f"[vllm-worker] {message}", file=sys.stderr, flush=True)
 
@@ -149,9 +159,9 @@ class VLLMWorker:
         return {"text": out.text, "log_probs": log_probs, "token_ids": list(out.token_ids)}
 
     def generate(self, role: str, prompt: str, temperature: float = 1.0):
-        # Only the controller is a short routing turn. Proposer/Critic/Verifier
-        # must continue after </interaction> so their answer/score fields exist.
-        stop = ["</meta-plan>"] if role == "controller" else None
+        # M1 后所有角色的结构化闭标签都位于实质输出末尾。保留闭标签本身，
+        # 但禁止其后继续生成，否则 trailing interaction span 无法安全切分。
+        stop = _stop_for_role(role)
         params = self.SamplingParams(
             max_tokens=self.max_tokens, temperature=temperature, logprobs=20,
             stop=stop, include_stop_str_in_output=bool(stop),
@@ -171,7 +181,7 @@ class VLLMWorker:
         for req in requests:
             role = req["role"]
             temp = req.get("temperature", 1.0)
-            stop = ["</meta-plan>"] if role == "controller" else None
+            stop = _stop_for_role(role)
             inputs.append(req["prompt"])
             lora_reqs.append(self._make_lora_req(role))
             params_list.append(self.SamplingParams(

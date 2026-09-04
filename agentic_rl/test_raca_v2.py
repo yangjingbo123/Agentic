@@ -60,6 +60,15 @@ def test_parse_decision():
     assert parse_decision("乱码 without decision") == "continue"   # 保守默认
 
 
+def test_vllm_worker_stops_on_each_roles_terminal_structure():
+    """M1 后 worker 的 interaction 块位于末尾，闭标签必须成为生成 stop。"""
+    from llm.vllm_worker import _stop_for_role
+
+    assert _stop_for_role("controller") == ["</meta-plan>"]
+    for role in ("proposer", "critic", "verifier"):
+        assert _stop_for_role(role) == ["</interaction>"], role
+
+
 def test_trailing_interaction_span_only_accepts_a_complete_final_block():
     """credit split 只认**末尾完整块**，正文示例/残块/块后正文都不能切。
 
@@ -1117,7 +1126,9 @@ def test_executor_records_exact_interaction_token_boundary():
     bad = bad_ex.run_episodes_batch(["1+1=?"], ["2"])[0]
     bad_primary = [m for m in bad["messages"] if m["role_name"] == "proposer"][0]
     assert bad_primary["interaction_span"] is None
+    assert bad_primary["interaction_span_error"] == "no_close_tag"
     assert bad_ex.n_credit_split_failed == 1
+    assert bad_ex.n_credit_split_failures == {"no_close_tag": 1}
 
     # logprob 少于 token_ids 时，扁平数组仍补位以免后续 turn 错位，但 message 必须
     # 标成无效，训练器会整 turn 跳过；不能把补出的 0.0 当成真实 old logprob。
@@ -3376,10 +3387,11 @@ def test_absorb_counters_keeps_batch_and_cumulative_semantics_apart():
     from agents.agentic_executor import AgenticExecutor
 
     class _Fake:
-        def __init__(self, gate, self_t, split_f, lp_f, clip, hops):
+        def __init__(self, gate, self_t, split_f, split_why, lp_f, clip, hops):
             self.n_gate_unlocked = gate
             self.n_self_target = self_t
             self.n_credit_split_failed = split_f
+            self.n_credit_split_failures = Counter(split_why)
             self.n_logprob_mismatch = lp_f
             self.n_prompt_clipped = clip
             self.n_hop_depth = Counter(hops)
@@ -3388,16 +3400,24 @@ def test_absorb_counters_keeps_batch_and_cumulative_semantics_apart():
     dst.n_gate_unlocked = 0
     dst.n_self_target = 0
     dst.n_credit_split_failed = 0
+    dst.n_credit_split_failures = Counter()
     dst.n_logprob_mismatch = 0
     dst.n_prompt_clipped = 0
     dst.n_hop_depth = Counter()
 
-    shards = [_Fake(2, 1, 2, 3, 3, {1: 10, 2: 4, "1:critic": 7}),
-              _Fake(5, 0, 4, 5, 1, {1: 6, 3: 2, "3:verifier": 2})]
+    shards = [
+        _Fake(2, 1, 2, {"text_after_block": 2}, 3, 3,
+              {1: 10, 2: 4, "1:critic": 7}),
+        _Fake(5, 0, 4, {"text_after_block": 1, "visible_id_mismatch": 3},
+              5, 1, {1: 6, 3: 2, "3:verifier": 2}),
+    ]
 
     dst.absorb_counters(shards)
     assert dst.n_gate_unlocked == 7 and dst.n_self_target == 1
     assert dst.n_credit_split_failed == 6, "credit split 失败数没有跨分片求和"
+    assert dst.n_credit_split_failures == {
+        "text_after_block": 3, "visible_id_mismatch": 3}, \
+        "credit split 原因分布没有跨分片合并"
     assert dst.n_logprob_mismatch == 8, "logprob mismatch 没有跨分片求和"
     assert dst.n_prompt_clipped == 4, "累计级应累加"
     assert dst.n_hop_depth[1] == 16 and dst.n_hop_depth[2] == 4
@@ -3410,6 +3430,8 @@ def test_absorb_counters_keeps_batch_and_cumulative_semantics_apart():
     assert dst.n_gate_unlocked == 7, \
         f"批次级被累加了（{dst.n_gate_unlocked}）—— 会被误读成越来越糟"
     assert dst.n_credit_split_failed == 6, "split failure 被错误地跨批次累加了"
+    assert dst.n_credit_split_failures["text_after_block"] == 3
+    assert dst.n_credit_split_failures["visible_id_mismatch"] == 3
     assert dst.n_logprob_mismatch == 8, "logprob mismatch 被错误地跨批次累加了"
     assert dst.n_hop_depth[1] == 16, "跳深没有按批次重置"
     assert dst.n_prompt_clipped == 8, \
@@ -3419,6 +3441,7 @@ def test_absorb_counters_keeps_batch_and_cumulative_semantics_apart():
     dst.absorb_counters([])
     assert dst.n_gate_unlocked == 0 and not dst.n_hop_depth
     assert dst.n_credit_split_failed == 0
+    assert not dst.n_credit_split_failures
     assert dst.n_logprob_mismatch == 0
     assert dst.n_prompt_clipped == 8
 

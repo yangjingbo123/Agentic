@@ -75,11 +75,12 @@ class AgenticExecutor:
         self.n_prompt_clipped = 0
         self.n_gate_unlocked = 0    # 本批次闸门解锁次数（健康指标：应随训练下降）
         self.n_self_target = 0      # proposer 自指 target（被归一为 none）的次数
-        # Proposer primary 的文本块边界无法与 vLLM 原始 token_ids 精确对齐的次数。
-        # 这类结构化 turn 整体 fail-closed 跳过 PG（仍可在其它统计中出现），因此
-        # 必须可见；否则 tokenizer 一旦整体不匹配，双通道会静默停止训练。
+        # Proposer primary 无法获得 interaction credit 的次数。格式缺失时仍尽量
+        # 保留 solution span；只有两个功能区间都无法证明时才会整 turn 跳过 PG。
         self.n_credit_split_failed = 0
-        self.n_credit_split_failures = Counter()  # 失败原因分布（定位格式 vs tokenizer）
+        self.n_credit_split_failures = Counter()  # interaction credit 缺失/映射失败原因
+        self.n_credit_boundary_tokens = 0  # 跨 solution/interaction 的 token，仅保留 KL
+        self.n_credit_decode_fallback = 0  # 用原始 IDs 累计 decode 完成边界定位的 turn
         # vLLM 返回的 response_ids / log_probs 长度不一致。扁平数组仍需补位保持后续
         # turn 对齐，但该 turn 必须标成无效并在 PPO 前整条跳过，不能把补的 0 当真值。
         self.n_logprob_mismatch = 0
@@ -107,8 +108,10 @@ class AgenticExecutor:
             eps_force = 0.0
         self.n_gate_unlocked = 0    # 每批次重置；train.py 读到的就是本步值
         self.n_self_target = 0      # 同上
-        self.n_credit_split_failed = 0  # 同上（双通道 token 边界）
+        self.n_credit_split_failed = 0  # 同上（interaction span 不可用）
         self.n_credit_split_failures.clear()
+        self.n_credit_boundary_tokens = 0
+        self.n_credit_decode_fallback = 0
         self.n_logprob_mismatch = 0     # 同上（response/logprob 对齐）
         self.n_hop_depth.clear()    # 同上（跳深分布）
 
@@ -155,73 +158,146 @@ class AgenticExecutor:
                     + "\n…（中段已省略）…\n"
                     + self.tokenizer.decode(ids[-(budget - head):]))
 
-        def interaction_token_span(text, token_ids):
-            """把末尾 interaction 字符边界映射到原始 vLLM IDs。
+        def token_credit_spans(text, token_ids):
+            """将功能字符区间映射到 vLLM 原始 token IDs。
 
-            返回 ``((start, end), None)`` 或 ``(None, reason)``。失败原因必须保留，
-            否则 ``splitF`` 升高时无法区分模型格式续写和 tokenizer round-trip 问题。
+            返回 ``(spans, split_error, gap_tokens, method)``。``spans`` 可只有
+            solution；字符边界穿过 BPE token 时，只把跨界 token 留给 KL，而不是
+            丢弃整个 turn。重新编码与采样 IDs 不一致时，回退到原始 IDs 累计 decode。
             """
-            span = trailing_interaction_span(text)
-            if span is None:
-                close_tag = "</interaction>"
-                close_start = text.rfind(close_tag)
-                if close_start < 0:
-                    return None, "no_close_tag"
-                close_end = close_start + len(close_tag)
-                if text[close_end:].strip():
-                    return None, "text_after_block"
-                open_tag = "<interaction>"
-                open_start = text.rfind(open_tag, 0, close_start)
-                if open_start < 0:
-                    return None, "no_open_tag"
-                return None, "malformed_tail_block"
-
-            char_start, _ = span
             ids = list(token_ids)
+            special = set(getattr(self.tokenizer, "all_special_ids", []) or [])
+            visible_end = len(ids)
+            while visible_end > 0 and ids[visible_end - 1] in special:
+                visible_end -= 1
+            visible_ids = ids[:visible_end]
 
-            def visible_match(full_ids):
-                full_ids = list(full_ids)
-                if ids[:len(full_ids)] != full_ids:
-                    return False, "visible_id_mismatch"
-                extras = ids[len(full_ids):]
-                special = set(getattr(self.tokenizer, "all_special_ids", []) or [])
-                if not all(tok in special for tok in extras):
-                    return False, "extra_non_special"
-                return True, None
+            strict = trailing_interaction_span(text)
+            if strict is not None:
+                boundary_char = strict[0]
+                interaction_available = True
+                format_error = None
+            else:
+                interaction_available = False
+                close_tag = "</interaction>"
+                open_tag = "<interaction>"
+                close_start = text.rfind(close_tag)
+                open_limit = close_start if close_start >= 0 else len(text)
+                open_start = text.rfind(open_tag, 0, open_limit)
+                if close_start < 0:
+                    format_error = "no_close_tag"
+                elif text[close_start + len(close_tag):].strip():
+                    format_error = "text_after_block"
+                elif open_start < 0:
+                    format_error = "no_open_tag"
+                else:
+                    format_error = "malformed_tail_block"
 
-            try:
-                encoded = self.tokenizer(
-                    text, add_special_tokens=False, return_offsets_mapping=True)
-                full_ids = encoded["input_ids"]
-                offsets = encoded["offset_mapping"]
-                if full_ids and isinstance(full_ids[0], list):
-                    full_ids, offsets = full_ids[0], offsets[0]
-                matched, _ = visible_match(full_ids)
-                if matched and len(offsets) == len(full_ids):
-                    for idx, (lo, hi) in enumerate(offsets):
-                        if lo == char_start:
-                            return (idx, len(full_ids)), None
-                        if lo < char_start < hi:
-                            return None, "boundary_inside_token"
-            except (TypeError, KeyError, NotImplementedError, AttributeError):
-                pass
+                # 即使 interaction 格式坏了，块前的解题内容仍可安全训练。完全没有
+                # interaction 标签时，整段可见文本都属于 solution。
+                if open_start >= 0:
+                    boundary_char = open_start
+                elif close_start >= 0:
+                    boundary_char = close_start
+                else:
+                    boundary_char = len(text)
+                while boundary_char > 0 and text[boundary_char - 1].isspace():
+                    boundary_char -= 1
 
-            try:
-                full_ids = list(self.tokenizer.encode(
-                    text, add_special_tokens=False))
-                prefix_ids = list(self.tokenizer.encode(
-                    text[:char_start], add_special_tokens=False))
-            except (TypeError, AttributeError):
-                return None, "tokenizer_error"
+            def _encode(value):
+                return list(self.tokenizer.encode(value, add_special_tokens=False))
 
-            matched, reason = visible_match(full_ids)
-            if not matched:
-                return None, reason
-            if len(prefix_ids) >= len(full_ids):
-                return None, "empty_interaction_span"
-            if full_ids[:len(prefix_ids)] != prefix_ids:
-                return None, "prefix_not_stable"
-            return (len(prefix_ids), len(full_ids)), None
+            def _decode(value):
+                try:
+                    return self.tokenizer.decode(
+                        value, skip_special_tokens=False,
+                        clean_up_tokenization_spaces=False)
+                except TypeError:
+                    return self.tokenizer.decode(value)
+
+            def map_boundary(char_pos, suffix_text=None):
+                """返回 ``(solution_end, interaction_start, gap, method, error)``。"""
+                if char_pos <= 0:
+                    return 0, 0, 0, "edge", None
+                if char_pos >= len(text):
+                    return visible_end, visible_end, 0, "edge", None
+
+                # 快路径：canonical encode 与原始采样 IDs 一致时使用 offset mapping。
+                try:
+                    encoded = self.tokenizer(
+                        text, add_special_tokens=False, return_offsets_mapping=True)
+                    full_ids = encoded["input_ids"]
+                    offsets = encoded["offset_mapping"]
+                    if full_ids and isinstance(full_ids[0], list):
+                        full_ids, offsets = full_ids[0], offsets[0]
+                    full_ids = list(full_ids)
+                    if full_ids == visible_ids and len(offsets) == len(full_ids):
+                        for idx, (lo, hi) in enumerate(offsets):
+                            if lo == char_pos:
+                                return idx, idx, 0, "offset", None
+                            if lo < char_pos < hi:
+                                return idx, idx + 1, 1, "offset_gap", None
+                except (TypeError, KeyError, NotImplementedError, AttributeError):
+                    pass
+
+                # 中速路径：正文前段可能是非 canonical segmentation，但末尾 block
+                # 仍常与原始 IDs 的后缀逐位一致。
+                if suffix_text:
+                    try:
+                        suffix_ids = _encode(suffix_text)
+                    except (TypeError, AttributeError):
+                        suffix_ids = []
+                    if (suffix_ids and len(suffix_ids) <= visible_end
+                            and visible_ids[-len(suffix_ids):] == suffix_ids):
+                        idx = visible_end - len(suffix_ids)
+                        return idx, idx, 0, "suffix", None
+
+                # 稳健回退：以原始采样 IDs 为真相源，累计 decode 找字符边界。
+                try:
+                    full_text = _decode(visible_ids)
+                except (TypeError, AttributeError, ValueError):
+                    return None, None, 0, None, "tokenizer_error"
+                if full_text != text:
+                    return None, None, 0, None, "decode_text_mismatch"
+
+                last_good_k, last_good_text = 0, ""
+                for k in range(1, visible_end + 1):
+                    try:
+                        prefix = _decode(visible_ids[:k])
+                    except (TypeError, AttributeError, ValueError):
+                        continue
+                    if not text.startswith(prefix):
+                        continue
+                    if len(prefix) == char_pos:
+                        return k, k, 0, "decode", None
+                    if len(last_good_text) < char_pos < len(prefix):
+                        # 一个或多个 byte/BPE token 才共同形成完整字符；全部作为 gap。
+                        return (last_good_k, k, k - last_good_k,
+                                "decode_gap", None)
+                    if len(prefix) < char_pos:
+                        last_good_k, last_good_text = k, prefix
+                return None, None, 0, None, "decode_boundary_missing"
+
+            # 没有任何 interaction 标签时，无需做字符边界搜索：所有可见 token
+            # 都可安全接收 solution credit。
+            if not interaction_available and boundary_char >= len(text):
+                spans = {"solution": (0, visible_end)} if visible_end else {}
+                return spans, format_error, 0, "solution_only"
+
+            suffix = text[boundary_char:] if interaction_available else None
+            sol_end, int_start, gap, method, map_error = map_boundary(
+                boundary_char, suffix_text=suffix)
+            if map_error is not None:
+                return {}, map_error, 0, None
+
+            spans = {}
+            if sol_end and sol_end > 0:
+                spans["solution"] = (0, sol_end)
+            if interaction_available and int_start is not None and int_start < visible_end:
+                spans["interaction"] = (int_start, visible_end)
+            split_error = (None if "interaction" in spans
+                           else (format_error or "empty_interaction_span"))
+            return spans, split_error, gap, method
 
         def record(i, role, system, user, result, tid, *, prompt_text=None,
                    split_credit=False):
@@ -250,12 +326,19 @@ class AgenticExecutor:
                 "logprob_aligned": logprob_aligned,
             }
             if split_credit:
-                span, split_error = interaction_token_span(text, token_ids)
-                message["interaction_span"] = span
-                if span is None:
+                spans, split_error, gap_tokens, method = token_credit_spans(text, token_ids)
+                message["credit_spans"] = spans
+                # 旧字段保留，便于旧诊断与外部工具读取。
+                message["interaction_span"] = spans.get("interaction")
+                if gap_tokens:
+                    message["credit_boundary_gap_tokens"] = gap_tokens
+                    self.n_credit_boundary_tokens += gap_tokens
+                if method and method.startswith("decode"):
+                    self.n_credit_decode_fallback += 1
+                if split_error is not None:
                     message["interaction_span_error"] = split_error
                     self.n_credit_split_failed += 1
-                    self.n_credit_split_failures[split_error or "unknown"] += 1
+                    self.n_credit_split_failures[split_error] += 1
             all_messages[i].append(message)
             return text
 
@@ -700,6 +783,7 @@ class AgenticExecutor:
         **两类计数器语义不同，聚合方式必须不同——这是本方法最容易写错的地方：**
         - 批次级（`run_episodes_batch` 开头会重置）：`n_gate_unlocked`、
           `n_self_target`、`n_credit_split_failed`、`n_credit_split_failures`、
+          `n_credit_boundary_tokens`、`n_credit_decode_fallback`、
           `n_logprob_mismatch`、`n_hop_depth` → **赋值**为各分片之和。
         - 累计级（只在 `__init__` 归零、跨步累加）：`n_prompt_clipped` → **累加**。
 
@@ -716,6 +800,10 @@ class AgenticExecutor:
         for o in others:
             self.n_credit_split_failures.update(
                 getattr(o, "n_credit_split_failures", None) or {})
+        self.n_credit_boundary_tokens = sum(
+            getattr(o, "n_credit_boundary_tokens", 0) for o in others)
+        self.n_credit_decode_fallback = sum(
+            getattr(o, "n_credit_decode_fallback", 0) for o in others)
         self.n_logprob_mismatch = sum(
             getattr(o, "n_logprob_mismatch", 0) for o in others)
         self.n_prompt_clipped += sum(

@@ -34,29 +34,54 @@ def _mean_std(values: list) -> tuple:
 def token_credit_components(advantage_spec, interaction_span, original_positions):
     """返回 ``[(name, advantage, local_token_indices)]``（纯 Python，可 CPU 单测）。
 
-    旧 scalar advantage 仍广播整段。新 proposer primary 的 solution 只覆盖块前
-    token，interaction 只覆盖严格的 ``[start,end)`` 块区间；end 后可能存在的
-    EOS/special token 不收 PG credit（仍可收 KL）。结构化 spec 没有可证明边界时
-    返回空列表，fail-closed 跳过该 turn，避免猜测性路由。
+    新格式传入显式 ``credit_spans`` 字典：
+    ``{"solution": (s0,s1), "interaction": (i0,i1)}``。两段可以不相邻，
+    中间的跨界 token 因而能只接受 KL、不接受任何 PG。interaction 缺失时仍可
+    保留 solution credit。旧的 ``(interaction_start, end)`` 元组继续兼容。
     """
     positions = list(original_positions)
     if not isinstance(advantage_spec, dict):
         return [("default", float(advantage_spec), list(range(len(positions))))]
-    if (not isinstance(interaction_span, (tuple, list))
-            or len(interaction_span) != 2):
-        return []
-    start, end = interaction_span
-    if (not (isinstance(start, int) and isinstance(end, int) and 0 < start < end)
-            or end > len(positions)):
-        return []
-    solution_idx = [i for i, pos in enumerate(positions) if pos < start]
-    interaction_idx = [i for i, pos in enumerate(positions) if start <= pos < end]
+
+    if isinstance(interaction_span, dict):
+        spans = interaction_span
+    elif isinstance(interaction_span, (tuple, list)) and len(interaction_span) == 2:
+        # 旧 rollout：solution 由 interaction 起点隐式推导。旧格式只有一个边界，
+        # 任一端非法时无法安全降级，保持整 turn fail-closed。
+        start, end = interaction_span
+        if (not isinstance(start, int) or not isinstance(end, int)
+                or not (0 < start < end <= len(positions))):
+            return []
+        spans = {"solution": (0, start), "interaction": (start, end)}
+    else:
+        spans = {}
+
+    valid = {}
+    for name in ("solution", "interaction"):
+        span = spans.get(name)
+        if not isinstance(span, (tuple, list)) or len(span) != 2:
+            continue
+        start, end = span
+        if (not isinstance(start, int) or not isinstance(end, int)
+                or not (0 <= start < end <= len(positions))):
+            continue
+        valid[name] = (start, end)
+
+    # 两个功能区间不得重叠；重叠意味着 credit mapper 自身出错，整 turn fail-closed。
+    if "solution" in valid and "interaction" in valid:
+        s0, s1 = valid["solution"]
+        i0, i1 = valid["interaction"]
+        if max(s0, i0) < min(s1, i1):
+            return []
+
     components = []
-    if "solution" in advantage_spec and solution_idx:
-        components.append(("solution", float(advantage_spec["solution"]), solution_idx))
-    if "interaction" in advantage_spec and interaction_idx:
-        components.append(("interaction", float(advantage_spec["interaction"]),
-                           interaction_idx))
+    for name in ("solution", "interaction"):
+        if name not in advantage_spec or name not in valid:
+            continue
+        start, end = valid[name]
+        local = [i for i, pos in enumerate(positions) if start <= pos < end]
+        if local:
+            components.append((name, float(advantage_spec[name]), local))
     return components
 
 

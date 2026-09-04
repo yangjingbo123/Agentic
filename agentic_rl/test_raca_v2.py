@@ -128,11 +128,25 @@ def test_token_credit_components_route_channels_without_overlap():
     assert len(set(covered)) == len(covered), "两个通道 token 不能重叠"
     assert 5 not in covered, "文本外 EOS/special token 不应收到任一 PG credit"
 
+    # 新显式双 span 可以在中间留下 gap；位置 3 是跨界 token，只接受 KL。
+    gapped = token_credit_components(
+        spec, {"solution": (0, 3), "interaction": (4, 6)}, range(7))
+    assert gapped == [
+        ("solution", 1.5, [0, 1, 2]),
+        ("interaction", -0.25, [4, 5]),
+    ]
+    assert 3 not in [i for _, _, ids in gapped for i in ids]
+
+    # interaction 缺失时仍保留 solution，不再因格式问题丢掉整条解题信号。
+    solution_only = token_credit_components(
+        spec, {"solution": (0, 5)}, range(7))
+    assert solution_only == [("solution", 1.5, [0, 1, 2, 3, 4])]
+
     # forced：只有 solution，interaction block 与尾部 EOS 都没有 PG credit（仍有 KL）。
     forced = token_credit_components({"solution": -1.0}, (4, 6), range(7))
     assert forced == [("solution", -1.0, [0, 1, 2, 3])]
 
-    # 无精确/越界边界：结构化 credit 整 turn fail-closed；不能猜测性广播。
+    # 旧格式无精确/越界边界时仍整 turn fail-closed；新显式 spans 才能安全降级。
     assert token_credit_components(spec, None, range(7)) == []
     assert token_credit_components(spec, (4, 99), range(7)) == [], \
         "span.end 超出原始 response_ids 仍被接受"
@@ -1046,8 +1060,8 @@ def test_executor_records_exact_interaction_token_boundary():
     """primary proposer 的 interaction_start 必须直接索引原始 response_ids。
 
     用字符充当 token，使预期边界可以逐位验证；这条同时守住三件事：response 文本
-    与 IDs 不被重写、只有 primary proposer 带 credit split、无法切分时 fail-closed
-    并留下计数。真实 tokenizer 走 offset_mapping / exact re-encode 的同一协议。
+    与 IDs 不被重写、只有 primary proposer 带 credit spans、interaction 缺失时
+    保留 solution 并留下计数。真实 tokenizer 还会走原始 IDs 累计 decode 回退。
     """
     class CharEngine(FakeEngine):
         def generate_batch(self, requests):
@@ -1115,7 +1129,7 @@ def test_executor_records_exact_interaction_token_boundary():
     assert eos_msg["interaction_span"][1] == len(response)
     assert len(eos_msg["response_ids"]) == len(response) + 1
 
-    # 无完整末尾块：不能猜边界，必须 fail-closed 并计数。
+    # 无完整末尾块：interaction 缺席并计数，但 solution 仍继续训练。
     bad_script = {
         "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>",
                        "<meta-plan>\ndecision: stop\nreason: r\n</meta-plan>"],
@@ -1127,8 +1141,16 @@ def test_executor_records_exact_interaction_token_boundary():
     bad_primary = [m for m in bad["messages"] if m["role_name"] == "proposer"][0]
     assert bad_primary["interaction_span"] is None
     assert bad_primary["interaction_span_error"] == "no_close_tag"
+    assert bad_primary["credit_spans"] == {
+        "solution": (0, len(bad_primary["response_ids"]))}, \
+        "缺 interaction 标签时 solution credit 没有保留"
     assert bad_ex.n_credit_split_failed == 1
     assert bad_ex.n_credit_split_failures == {"no_close_tag": 1}
+    from training.raca_adv import token_credit_components
+    parts = token_credit_components(
+        {"solution": 1.0, "interaction": -1.0},
+        bad_primary["credit_spans"], range(len(bad_primary["response_ids"])))
+    assert [name for name, _, _ in parts] == ["solution"]
 
     # logprob 少于 token_ids 时，扁平数组仍补位以免后续 turn 错位，但 message 必须
     # 标成无效，训练器会整 turn 跳过；不能把补出的 0.0 当成真实 old logprob。
@@ -1157,6 +1179,120 @@ def test_executor_records_exact_interaction_token_boundary():
     assert mm_ex.n_logprob_mismatch == 1
     assert len(mm["log_probs"]) == len(mm["turn_ids"]), \
         "即使 turn 无效，扁平占位也必须保持后续 turn 的全局索引对齐"
+
+
+def test_cross_boundary_token_is_excluded_instead_of_dropping_turn():
+    """边界穿过一个 BPE token 时，双通道保留、只排除该 token。"""
+    block = INTER.format(a="none", t="none").strip()
+    response = "推理过程：1+1=2\n最终答案：2\n" + block
+    from agents.parsing import trailing_interaction_span
+    char_start, _ = trailing_interaction_span(response)
+    response_ids = [101, 102, 103]
+
+    class CrossingTokenizer(FakeTokenizer):
+        all_special_ids = []
+
+        def __call__(self, text, add_special_tokens=False,
+                     return_offsets_mapping=False):
+            assert text == response and return_offsets_mapping
+            return {
+                "input_ids": response_ids,
+                "offset_mapping": [
+                    (0, char_start - 1),
+                    (char_start - 1, char_start + 1),
+                    (char_start + 1, len(text)),
+                ],
+            }
+
+    class CrossingEngine(FakeEngine):
+        def generate_batch(self, requests):
+            out = []
+            for req in requests:
+                self.calls.append(req["role"])
+                self.prompts.append((req["role"], req["prompt"]))
+                self.temps.append(req.get("temperature"))
+                text = self.script[req["role"]].pop(0)
+                ids = response_ids if req["role"] == "proposer" else list(text)
+                out.append((text, [-0.5] * len(ids), ids))
+            return out
+
+    script = {
+        "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>"],
+        "proposer": [response], "critic": [], "verifier": [],
+    }
+    ex = _mk_executor(
+        CrossingEngine(script), tokenizer=CrossingTokenizer(),
+        stop_gate=False, max_rounds=1, max_hops=0)
+    ep = ex.run_episodes_batch(["1+1=?"], ["2"])[0]
+    msg = next(m for m in ep["messages"] if m["role_name"] == "proposer")
+    assert msg["credit_spans"] == {
+        "solution": (0, 1), "interaction": (2, 3)}
+    assert msg["credit_boundary_gap_tokens"] == 1
+    assert ex.n_credit_boundary_tokens == 1
+    assert ex.n_credit_split_failed == 0
+
+
+def test_original_token_decode_recovers_noncanonical_segmentation():
+    """重新 encode 的 IDs 不同时，原始采样 IDs 的累计 decode 仍能定位边界。"""
+    block = INTER.format(a="none", t="none").strip()
+    response = "推理过程：x\n最终答案：2\n" + block
+    from agents.parsing import trailing_interaction_span
+    char_start, _ = trailing_interaction_span(response)
+    original_ids = [201, 202, 203]
+
+    class NonCanonicalTokenizer(FakeTokenizer):
+        all_special_ids = []
+
+        def __call__(self, text, add_special_tokens=False,
+                     return_offsets_mapping=False):
+            assert text == response and return_offsets_mapping
+            return {
+                "input_ids": [1, 2, 3],
+                "offset_mapping": [(0, 1), (1, 2), (2, len(text))],
+            }
+
+        def encode(self, text, add_special_tokens=False):
+            if text == response or text == response[char_start:]:
+                return [1, 2, 3, 4]  # 故意无法匹配原始 IDs 或其后缀
+            return list(text)
+
+        def decode(self, ids, **kwargs):
+            table = {
+                (): "",
+                (201,): response[:char_start],
+                (201, 202): response[:char_start] + "<interaction>",
+                (201, 202, 203): response,
+            }
+            key = tuple(ids)
+            if key in table:
+                return table[key]
+            return "".join(str(x) for x in ids)
+
+    class NonCanonicalEngine(FakeEngine):
+        def generate_batch(self, requests):
+            out = []
+            for req in requests:
+                self.calls.append(req["role"])
+                self.prompts.append((req["role"], req["prompt"]))
+                self.temps.append(req.get("temperature"))
+                text = self.script[req["role"]].pop(0)
+                ids = original_ids if req["role"] == "proposer" else list(text)
+                out.append((text, [-0.5] * len(ids), ids))
+            return out
+
+    script = {
+        "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>"],
+        "proposer": [response], "critic": [], "verifier": [],
+    }
+    ex = _mk_executor(
+        NonCanonicalEngine(script), tokenizer=NonCanonicalTokenizer(),
+        stop_gate=False, max_rounds=1, max_hops=0)
+    ep = ex.run_episodes_batch(["1+1=?"], ["2"])[0]
+    msg = next(m for m in ep["messages"] if m["role_name"] == "proposer")
+    assert msg["credit_spans"] == {
+        "solution": (0, 1), "interaction": (1, 3)}
+    assert ex.n_credit_decode_fallback == 1
+    assert ex.n_credit_split_failed == 0
 
 
 def test_rollout_preserves_the_exact_prompt_used_for_sampling():
@@ -3387,11 +3523,14 @@ def test_absorb_counters_keeps_batch_and_cumulative_semantics_apart():
     from agents.agentic_executor import AgenticExecutor
 
     class _Fake:
-        def __init__(self, gate, self_t, split_f, split_why, lp_f, clip, hops):
+        def __init__(self, gate, self_t, split_f, split_why, gap, decode_f,
+                     lp_f, clip, hops):
             self.n_gate_unlocked = gate
             self.n_self_target = self_t
             self.n_credit_split_failed = split_f
             self.n_credit_split_failures = Counter(split_why)
+            self.n_credit_boundary_tokens = gap
+            self.n_credit_decode_fallback = decode_f
             self.n_logprob_mismatch = lp_f
             self.n_prompt_clipped = clip
             self.n_hop_depth = Counter(hops)
@@ -3401,15 +3540,17 @@ def test_absorb_counters_keeps_batch_and_cumulative_semantics_apart():
     dst.n_self_target = 0
     dst.n_credit_split_failed = 0
     dst.n_credit_split_failures = Counter()
+    dst.n_credit_boundary_tokens = 0
+    dst.n_credit_decode_fallback = 0
     dst.n_logprob_mismatch = 0
     dst.n_prompt_clipped = 0
     dst.n_hop_depth = Counter()
 
     shards = [
-        _Fake(2, 1, 2, {"text_after_block": 2}, 3, 3,
+        _Fake(2, 1, 2, {"text_after_block": 2}, 4, 3, 3, 3,
               {1: 10, 2: 4, "1:critic": 7}),
         _Fake(5, 0, 4, {"text_after_block": 1, "visible_id_mismatch": 3},
-              5, 1, {1: 6, 3: 2, "3:verifier": 2}),
+              6, 2, 5, 1, {1: 6, 3: 2, "3:verifier": 2}),
     ]
 
     dst.absorb_counters(shards)
@@ -3418,6 +3559,8 @@ def test_absorb_counters_keeps_batch_and_cumulative_semantics_apart():
     assert dst.n_credit_split_failures == {
         "text_after_block": 3, "visible_id_mismatch": 3}, \
         "credit split 原因分布没有跨分片合并"
+    assert dst.n_credit_boundary_tokens == 10
+    assert dst.n_credit_decode_fallback == 5
     assert dst.n_logprob_mismatch == 8, "logprob mismatch 没有跨分片求和"
     assert dst.n_prompt_clipped == 4, "累计级应累加"
     assert dst.n_hop_depth[1] == 16 and dst.n_hop_depth[2] == 4
@@ -3432,6 +3575,8 @@ def test_absorb_counters_keeps_batch_and_cumulative_semantics_apart():
     assert dst.n_credit_split_failed == 6, "split failure 被错误地跨批次累加了"
     assert dst.n_credit_split_failures["text_after_block"] == 3
     assert dst.n_credit_split_failures["visible_id_mismatch"] == 3
+    assert dst.n_credit_boundary_tokens == 10
+    assert dst.n_credit_decode_fallback == 5
     assert dst.n_logprob_mismatch == 8, "logprob mismatch 被错误地跨批次累加了"
     assert dst.n_hop_depth[1] == 16, "跳深没有按批次重置"
     assert dst.n_prompt_clipped == 8, \
@@ -3442,6 +3587,8 @@ def test_absorb_counters_keeps_batch_and_cumulative_semantics_apart():
     assert dst.n_gate_unlocked == 0 and not dst.n_hop_depth
     assert dst.n_credit_split_failed == 0
     assert not dst.n_credit_split_failures
+    assert dst.n_credit_boundary_tokens == 0
+    assert dst.n_credit_decode_fallback == 0
     assert dst.n_logprob_mismatch == 0
     assert dst.n_prompt_clipped == 8
 

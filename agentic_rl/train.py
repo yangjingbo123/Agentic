@@ -406,14 +406,16 @@ def main(cfg: DictConfig):
             raise
 
         _g_kept, _g_total = stats.get("groups_kept", 0), stats.get("groups_total", 0)
-        # 先读 fail-closed 诊断，再判断 skipped；否则所有 primary 因 token 边界或
-        # logprob 错位被跳过时，只会看到泛化的「无有效组」，真正原因反而不打印。
+        # 先读 credit/logprob 诊断，再判断 skipped。splitF 现在表示 interaction
+        # channel 缺失；格式坏时 solution 仍可能保留。gapT 是只收 KL 的跨界 token。
         _n_split = getattr(trainer.executor, "n_credit_split_failed", 0)
         _split_reasons = getattr(
             trainer.executor, "n_credit_split_failures", None) or {}
         _split_reason_s = ",".join(
             f"{name}:{count}" for name, count in
             sorted(_split_reasons.items(), key=lambda kv: (-kv[1], kv[0])))
+        _n_boundary_gap = getattr(trainer.executor, "n_credit_boundary_tokens", 0)
+        _n_decode_fb = getattr(trainer.executor, "n_credit_decode_fallback", 0)
         _n_lp_bad = getattr(trainer.executor, "n_logprob_mismatch", 0)
         # 绝对计数会随 batch 大小、平均轮数变化，补充稳定的比例口径。
         _all_msgs = [msg for ep in all_eps if ep is not None
@@ -495,6 +497,8 @@ def main(cfg: DictConfig):
             + (f" splitF={_n_split}/{_n_split_total}({_split_rate:.2%})"
                + (f"[{_split_reason_s}]" if _split_reason_s else "")
                if _n_split else "")
+            + (f" gapT={_n_boundary_gap}" if _n_boundary_gap else "")
+            + (f" decF={_n_decode_fb}" if _n_decode_fb else "")
             + (f" lpF={_n_lp_bad}/{_n_lp_total}({_lp_bad_rate:.2%})"
                if _n_lp_bad else "")
             + (f" hop={_hop_s}" if _hop_s else ""),
@@ -537,6 +541,8 @@ def main(cfg: DictConfig):
         log_data["credit_split_failure_rate"] = _split_rate
         for _reason, _count in _split_reasons.items():
             log_data[f"credit_split_reason/{_reason}"] = int(_count)
+        log_data["credit_boundary_gap_tokens"] = _n_boundary_gap
+        log_data["credit_decode_fallback"] = _n_decode_fb
         log_data["logprob_mismatch"] = _n_lp_bad
         log_data["logprob_checked"] = _n_lp_total
         log_data["logprob_mismatch_rate"] = _lp_bad_rate

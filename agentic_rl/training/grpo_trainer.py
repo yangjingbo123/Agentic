@@ -61,9 +61,9 @@ class GRPOAgenticTrainer:
                     or any(tok < 0 or tok >= vocab_size for tok in ids)):
                 continue
             if isinstance(spec, dict):
-                span = msg.get("interaction_span")
-                if (not isinstance(span, (tuple, list)) or len(span) != 2
-                        or not (0 < span[0] < span[1] <= len(ids))):
+                span_spec = msg.get("credit_spans", msg.get("interaction_span"))
+                components = token_credit_components(spec, span_spec, range(len(ids)))
+                if not components:
                     continue
             total += 1
         return total
@@ -298,8 +298,9 @@ class GRPOAgenticTrainer:
             valid_positions = list(range(len(raw_ids)))
             n_resp = len(resp_ids)
             n_align = n_resp
+            span_spec = msg.get("credit_spans", msg.get("interaction_span"))
             components = token_credit_components(
-                advantage_spec, msg.get("interaction_span"), valid_positions)
+                advantage_spec, span_spec, valid_positions)
             if not components:
                 continue
 

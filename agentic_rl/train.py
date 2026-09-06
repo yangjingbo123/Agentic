@@ -416,6 +416,20 @@ def main(cfg: DictConfig):
             sorted(_split_reasons.items(), key=lambda kv: (-kv[1], kv[0])))
         _n_boundary_gap = getattr(trainer.executor, "n_credit_boundary_tokens", 0)
         _n_decode_fb = getattr(trainer.executor, "n_credit_decode_fallback", 0)
+        _fmt = getattr(trainer.executor, "n_primary_format", None) or {}
+        _fmt_total = sum(v for k, v in _fmt.items() if k.startswith("status/"))
+        _fmt_ok = int(_fmt.get("status/complete", 0))
+        _fmt_rate = _fmt_ok / max(_fmt_total, 1)
+        _fmt_bad = _fmt_total - _fmt_ok
+        _fmt_s = (
+            f"{_fmt_ok}/{_fmt_total}({_fmt_rate:.1%})"
+            f" badC/W={_fmt.get('bad/correct', 0)}/{_fmt.get('bad/wrong', 0)}"
+            f" F/S={_fmt.get('bad/forced', 0)}/{_fmt.get('bad/spontaneous', 0)}"
+            f" endL/S/U={_fmt.get('bad/finish_length', 0)}/"
+            f"{_fmt.get('bad/finish_stop', 0)}/"
+            f"{_fmt.get('bad/finish_unknown', 0)}"
+            f" max={_fmt.get('bad/max_tokens', 0)}"
+        )
         _n_lp_bad = getattr(trainer.executor, "n_logprob_mismatch", 0)
         # 绝对计数会随 batch 大小、平均轮数变化，补充稳定的比例口径。
         _all_msgs = [msg for ep in all_eps if ep is not None
@@ -499,6 +513,7 @@ def main(cfg: DictConfig):
                if _n_split else "")
             + (f" gapT={_n_boundary_gap}" if _n_boundary_gap else "")
             + (f" decF={_n_decode_fb}" if _n_decode_fb else "")
+            + (f" fmt={_fmt_s}" if _fmt_bad else "")
             + (f" lpF={_n_lp_bad}/{_n_lp_total}({_lp_bad_rate:.2%})"
                if _n_lp_bad else "")
             + (f" hop={_hop_s}" if _hop_s else ""),
@@ -543,6 +558,11 @@ def main(cfg: DictConfig):
             log_data[f"credit_split_reason/{_reason}"] = int(_count)
         log_data["credit_boundary_gap_tokens"] = _n_boundary_gap
         log_data["credit_decode_fallback"] = _n_decode_fb
+        log_data["primary_format_valid"] = _fmt_ok
+        log_data["primary_format_total"] = _fmt_total
+        log_data["primary_format_rate"] = _fmt_rate
+        for _fmt_key, _fmt_count in _fmt.items():
+            log_data[f"primary_format/{_fmt_key}"] = int(_fmt_count)
         log_data["logprob_mismatch"] = _n_lp_bad
         log_data["logprob_checked"] = _n_lp_total
         log_data["logprob_mismatch_rate"] = _lp_bad_rate

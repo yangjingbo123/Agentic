@@ -12,6 +12,36 @@ import time
 _ADAPTER_NAMES = ("proposer", "controller", "critic", "verifier")
 
 
+class GenerationResult:
+    """向后兼容的三元生成结果，并旁挂只读结束原因元数据。"""
+
+    def __init__(self, text, log_probs, token_ids, finish_reason=None, stop_reason=None):
+        self.text = text
+        self.log_probs = log_probs
+        self.token_ids = token_ids
+        self.finish_reason = finish_reason
+        self.stop_reason = stop_reason
+
+    def __iter__(self):
+        yield self.text
+        yield self.log_probs
+        yield self.token_ids
+
+    def __getitem__(self, index):
+        return (self.text, self.log_probs, self.token_ids)[index]
+
+    def __len__(self):
+        return 3
+
+
+def _generation_result(result):
+    return GenerationResult(
+        result["text"], result["log_probs"], result["token_ids"],
+        finish_reason=result.get("finish_reason"),
+        stop_reason=result.get("stop_reason"),
+    )
+
+
 class VLLMInferenceEngine:
     """Parent-side client for a vLLM worker pinned to a separate CUDA process."""
 
@@ -174,7 +204,7 @@ class VLLMInferenceEngine:
 
     def generate(self, role: str, prompt: str, temperature: float = 1.0) -> tuple[str, list[float], list[int]]:
         result = self._request("generate", role=role, prompt=prompt, temperature=temperature)
-        return result["text"], result["log_probs"], result["token_ids"]
+        return _generation_result(result)
 
     def generate_batch(self, requests: list[dict]) -> list[tuple[str, list[float], list[int]]]:
         """requests: list of {"role": str, "prompt": str, "temperature": float}.
@@ -182,7 +212,7 @@ class VLLMInferenceEngine:
         Pass temperature=0.0 for greedy eval decoding.
         Returns list in same order."""
         results = self._request("generate_batch", requests=requests)
-        return [(r["text"], r["log_probs"], r["token_ids"]) for r in results]
+        return [_generation_result(r) for r in results]
 
     def sync_lora(self, model):
         """Save adapters in the parent process, then hand the manifest to the worker."""

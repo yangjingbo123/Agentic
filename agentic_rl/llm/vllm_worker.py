@@ -156,7 +156,17 @@ class VLLMWorker:
                 log_probs.append(min(lp.logprob for lp in lp_dict.values()) - 1.0)
             else:
                 log_probs.append(0.0)
-        return {"text": out.text, "log_probs": log_probs, "token_ids": list(out.token_ids)}
+        finish_reason = getattr(out, "finish_reason", None)
+        stop_reason = getattr(out, "stop_reason", None)
+        if stop_reason is not None and not isinstance(stop_reason, (str, int, float, bool)):
+            stop_reason = str(stop_reason)
+        return {
+            "text": out.text,
+            "log_probs": log_probs,
+            "token_ids": list(out.token_ids),
+            "finish_reason": finish_reason,
+            "stop_reason": stop_reason,
+        }
 
     def generate(self, role: str, prompt: str, temperature: float = 1.0):
         # M1 后所有角色的结构化闭标签都位于实质输出末尾。保留闭标签本身，

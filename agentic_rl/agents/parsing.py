@@ -96,6 +96,26 @@ def trailing_interaction_span(text: str) -> tuple[int, int] | None:
     return start, len(text)
 
 
+def interaction_format_status(text: str) -> str:
+    """只读诊断：分类 worker 输出的 interaction 结构，不改变解析语义。"""
+    if trailing_interaction_span(text) is not None:
+        return "complete"
+
+    open_tag, close_tag = "<interaction>", "</interaction>"
+    open_start = text.rfind(open_tag)
+    close_start = text.rfind(close_tag)
+    if open_start < 0 and close_start < 0:
+        return "no_block"
+    if open_start >= 0 and (close_start < 0 or close_start < open_start):
+        return "open_without_close"
+    if open_start < 0:
+        return "close_without_open"
+    close_end = close_start + len(close_tag)
+    if text[close_end:].strip():
+        return "text_after_block"
+    return "malformed"
+
+
 def strip_interaction(text: str, *, trim: bool = True) -> str:
     """剥掉 `<interaction>` 块——**仅用于把一个角色的输出展示给另一个角色**。
 
@@ -353,4 +373,3 @@ def critic_found_errors(critic_output: str) -> bool:
         return bool(err_text) and "无错误" not in err_text and "无错" not in err_text
     # 无「错误分析」段（响应未按格式）——保守不判 flag
     return False
-

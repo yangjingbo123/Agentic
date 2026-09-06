@@ -20,6 +20,7 @@ from agents.parsing import (
     ROLE_NAMES,
     critic_found_errors,
     has_answer_label,
+    interaction_format_status,
     parse_decision,
     parse_interaction,
     parse_reasoning,
@@ -81,6 +82,9 @@ class AgenticExecutor:
         self.n_credit_split_failures = Counter()  # interaction credit 缺失/映射失败原因
         self.n_credit_boundary_tokens = 0  # 跨 solution/interaction 的 token，仅保留 KL
         self.n_credit_decode_fallback = 0  # 用原始 IDs 累计 decode 完成边界定位的 turn
+        # 纯诊断：primary proposer 的 interaction 格式、答案对错、forced 与结束原因。
+        # 不参与奖励、路由或优势计算。
+        self.n_primary_format = Counter()
         # vLLM 返回的 response_ids / log_probs 长度不一致。扁平数组仍需补位保持后续
         # turn 对齐，但该 turn 必须标成无效并在 PPO 前整条跳过，不能把补的 0 当真值。
         self.n_logprob_mismatch = 0
@@ -112,6 +116,7 @@ class AgenticExecutor:
         self.n_credit_split_failures.clear()
         self.n_credit_boundary_tokens = 0
         self.n_credit_decode_fallback = 0
+        self.n_primary_format.clear()
         self.n_logprob_mismatch = 0     # 同上（response/logprob 对齐）
         self.n_hop_depth.clear()    # 同上（跳深分布）
 
@@ -302,6 +307,8 @@ class AgenticExecutor:
         def record(i, role, system, user, result, tid, *, prompt_text=None,
                    split_credit=False):
             text, turn_lps, token_ids = result
+            finish_reason = getattr(result, "finish_reason", None)
+            stop_reason = getattr(result, "stop_reason", None)
             token_ids = list(token_ids)
             n_resp = len(token_ids)
             logprob_aligned = len(turn_lps) == n_resp
@@ -324,6 +331,8 @@ class AgenticExecutor:
                 "response":     text,
                 "response_ids": token_ids,
                 "logprob_aligned": logprob_aligned,
+                "finish_reason": finish_reason,
+                "stop_reason": stop_reason,
             }
             if split_credit:
                 spans, split_error, gap_tokens, method = token_credit_spans(text, token_ids)
@@ -536,6 +545,32 @@ class AgenticExecutor:
                         forced, action, target, reason = True, "request", tgt, ""
                 st["u"] = u
                 st["forced"] = forced
+                # 只读诊断：判断 no_close 到底来自无块、未闭合、长度截断还是 EOS。
+                fmt = interaction_format_status(out)
+                primary_msg = all_messages[i][-1]
+                finish = str(primary_msg.get("finish_reason") or "unknown").lower()
+                stop_reason = primary_msg.get("stop_reason")
+                p_now = math_equal(answer, correct_answers[i])
+                self.n_primary_format[f"status/{fmt}"] += 1
+                if fmt != "complete":
+                    self.n_primary_format[
+                        "bad/correct" if p_now else "bad/wrong"] += 1
+                    self.n_primary_format[
+                        "bad/forced" if forced else "bad/spontaneous"] += 1
+                    if len(primary_msg.get("response_ids", [])) >= self.max_tokens:
+                        self.n_primary_format["bad/max_tokens"] += 1
+                    if finish == "length":
+                        self.n_primary_format["bad/finish_length"] += 1
+                    elif finish == "stop":
+                        self.n_primary_format["bad/finish_stop"] += 1
+                        if stop_reason == "</interaction>":
+                            self.n_primary_format["bad/stop_interaction"] += 1
+                        elif isinstance(stop_reason, int):
+                            self.n_primary_format["bad/stop_token"] += 1
+                        else:
+                            self.n_primary_format["bad/stop_other"] += 1
+                    else:
+                        self.n_primary_format[f"bad/finish_{finish}"] += 1
                 # target 对 forced 轮也落盘（v2.3：q_spont/q_forced 拆分需要）
                 st["target"] = target if (u or forced) else None
                 if u or forced:
@@ -784,7 +819,7 @@ class AgenticExecutor:
         - 批次级（`run_episodes_batch` 开头会重置）：`n_gate_unlocked`、
           `n_self_target`、`n_credit_split_failed`、`n_credit_split_failures`、
           `n_credit_boundary_tokens`、`n_credit_decode_fallback`、
-          `n_logprob_mismatch`、`n_hop_depth` → **赋值**为各分片之和。
+          `n_primary_format`、`n_logprob_mismatch`、`n_hop_depth` → **赋值**为各分片之和。
         - 累计级（只在 `__init__` 归零、跨步累加）：`n_prompt_clipped` → **累加**。
 
         一律写 `+=` 会让批次级的数变成整轮累计（只增不减，被误读成"越来越糟"）；
@@ -804,6 +839,9 @@ class AgenticExecutor:
             getattr(o, "n_credit_boundary_tokens", 0) for o in others)
         self.n_credit_decode_fallback = sum(
             getattr(o, "n_credit_decode_fallback", 0) for o in others)
+        self.n_primary_format.clear()
+        for o in others:
+            self.n_primary_format.update(getattr(o, "n_primary_format", None) or {})
         self.n_logprob_mismatch = sum(
             getattr(o, "n_logprob_mismatch", 0) for o in others)
         self.n_prompt_clipped += sum(

@@ -69,6 +69,16 @@ def test_vllm_worker_stops_on_each_roles_terminal_structure():
         assert _stop_for_role(role) == ["</interaction>"], role
 
 
+def test_generation_result_keeps_three_tuple_compatibility_with_finish_metadata():
+    from llm.vllm_engine import GenerationResult
+
+    result = GenerationResult("x", [-0.1], [7], finish_reason="stop", stop_reason=151645)
+    text, lps, ids = result
+    assert (text, lps, ids) == ("x", [-0.1], [7])
+    assert result[0] == "x" and len(result) == 3
+    assert result.finish_reason == "stop" and result.stop_reason == 151645
+
+
 def test_trailing_interaction_span_only_accepts_a_complete_final_block():
     """credit split 只认**末尾完整块**，正文示例/残块/块后正文都不能切。
 
@@ -110,6 +120,18 @@ def test_trailing_interaction_span_only_accepts_a_complete_final_block():
     assert trailing_interaction_span("正文 " + block + " 后面继续解释") is None
     assert trailing_interaction_span("正文 <interaction>\naction:none") is None
     assert trailing_interaction_span("只有答案：4") is None
+
+
+def test_interaction_format_status_separates_failure_shapes():
+    from agents.parsing import interaction_format_status
+
+    block = "<interaction>\naction: none\ntarget: none\nreason: x\n</interaction>"
+    assert interaction_format_status("答案：4\n" + block) == "complete"
+    assert interaction_format_status("答案：4") == "no_block"
+    assert interaction_format_status(
+        "答案：4\n<interaction>\naction: none") == "open_without_close"
+    assert interaction_format_status("答案：4\n</interaction>") == "close_without_open"
+    assert interaction_format_status("答案：4\n" + block + "\n继续") == "text_after_block"
 
 
 def test_token_credit_components_route_channels_without_overlap():
@@ -1293,6 +1315,56 @@ def test_original_token_decode_recovers_noncanonical_segmentation():
         "solution": (0, 1), "interaction": (1, 3)}
     assert ex.n_credit_decode_fallback == 1
     assert ex.n_credit_split_failed == 0
+
+
+def test_primary_format_diagnostics_are_read_only_and_finish_aware():
+    """格式诊断拆分形态/对错/结束原因，但不改变 episode 执行。"""
+    from llm.vllm_engine import GenerationResult
+
+    no_block = "推理过程：1+1=2\n最终答案：2"
+    open_only = ("推理过程：1+1=5\n最终答案：5\n"
+                 "<interaction>\naction: none\ntarget: none")
+
+    class MetaEngine(FakeEngine):
+        def generate_batch(self, requests):
+            out = []
+            for req in requests:
+                self.calls.append(req["role"])
+                self.prompts.append((req["role"], req["prompt"]))
+                self.temps.append(req.get("temperature"))
+                item = self.script[req["role"]].pop(0)
+                if isinstance(item, str):
+                    item = GenerationResult(
+                        item, [-0.5] * len(item), list(item), finish_reason="stop")
+                out.append(item)
+            return out
+
+    script = {
+        "controller": [
+            "<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>",
+            "<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>",
+        ],
+        "proposer": [
+            GenerationResult(
+                no_block, [-0.5] * len(no_block), list(no_block),
+                finish_reason="stop", stop_reason=151645),
+            GenerationResult(
+                open_only, [-0.5] * len(open_only), list(open_only),
+                finish_reason="length"),
+        ],
+        "critic": [], "verifier": [],
+    }
+    ex = _mk_executor(MetaEngine(script), stop_gate=False, max_rounds=1, max_hops=0)
+    episodes = ex.run_episodes_batch(["1+1=?", "1+1=?"], ["2", "2"])
+    assert len(episodes) == 2
+    assert ex.n_primary_format["status/no_block"] == 1
+    assert ex.n_primary_format["status/open_without_close"] == 1
+    assert ex.n_primary_format["bad/correct"] == 1
+    assert ex.n_primary_format["bad/wrong"] == 1
+    assert ex.n_primary_format["bad/spontaneous"] == 2
+    assert ex.n_primary_format["bad/finish_stop"] == 1
+    assert ex.n_primary_format["bad/stop_token"] == 1
+    assert ex.n_primary_format["bad/finish_length"] == 1
 
 
 def test_rollout_preserves_the_exact_prompt_used_for_sampling():
@@ -3524,13 +3596,14 @@ def test_absorb_counters_keeps_batch_and_cumulative_semantics_apart():
 
     class _Fake:
         def __init__(self, gate, self_t, split_f, split_why, gap, decode_f,
-                     lp_f, clip, hops):
+                     fmt, lp_f, clip, hops):
             self.n_gate_unlocked = gate
             self.n_self_target = self_t
             self.n_credit_split_failed = split_f
             self.n_credit_split_failures = Counter(split_why)
             self.n_credit_boundary_tokens = gap
             self.n_credit_decode_fallback = decode_f
+            self.n_primary_format = Counter(fmt)
             self.n_logprob_mismatch = lp_f
             self.n_prompt_clipped = clip
             self.n_hop_depth = Counter(hops)
@@ -3542,15 +3615,20 @@ def test_absorb_counters_keeps_batch_and_cumulative_semantics_apart():
     dst.n_credit_split_failures = Counter()
     dst.n_credit_boundary_tokens = 0
     dst.n_credit_decode_fallback = 0
+    dst.n_primary_format = Counter()
     dst.n_logprob_mismatch = 0
     dst.n_prompt_clipped = 0
     dst.n_hop_depth = Counter()
 
     shards = [
-        _Fake(2, 1, 2, {"text_after_block": 2}, 4, 3, 3, 3,
+        _Fake(2, 1, 2, {"text_after_block": 2}, 4, 3,
+              {"status/complete": 8, "status/no_block": 2, "bad/wrong": 2}, 3, 3,
               {1: 10, 2: 4, "1:critic": 7}),
         _Fake(5, 0, 4, {"text_after_block": 1, "visible_id_mismatch": 3},
-              6, 2, 5, 1, {1: 6, 3: 2, "3:verifier": 2}),
+              6, 2,
+              {"status/complete": 7, "status/open_without_close": 4,
+               "bad/correct": 1, "bad/wrong": 3},
+              5, 1, {1: 6, 3: 2, "3:verifier": 2}),
     ]
 
     dst.absorb_counters(shards)
@@ -3561,6 +3639,10 @@ def test_absorb_counters_keeps_batch_and_cumulative_semantics_apart():
         "credit split 原因分布没有跨分片合并"
     assert dst.n_credit_boundary_tokens == 10
     assert dst.n_credit_decode_fallback == 5
+    assert dst.n_primary_format["status/complete"] == 15
+    assert dst.n_primary_format["status/no_block"] == 2
+    assert dst.n_primary_format["status/open_without_close"] == 4
+    assert dst.n_primary_format["bad/wrong"] == 5
     assert dst.n_logprob_mismatch == 8, "logprob mismatch 没有跨分片求和"
     assert dst.n_prompt_clipped == 4, "累计级应累加"
     assert dst.n_hop_depth[1] == 16 and dst.n_hop_depth[2] == 4
@@ -3577,6 +3659,8 @@ def test_absorb_counters_keeps_batch_and_cumulative_semantics_apart():
     assert dst.n_credit_split_failures["visible_id_mismatch"] == 3
     assert dst.n_credit_boundary_tokens == 10
     assert dst.n_credit_decode_fallback == 5
+    assert dst.n_primary_format["status/complete"] == 15
+    assert dst.n_primary_format["bad/wrong"] == 5
     assert dst.n_logprob_mismatch == 8, "logprob mismatch 被错误地跨批次累加了"
     assert dst.n_hop_depth[1] == 16, "跳深没有按批次重置"
     assert dst.n_prompt_clipped == 8, \
@@ -3589,6 +3673,7 @@ def test_absorb_counters_keeps_batch_and_cumulative_semantics_apart():
     assert not dst.n_credit_split_failures
     assert dst.n_credit_boundary_tokens == 0
     assert dst.n_credit_decode_fallback == 0
+    assert not dst.n_primary_format
     assert dst.n_logprob_mismatch == 0
     assert dst.n_prompt_clipped == 8
 

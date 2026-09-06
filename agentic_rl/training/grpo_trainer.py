@@ -6,7 +6,7 @@ import bitsandbytes as bnb
 from agents.agentic_executor import AgenticExecutor
 from llm.trainable_llm import ROLE_ADAPTER
 from training.metrics import rollout_metrics
-from training.raca_adv import compute_raca_advantages
+from training.raca_adv import compute_raca_advantages, token_credit_components
 
 
 def logprobs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -44,13 +44,29 @@ class GRPOAgenticTrainer:
     # ── Training loop ────────────────────────────────────────────────────────
 
     def _count_valid_turns(self, episode: dict, per_turn_adv: dict) -> int:
-        """Count turns that have both response tokens and a valid advantage."""
+        """Count turns that pass the same structural guards as ``_compute_loss``."""
         vocab_size = self.model._model.config.vocab_size
-        return sum(
-            1 for msg in episode["messages"]
-            if (msg.get("turn_id") in per_turn_adv
-                and [t for t in msg.get("response_ids", []) if 0 <= t < vocab_size])
-        )
+        lp_count = {}
+        for tid in episode.get("turn_ids", []):
+            lp_count[tid] = lp_count.get(tid, 0) + 1
+        total = 0
+        for msg in episode["messages"]:
+            tid = msg.get("turn_id")
+            spec = per_turn_adv.get(tid)
+            if spec is None:
+                continue
+            ids = list(msg.get("response_ids", []))
+            if (not msg.get("logprob_aligned", True)
+                    or not ids or len(ids) != lp_count.get(tid, 0)
+                    or any(tok < 0 or tok >= vocab_size for tok in ids)):
+                continue
+            if isinstance(spec, dict):
+                span_spec = msg.get("credit_spans", msg.get("interaction_span"))
+                components = token_credit_components(spec, span_spec, range(len(ids)))
+                if not components:
+                    continue
+            total += 1
+        return total
 
     def update(self, batch_rollouts: list) -> dict:
         """RACA update.
@@ -105,15 +121,27 @@ class GRPOAgenticTrainer:
               f"groups={n_groups_kept}/{n_groups}", flush=True)
 
         # Pre-count total valid turns for normalization
-        total_valid = max(
-            sum(self._count_valid_turns(ep, adv)
-                for ep, adv in zip(all_episodes, all_per_turn_adv)), 1
+        total_valid = sum(
+            self._count_valid_turns(ep, adv)
+            for ep, adv in zip(all_episodes, all_per_turn_adv)
         )
+        if total_valid == 0:
+            if self.vllm_engine is not None:
+                self.vllm_engine.sync_lora(self.model)
+            return {"loss": 0.0, "mean_reward": mean_r, "accuracy": mean_acc,
+                    "kl": 0.0, "skipped": True,
+                    "groups_total": n_groups, "groups_kept": n_groups_kept,
+                    **int_metrics}
 
         total_loss    = 0.0
         total_n_valid = 0
         agg = {"kl_sum": 0.0, "ent_sum": 0.0, "clip_sum": 0.0, "ratio_sum": 0.0,
-               "ratio_max": 0.0, "n_tok": 0, "resp_len_sum": 0, "n_turn": 0}
+               "ratio_max": 0.0, "n_tok": 0, "n_pg_tok": 0,
+               "resp_len_sum": 0, "n_turn": 0,
+               "solution_pg_sum": 0.0, "interaction_pg_sum": 0.0,
+               "solution_adv_abs_sum": 0.0, "interaction_adv_abs_sum": 0.0,
+               "n_solution_channel": 0, "n_interaction_channel": 0,
+               "n_solution_tok": 0, "n_interaction_tok": 0}
 
         for _ in range(self.ppo_epochs):
             self.optimizer.zero_grad()
@@ -128,7 +156,11 @@ class GRPOAgenticTrainer:
                 epoch_loss    += ep_loss
                 epoch_n_valid += n_valid
                 for k in ("kl_sum", "ent_sum", "clip_sum", "ratio_sum",
-                          "n_tok", "resp_len_sum", "n_turn"):
+                          "n_tok", "n_pg_tok", "resp_len_sum", "n_turn",
+                          "solution_pg_sum", "interaction_pg_sum",
+                          "solution_adv_abs_sum", "interaction_adv_abs_sum",
+                          "n_solution_channel", "n_interaction_channel",
+                          "n_solution_tok", "n_interaction_tok"):
                     agg[k] += diag.get(k, 0)
                 agg["ratio_max"] = max(agg["ratio_max"], diag.get("ratio_max", 0.0))
 
@@ -140,10 +172,11 @@ class GRPOAgenticTrainer:
                 )
                 self.optimizer.step()
                 _nt = max(agg["n_tok"], 1)
+                _npg = max(agg["n_pg_tok"], 1)
                 print(f"  [update] grad_norm={grad_norm:.4f} loss={epoch_loss:.4f} "
                       f"kl={agg['kl_sum'] / _nt:.6f} "
                       f"entropy={agg['ent_sum'] / _nt:.4f} "
-                      f"clip_frac={agg['clip_sum'] / _nt:.4f}",
+                      f"clip_frac={agg['clip_sum'] / _npg:.4f}",
                       flush=True)
             else:
                 print("  [update] SKIPPED: no valid gradients", flush=True)
@@ -154,7 +187,14 @@ class GRPOAgenticTrainer:
         if self.vllm_engine is not None:
             self.vllm_engine.sync_lora(self.model)
 
+        if total_n_valid == 0:
+            return {"loss": 0.0, "mean_reward": mean_r, "accuracy": mean_acc,
+                    "kl": 0.0, "skipped": True,
+                    "groups_total": n_groups, "groups_kept": n_groups_kept,
+                    **int_metrics}
+
         _nt = max(agg["n_tok"], 1)
+        _npg = max(agg["n_pg_tok"], 1)
         return {
             "loss":        total_loss / max(total_n_valid, 1),
             "mean_reward": mean_r,
@@ -164,10 +204,23 @@ class GRPOAgenticTrainer:
             "groups_kept":  n_groups_kept,
             # ── 策略健康指标（标准 GRPO 看盘项） ──
             "entropy":     agg["ent_sum"] / _nt,      # 断崖下跌 = 熵坍塌
-            "clip_frac":   agg["clip_sum"] / _nt,     # 持续 >0.2 = lr 过大/off-policy 太深
-            "ratio_mean":  agg["ratio_sum"] / _nt,    # 应 ≈1
+            "clip_frac":   agg["clip_sum"] / _npg,    # 仅统计真正收到 PG credit 的 token
+            "ratio_mean":  agg["ratio_sum"] / _npg,   # 应 ≈1（同上）
             "ratio_max":   agg["ratio_max"],          # 飞了 = rollout/训练权重脱节
             "resp_len":    agg["resp_len_sum"] / max(agg["n_turn"], 1),
+            # 双通道诊断：确认 proposer 的两个目标没有在尺度上互相淹没。
+            "solution_pg_loss": (agg["solution_pg_sum"] /
+                                 max(agg["n_solution_channel"], 1)),
+            "interaction_pg_loss": (agg["interaction_pg_sum"] /
+                                    max(agg["n_interaction_channel"], 1)),
+            "solution_adv_abs": (agg["solution_adv_abs_sum"] /
+                                 max(agg["n_solution_channel"], 1)),
+            "interaction_adv_abs": (agg["interaction_adv_abs_sum"] /
+                                    max(agg["n_interaction_channel"], 1)),
+            "solution_channel_count": agg["n_solution_channel"],
+            "interaction_channel_count": agg["n_interaction_channel"],
+            "solution_token_count": agg["n_solution_tok"],
+            "interaction_token_count": agg["n_interaction_tok"],
             **int_metrics,
         }
 
@@ -186,7 +239,8 @@ class GRPOAgenticTrainer:
 
         Reference model = frozen SFT snapshot per role (via as_ref(role)).
         Backward after each turn to keep peak memory minimal.
-        per_turn_adv: maps turn_id → RACA advantage scalar.
+        per_turn_adv: turn_id → float（普通 turn）或
+                      {"solution": float, "interaction": float}（proposer primary）。
         Returns (mean_loss, n_valid_turns, diag) — diag 为健康指标的 token 加权和，
         由调用方累加后除以 token 总数（避免短 turn 被过度加权）。
         """
@@ -212,34 +266,55 @@ class GRPOAgenticTrainer:
         # 健康指标：token 加权累加（分母统一为 n_tok）
         diag = {"kl_sum": 0.0, "ent_sum": 0.0, "clip_sum": 0.0,
                 "ratio_sum": 0.0, "ratio_max": 0.0, "n_tok": 0,
-                "resp_len_sum": 0, "n_turn": 0}
+                "n_pg_tok": 0, "resp_len_sum": 0, "n_turn": 0,
+                "solution_pg_sum": 0.0, "interaction_pg_sum": 0.0,
+                "solution_adv_abs_sum": 0.0, "interaction_adv_abs_sum": 0.0,
+                "n_solution_channel": 0, "n_interaction_channel": 0,
+                "n_solution_tok": 0, "n_interaction_tok": 0}
 
         for msg in messages:
             turn_id = msg.get("turn_id", 0)
 
             # Only process turns that have a RACA advantage assigned.
-            advantage = per_turn_adv.get(turn_id)
-            if advantage is None:
+            advantage_spec = per_turn_adv.get(turn_id)
+            if advantage_spec is None:
                 continue
 
-            role     = msg.get("role_name", "proposer")
-            resp_ids = [t for t in msg.get("response_ids", []) if 0 <= t < vocab_size]
-            if not resp_ids:
+            role = msg.get("role_name", "proposer")
+            if not msg.get("logprob_aligned", True):
+                continue
+            raw_ids = list(msg.get("response_ids", []))
+            mask = (all_turn_ids == turn_id)
+            old_lps_raw = all_old_lps[mask]
+            # 任何非法 token 或长度错位都整 turn 跳过。旧代码删除非法 ID 后重新拼接
+            # 序列，会改变后续 token 的 autoregressive context；即使 mask 位置同步，
+            # new/ref logprob 也已经不是 rollout 时那条序列，不能用于 PPO ratio。
+            if (not raw_ids
+                    or len(raw_ids) != old_lps_raw.shape[0]
+                    or any(tok < 0 or tok >= vocab_size for tok in raw_ids)):
+                continue
+            resp_ids = raw_ids
+            old_lps = old_lps_raw
+            valid_positions = list(range(len(raw_ids)))
+            n_resp = len(resp_ids)
+            n_align = n_resp
+            span_spec = msg.get("credit_spans", msg.get("interaction_span"))
+            components = token_credit_components(
+                advantage_spec, span_spec, valid_positions)
+            if not components:
                 continue
 
-            mask    = (all_turn_ids == turn_id)
-            old_lps = all_old_lps[mask]
-            n_resp  = len(resp_ids)
-            n_align = min(n_resp, old_lps.shape[0])
-            if n_align == 0:
-                continue
-
-            prompt_text = self.tokenizer.apply_chat_template(
-                [{"role": "system", "content": msg["system"]},
-                 {"role": "user",   "content": msg["user"]}],
-                tokenize=False, add_generation_prompt=True,
-                enable_thinking=False,
-            )
+            # 优先复用 rollout 实际送入 vLLM 的 prompt。尤其在 executor 触发
+            # clip_user() 时，根据原始 system/user 重建会得到另一条上下文，使 PPO
+            # ratio 比较的不是同一条件分布。无该字段时仅为旧 rollout 做兼容回退。
+            prompt_text = msg.get("prompt_text")
+            if prompt_text is None:
+                prompt_text = self.tokenizer.apply_chat_template(
+                    [{"role": "system", "content": msg["system"]},
+                     {"role": "user",   "content": msg["user"]}],
+                    tokenize=False, add_generation_prompt=True,
+                    enable_thinking=False,
+                )
             prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
             p_len = len(prompt_ids)
             if p_len == 0:
@@ -293,11 +368,32 @@ class GRPOAgenticTrainer:
                 continue
 
             ratio_tok = torch.exp(log_ratio_tok)
-            pg_loss = torch.maximum(
-                -advantage * ratio_tok,
-                -advantage * torch.clamp(ratio_tok, 1 - self.clip_epsilon,
-                                                     1 + self.clip_epsilon),
-            ).mean()
+            # 每个功能通道先在自己的 token span 内取均值，再在 turn 内相加。
+            # 若把 A_sol+A_int 先合成一个 scalar 再广播整段，正确答案(+1)与错误求助
+            # (-1) 会直接抵消成 0；若在全部 active token 上统一求均值，长推理又会
+            # 稀释很短的 interaction block。分通道 mean 后相加才同时满足：
+            #   solution advantage → reasoning + answer token
+            #   interaction advantage → trailing <interaction> block token
+            pg_parts = []
+            active_local_indices = []
+            for _name, channel_adv, local_indices in components:
+                idx = torch.tensor(local_indices, dtype=torch.long, device=ratio_tok.device)
+                r = ratio_tok.index_select(0, idx)
+                part = torch.maximum(
+                    -channel_adv * r,
+                    -channel_adv * torch.clamp(
+                        r, 1 - self.clip_epsilon, 1 + self.clip_epsilon),
+                ).mean()
+                pg_parts.append(part)
+                active_local_indices.extend(local_indices)
+                if _name in ("solution", "interaction"):
+                    diag[f"{_name}_pg_sum"] += float(part.detach().item())
+                    diag[f"{_name}_adv_abs_sum"] += abs(float(channel_adv))
+                    diag[f"n_{_name}_channel"] += 1
+                    diag[f"n_{_name}_tok"] += len(local_indices)
+            if not pg_parts:
+                continue
+            pg_loss = torch.stack(pg_parts).sum()
 
             # KL penalty (k3 估计器): exp(ref−new) − (ref−new) − 1 ≥ 0。
             # v1 用 k1 = mean(new − ref)：ref 是常量，梯度 = ∇mean(new_lps)，
@@ -314,15 +410,20 @@ class GRPOAgenticTrainer:
 
             # ── 健康指标采集（均不入图） ───────────────────────────
             with torch.no_grad():
-                # clip fraction：被 PPO clip 截断的 token 比例（通常 <0.2）
-                _clipped = ((ratio_tok < 1 - self.clip_epsilon) |
-                            (ratio_tok > 1 + self.clip_epsilon)).float().sum().item()
+                active_idx = torch.tensor(
+                    sorted(set(active_local_indices)), dtype=torch.long,
+                    device=ratio_tok.device)
+                active_ratio = ratio_tok.index_select(0, active_idx)
+                _clipped = ((active_ratio < 1 - self.clip_epsilon) |
+                            (active_ratio > 1 + self.clip_epsilon)).float().sum().item()
                 diag["clip_sum"]  += _clipped
-                diag["ratio_sum"] += ratio_tok.sum().item()
-                diag["ratio_max"]  = max(diag["ratio_max"], ratio_tok.max().item())
+                diag["ratio_sum"] += active_ratio.sum().item()
+                diag["ratio_max"]  = max(
+                    diag["ratio_max"], active_ratio.max().item())
                 diag["kl_sum"]    += kl.item() * n_align
                 diag["ent_sum"]   += _ent_sum
                 diag["n_tok"]     += n_align
+                diag["n_pg_tok"]  += active_ratio.numel()
                 diag["resp_len_sum"] += n_resp
                 diag["n_turn"]    += 1
 

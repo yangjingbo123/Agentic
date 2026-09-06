@@ -13,3 +13,9 @@ diag-*.out
 
 # 本地污染数据备份（旧版本可从 git 历史取回，不入库）
 data/backup_contaminated_*/
+
+# M1 重排/拼接的派生数据：submit_primus_sft.sh 每次现场从 sft_train_v2/v3.jsonl
+# 生成。刻意不入库——它内嵌 prompt_templates.py 的 system 串，一旦提交就会与
+# 模板漂移，而这种漂移无声无息（只表现为 parse_rate 缓慢下滑）。
+data/sft_train_*_m1.jsonl
+data/sft_train_v23.jsonl

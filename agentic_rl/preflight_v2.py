@@ -15,6 +15,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -117,7 +118,7 @@ def check_rl_data():
     test = [json.loads(l) for l in open(test_p)]
     check(all(r.get("answer") for r in train), "训练集无空答案")
     lvl5 = [r for r in test if r.get("level") == "Level 5"]
-    check(len(lvl5) >= 300, f"测试集 Level 5 样本 {len(lvl5)} 条（eval 取前 300）")
+    check(len(lvl5) >= 1000, f"测试集 Level 5 样本 {len(lvl5)} 条（eval 取前 1000）")
     # 泄漏检查
     tr_q = {r["question"] for r in train}
     overlap = sum(1 for r in test if r["question"] in tr_q)
@@ -166,9 +167,35 @@ def check_config():
     dat = _load_flat_yaml("configs/data/math.yaml")
     check(str(dat.get("sft_path", "")).endswith("sft_train_v2.jsonl"),
           f"data.sft_path 指向 v2 数据（当前 {dat.get('sft_path')}）")
-    for k in ("c_int", "lambda_int", "max_hops", "stop_gate",
+    check(str(dat.get("aime_path", "")).endswith("aime_2022_2026.jsonl"),
+          f"data.aime_path 指向 AIME-150（当前 {dat.get('aime_path')}）")
+    for k in ("c_int", "int_miss", "lambda_int", "token_credit",
+              "malformed_interaction_credit", "malformed_tail_tokens",
+              "balance_interaction_layers", "interaction_balance_cap",
+              "eval_samples", "eval_aime_samples", "max_steps",
+              "max_hops", "stop_gate",
               "eps_force_init", "eps_force_min"):
         check(k in cfg, f"v2 超参 {k} = {cfg.get(k)}")
+    check(isinstance(cfg.get("token_credit"), bool),
+          f"token_credit 必须是布尔值（当前 {cfg.get('token_credit')!r}）")
+    try:
+        _lambda_int = float(cfg.get("lambda_int"))
+        check(_lambda_int >= 0.0,
+              f"lambda_int 必须 >= 0（当前 {_lambda_int}）")
+    except (TypeError, ValueError):
+        check(False, f"lambda_int 必须是数值（当前 {cfg.get('lambda_int')!r}）")
+    check(isinstance(cfg.get("malformed_interaction_credit"), bool),
+          "malformed_interaction_credit 必须是布尔值")
+    check(int(cfg.get("malformed_tail_tokens", 0) or 0) >= 1,
+          f"malformed_tail_tokens >= 1（当前 {cfg.get('malformed_tail_tokens')}）")
+    check(isinstance(cfg.get("balance_interaction_layers"), bool),
+          "balance_interaction_layers 必须是布尔值")
+    check(float(cfg.get("interaction_balance_cap", 0) or 0) >= 1.0,
+          f"interaction_balance_cap >= 1（当前 {cfg.get('interaction_balance_cap')}）")
+    check(int(cfg.get("eval_samples", 0) or 0) == 1000,
+          f"MATH 同步评测固定 1000 题（当前 {cfg.get('eval_samples')}）")
+    check(int(cfg.get("eval_aime_samples", 0) or 0) == 150,
+          f"AIME 同步评测固定 150 题（当前 {cfg.get('eval_aime_samples')}）")
     # 消融组合合法性
     if cfg.get("max_hops", 0) == 0 and cfg.get("stop_gate"):
         check(False, "max_hops=0（禁交互）时 stop_gate 必须为 false，"
@@ -179,6 +206,37 @@ def check_config():
     print(f"       vllm_num_workers={nw}（训练模型占 cuda:0，vLLM 占 "
           f"cuda:{slot}..{slot + nw - 1}） → 需要 {1 + nw} 张卡；"
           f"不足时命令行覆盖 agentic.vllm_num_workers=N")
+
+
+def check_aime_data(path="data/aime_2022_2026.jsonl"):
+    print(f"\n[5] AIME 2022--2026 ({path})")
+    if not os.path.isfile(path):
+        check(False, f"{path} 不存在 —— 先运行 python data/prepare_data.py")
+        return
+    rows = [json.loads(line) for line in open(path)]
+    check(len(rows) == 150, f"AIME 总题数 150（当前 {len(rows)}）")
+    check(len({r.get('question') for r in rows}) == len(rows), "AIME 题目零重复")
+    years = {year: sum(r.get("year") == year for r in rows)
+             for year in range(2022, 2027)}
+    check(all(n == 30 for n in years.values()),
+          f"每年 AIME I+II 各 30 题（当前 {years}）")
+    exams = {(year, exam): sum(r.get("year") == year and r.get("exam") == exam
+                               for r in rows)
+             for year in range(2022, 2027) for exam in ("I", "II")}
+    check(all(n == 15 for n in exams.values()),
+          f"每年 AIME I/II 各 15 题（当前 {exams}）")
+    check(all(re.fullmatch(r"\d{3}", str(r.get("answer", ""))) for r in rows),
+          "AIME 答案均为保留前导零的三位数字")
+    check(all(r.get("source") and r.get("source_revision") for r in rows),
+          "AIME 每题均记录数据源与固定 revision")
+    other_questions = set()
+    for other in ("data/math_train_rl.jsonl", "data/math_test.jsonl",
+                  "data/sft_train_v2.jsonl", "data/sft_train_v3.jsonl"):
+        if os.path.isfile(other):
+            other_questions.update(json.loads(line).get("question")
+                                   for line in open(other))
+    overlap = sum(r["question"] in other_questions for r in rows)
+    check(overlap == 0, f"AIME 与 MATH/SFT 零重叠（当前 {overlap}）")
 
 
 def main():
@@ -194,6 +252,7 @@ def main():
     check_sft_ckpt(args.sft_ckpt)
     check_rl_data()
     check_config()
+    check_aime_data()
 
     print("\n" + "=" * 68)
     if _fails:

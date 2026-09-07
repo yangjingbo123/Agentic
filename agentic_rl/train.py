@@ -2,6 +2,7 @@ import json
 import os
 import random
 import subprocess
+import time
 
 import numpy as np
 import torch
@@ -107,6 +108,13 @@ def main(cfg: DictConfig):
             max_model_len=cfg.agentic.get("vllm_max_model_len", 4096),
             startup_timeout_s=cfg.agentic.get("vllm_start_timeout_s", 300),
             rpc_timeout_s=cfg.agentic.get("vllm_rpc_timeout_s", 600),
+            # "0"=强制V0（默认，同训练机 vllm 0.9.2）"1"=强制V1（高版本镜像
+            # 必选，vLLM ≥0.10 已删 V0）"auto"=交给 vLLM。首次切 V1 请用 SMOKE
+            # 作业验收：首步 kl 应 ≈0，不为 0 则 logprobs 对齐有差异。
+            vllm_use_v1=str(cfg.agentic.get("vllm_use_v1", "0")),
+            # enforce_eager=False 开启 CUDA graph。V1 下 kernel launch 开销占比高，
+            # 实测每步耗时可差数倍；代价是每 worker 额外几 GB 显存与首次建图耗时。
+            enforce_eager=bool(cfg.agentic.get("vllm_enforce_eager", True)),
         )
         if num_workers > 1:
             _visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
@@ -143,59 +151,151 @@ def main(cfg: DictConfig):
 
     dataset = load_dataset(cfg.data.train_path)
     eval_dataset = load_dataset(cfg.data.test_path) if cfg.data.get("test_path") else []
+    aime_dataset = load_dataset(cfg.data.aime_path) if cfg.data.get("aime_path") else []
     eval_freq = cfg.agentic.get("eval_freq", 20)
-    eval_samples = cfg.agentic.get("eval_samples", 100)
+    eval_samples = int(cfg.agentic.get("eval_samples", 100))
+    eval_aime_samples = int(cfg.agentic.get("eval_aime_samples", 150))
     from agents.agentic_executor import AgenticExecutor
+    from training.metrics import rollout_metrics
     eval_executor = AgenticExecutor(
         model, tokenizer, OmegaConf.to_container(cfg.agentic),
         vllm_engine=vllm_engine, eval_mode=True,
     )
 
-    # fixed eval subset — Level 5 only (hardest tier), first N items, same across all experiments
-    # Level 5 problems are where multi-agent collaboration has the most impact;
-    # easier levels inflate baseline accuracy and reduce discrimination.
-    _eval_items = [it for it in eval_dataset if it.get("level") == "Level 5"][:eval_samples] if eval_dataset else []
-    if _eval_items:
-        print(f"Eval subset: {len(_eval_items)} Level-5 items (from {len(eval_dataset)} total)", flush=True)
+    # 方案 C：每个 eval step 同时测固定 MATH Level-5 1000 与 AIME 2022--2026 150。
+    eval_suites = {
+        "math_l5": [it for it in eval_dataset
+                    if it.get("level") == "Level 5"][:eval_samples],
+        "aime": aime_dataset[:eval_aime_samples],
+    }
+    eval_suites = {name: items for name, items in eval_suites.items() if items}
+    for name, items in eval_suites.items():
+        print(f"Eval suite {name}: {len(items)} items", flush=True)
 
-    def run_eval(step):
-        if not _eval_items or vllm_engine is None:
-            return
+    _EVAL_TAIL_K = 5
+    _eval_histories = {name: [] for name in eval_suites}
+
+    def _save_eval_predictions(suite_name, step, items, episodes):
+        out_dir = os.path.join(ckpt_dir, "eval")
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"step_{step:03d}_{suite_name}.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            for item, ep in zip(items, episodes):
+                row = {
+                    "suite": suite_name,
+                    "step": step,
+                    "question": item["question"],
+                    "gold": item["answer"],
+                    "prediction": ep.get("final_answer", ""),
+                    "is_correct": bool(ep.get("is_correct", False)),
+                    "n_turns": len(ep.get("raca_turn_data", {})),
+                    "stopped": bool(ep.get("stopped", False)),
+                }
+                for key in ("year", "exam", "problem", "level", "source"):
+                    if key in item:
+                        row[key] = item[key]
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return path
+
+    def _run_eval_suite(suite_name, items, step):
         episodes = eval_executor.run_episodes_batch(
-            [it["question"] for it in _eval_items],
-            [it["answer"]   for it in _eval_items],
+            [it["question"] for it in items],
+            [it["answer"] for it in items],
         )
-        acc = sum(ep["is_correct"] for ep in episodes) / len(episodes)
-        # §19.3 判据①：同批 episode 上朴素计票的 acc（加权投票的在线消融）
-        acc_uni = sum(ep.get("is_correct_uniform", ep["is_correct"])
-                      for ep in episodes) / len(episodes)
-        # reward_mean: mean total RACA reward per episode (sum of all turn rewards)
-        reward_mean = float(np.mean([
-            sum(v["reward"] for v in ep.get("raca_turn_data", {}).values())
-            for ep in episodes
-        ]))
-        # avg_turns: mean number of turns per episode
+        n = len(episodes)
+        correct = sum(bool(ep["is_correct"]) for ep in episodes)
+        acc = correct / max(n, 1)
+        hist = _eval_histories[suite_name]
+        hist.append(acc)
+        tail = hist[-_EVAL_TAIL_K:]
+        acc_tail = float(np.mean(tail))
+
+        # 直接复用训练侧定义，保证条件交互率和 effectiveness 是同一把尺子。
+        behavior = rollout_metrics([episodes])
+        int_wrong = behavior.get("int_rate_wrong")
+        int_correct = behavior.get("int_rate_correct")
+        int_gap = behavior.get("int_rate_gap")
+        eff = behavior.get("int_effectiveness")
+        int_rate = behavior.get("int_rate", 0.0)
+        stop_rate = behavior.get("stop_rate", 0.0)
         avg_turns = float(np.mean([
             len(ep.get("raca_turn_data", {})) for ep in episodes
-        ]))
-        # RACA v2 行为指标（greedy、无 ε 注入，反映学到的策略本身）
-        _rounds = [m for ep in episodes for m in ep.get("raca_round_meta", [])]
-        eval_int_rate  = float(np.mean([m["u"] for m in _rounds])) if _rounds else 0.0
-        eval_stop_rate = float(np.mean([1.0 if ep.get("stopped") else 0.0 for ep in episodes]))
-        print(f"  [eval] step={step} eval_acc={acc:.3f} "
-              f"acc_uniform={acc_uni:.3f} d_vote={acc - acc_uni:+.3f} "
-              f"reward={reward_mean:.3f} "
-              f"avg_turns={avg_turns:.1f} int_rate={eval_int_rate:.2f} "
-              f"stop_rate={eval_stop_rate:.2f} (n={len(_eval_items)})", flush=True)
-        wandb.log({"eval_accuracy": acc, "eval_accuracy_uniform": acc_uni,
-                   "eval_vote_gain": acc - acc_uni, "eval_reward": reward_mean,
-                   "eval_avg_turns": avg_turns, "eval_int_rate": eval_int_rate,
-                   "eval_stop_rate": eval_stop_rate}, step=step)
+        ])) if episodes else 0.0
+
+        extras = ""
+        log_data = {
+            f"eval/{suite_name}/accuracy": acc,
+            f"eval/{suite_name}/accuracy_tail": acc_tail,
+            f"eval/{suite_name}/correct": correct,
+            f"eval/{suite_name}/total": n,
+            f"eval/{suite_name}/avg_turns": avg_turns,
+            f"eval/{suite_name}/int_rate": int_rate,
+            f"eval/{suite_name}/stop_rate": stop_rate,
+        }
+        if int_wrong is not None:
+            log_data[f"eval/{suite_name}/int_rate_wrong"] = int_wrong
+        if int_correct is not None:
+            log_data[f"eval/{suite_name}/int_rate_correct"] = int_correct
+        if int_gap is not None:
+            log_data[f"eval/{suite_name}/int_rate_gap"] = int_gap
+        if eff is not None:
+            log_data[f"eval/{suite_name}/int_effectiveness"] = eff
+
+        if suite_name == "math_l5":
+            n300 = min(300, n)
+            acc300 = (sum(bool(ep["is_correct"]) for ep in episodes[:n300]) /
+                      max(n300, 1))
+            log_data["eval/math_l5/accuracy_n300"] = acc300
+            # 旧键保留，避免历史 W&B 面板断线。
+            log_data.update({
+                "eval_accuracy": acc,
+                "eval_accuracy_tail": acc_tail,
+                "eval_accuracy_n300": acc300,
+            })
+            extras = f" acc300={acc300:.3f}"
+        elif suite_name == "aime":
+            by_year = {}
+            for year in sorted({it.get("year") for it in items if it.get("year")}):
+                pairs = [(it, ep) for it, ep in zip(items, episodes)
+                         if it.get("year") == year]
+                yc = sum(bool(ep["is_correct"]) for _it, ep in pairs)
+                yn = len(pairs)
+                by_year[year] = (yc, yn)
+                log_data[f"eval/aime/{year}_accuracy"] = yc / max(yn, 1)
+                log_data[f"eval/aime/{year}_correct"] = yc
+            extras = " years=" + ",".join(
+                f"{year}:{yc}/{yn}" for year, (yc, yn) in by_year.items())
+
+        def _fmt(value):
+            return "--" if value is None else f"{value:.2f}"
+
+        print(
+            f"  [eval:{suite_name}] step={step} acc={acc:.3f} "
+            f"correct={correct}/{n} tail{len(tail)}={acc_tail:.3f}{extras} "
+            f"turns={avg_turns:.1f} int={int_rate:.2f} "
+            f"intW/C/G={_fmt(int_wrong)}/{_fmt(int_correct)}/{_fmt(int_gap)} "
+            f"eff={_fmt(eff)} stop={stop_rate:.2f}",
+            flush=True,
+        )
+        pred_path = _save_eval_predictions(suite_name, step, items, episodes)
+        print(f"  [eval:{suite_name}] predictions={pred_path}", flush=True)
+        return log_data
+
+    def run_eval(step):
+        if not eval_suites or vllm_engine is None:
+            return
+        combined = {}
+        for suite_name, items in eval_suites.items():
+            combined.update(_run_eval_suite(suite_name, items, step))
+        wandb.log(combined, step=step)
+
     batch_size = cfg.agentic.batch_size
     max_steps = cfg.agentic.get("max_steps", 500)
     print(f"Dataset: {len(dataset)} items, batch_size={batch_size}, max_steps={max_steps}", flush=True)
 
-    ckpt_dir = f"checkpoints/rl-{cfg.exp_name}"
+    # checkpoint 目录：本地默认相对路径；Primus 等平台用 ckpt_dir=... 指向持久化
+    # 挂载（抢占重排后 resume 依赖同一路径下的 trainer_state.json）。
+    ckpt_dir = cfg.get("ckpt_dir") or f"checkpoints/rl-{cfg.exp_name}"
     save_freq = cfg.agentic.get("save_freq", 50)
 
     # resume from checkpoint if exists
@@ -270,6 +370,7 @@ def main(cfg: DictConfig):
         eps_force = max(_epsm, _eps0 - (_eps0 - _epsm) * step / max(max_steps, 1))
 
         # Run all batch_size * n_samples rollouts in one batched vLLM call
+        _t_roll0 = time.time()
         questions = [item["question"] for item in batch]
         answers   = [item["answer"]   for item in batch]
         n_s = trainer.n_samples
@@ -284,17 +385,26 @@ def main(cfg: DictConfig):
             _chunks_a = [all_a[i::_k] for i in range(_k)]
             def _run_chunk(eng, qs, ans):
                 ex = AgenticExecutor(model, tokenizer, _agentic_cfg, vllm_engine=eng)
-                return ex.run_episodes_batch(qs, ans, eps_force=eps_force)
+                # **必须把 ex 一起返回。** 诊断计数器（n_hop_depth / n_gate_unlocked
+                # / n_self_target / n_prompt_clipped）挂在这个**临时**实例上，而 step
+                # 行读的是 trainer.executor —— 一个从未跑过 rollout 的对象。不聚合
+                # 回去，那四个读数就在集群上恒为 0（08-28 两跑全程如此，导致
+                # max_hops 2→3 与窗口 600 两项改动都没法验收）。见
+                # `AgenticExecutor.absorb_counters` 的 docstring。
+                return ex.run_episodes_batch(qs, ans, eps_force=eps_force), ex
             with _TPE(max_workers=_k) as _pool:
                 _futures = [_pool.submit(_run_chunk, eng, qs, ans)
                             for eng, qs, ans in zip(_engines, _chunks_q, _chunks_a)]
-                _chunks_out = [f.result() for f in _futures]
+                _pairs = [f.result() for f in _futures]
+            _chunks_out = [p[0] for p in _pairs]
+            trainer.executor.absorb_counters([p[1] for p in _pairs])
             all_eps = [None] * len(all_q)
             for _ei, _res in enumerate(_chunks_out):
                 for _j, _ep in enumerate(_res):
                     all_eps[_ei + _j * _k] = _ep
         else:
             all_eps = trainer.executor.run_episodes_batch(all_q, all_a, eps_force=eps_force)
+        _dt_rollout = time.time() - _t_roll0
         # group by question — each group is the list of N rollouts for that question
         batch_rollouts = []
         for qi in range(len(batch)):
@@ -306,6 +416,7 @@ def main(cfg: DictConfig):
             note_skip("no group had >=2 valid episodes")
             continue
 
+        _t_train0 = time.time()
         try:
             stats = trainer.update(batch_rollouts)
         except Exception:
@@ -313,11 +424,49 @@ def main(cfg: DictConfig):
             raise
 
         _g_kept, _g_total = stats.get("groups_kept", 0), stats.get("groups_total", 0)
+        # 先读 credit/logprob 诊断，再判断 skipped。splitF 现在表示 interaction
+        # channel 缺失；格式坏时 solution 仍可能保留。gapT 是只收 KL 的跨界 token。
+        _n_split = getattr(trainer.executor, "n_credit_split_failed", 0)
+        _split_reasons = getattr(
+            trainer.executor, "n_credit_split_failures", None) or {}
+        _split_reason_s = ",".join(
+            f"{name}:{count}" for name, count in
+            sorted(_split_reasons.items(), key=lambda kv: (-kv[1], kv[0])))
+        _n_boundary_gap = getattr(trainer.executor, "n_credit_boundary_tokens", 0)
+        _n_decode_fb = getattr(trainer.executor, "n_credit_decode_fallback", 0)
+        _fmt = getattr(trainer.executor, "n_primary_format", None) or {}
+        _fmt_total = sum(v for k, v in _fmt.items() if k.startswith("status/"))
+        _fmt_ok = int(_fmt.get("status/complete", 0))
+        _fmt_rate = _fmt_ok / max(_fmt_total, 1)
+        _fmt_bad = _fmt_total - _fmt_ok
+        _fmt_s = (
+            f"{_fmt_ok}/{_fmt_total}({_fmt_rate:.1%})"
+            f" badC/W={_fmt.get('bad/correct', 0)}/{_fmt.get('bad/wrong', 0)}"
+            f" F/S={_fmt.get('bad/forced', 0)}/{_fmt.get('bad/spontaneous', 0)}"
+            f" endL/S/U={_fmt.get('bad/finish_length', 0)}/"
+            f"{_fmt.get('bad/finish_stop', 0)}/"
+            f"{_fmt.get('bad/finish_unknown', 0)}"
+            f" max={_fmt.get('bad/max_tokens', 0)}"
+        )
+        _n_lp_bad = getattr(trainer.executor, "n_logprob_mismatch", 0)
+        # 绝对计数会随 batch 大小、平均轮数变化，补充稳定的比例口径。
+        _all_msgs = [msg for ep in all_eps if ep is not None
+                     for msg in ep.get("messages", [])]
+        _n_split_total = sum(1 for msg in _all_msgs if "interaction_span" in msg)
+        _n_lp_total = len(_all_msgs)
+        _split_rate = _n_split / max(_n_split_total, 1)
+        _lp_bad_rate = _n_lp_bad / max(_n_lp_total, 1)
         if stats.get("skipped", False):
             # Reusing the current step index for wandb would also clash with the
             # point already logged there, so skip the log entirely and fold the
             # running total into the next real step.
-            note_skip(f"no usable groups (0/{_g_total})")
+            detail = (
+                f", splitF={_n_split}/{_n_split_total}({_split_rate:.2%})"
+                + (f"[{_split_reason_s}]" if _split_reason_s else "")
+                + f", lpF={_n_lp_bad}/{_n_lp_total}({_lp_bad_rate:.2%})"
+                if (_n_split or _n_lp_bad) else ""
+            )
+            note_skip(f"no usable groups (0/{_g_total}{detail})")
             continue
 
         consecutive_skips = 0
@@ -326,25 +475,82 @@ def main(cfg: DictConfig):
         # 缺失时打 "--" 而非 0，避免与真实零值混淆。
         _eff = stats.get("int_effectiveness")
         _sel = stats.get("int_selectivity")
+        _int_w = stats.get("int_rate_wrong")
+        _int_c = stats.get("int_rate_correct")
+        _int_gap = stats.get("int_rate_gap")
+        _p0_count = int(stats.get("interaction_p0_channel_count", 0))
+        _p1_count = int(stats.get("interaction_p1_channel_count", 0))
+        _p0_adv = stats.get("interaction_p0_adv_abs")
+        _p1_adv = stats.get("interaction_p1_adv_abs")
         _qf  = stats.get("q_forced")
         _tc  = stats.get("int_critic_share")
+        # v3.1：gate→unlocked 展示“拦下多少 → 其中多少被解锁”；两者应接近（本轮
+        # 交互链已自带分数的不需解锁）。clip_prompt 非 0 即告警：仍有文本无界点。
+        _n_clip = getattr(trainer.executor, "n_prompt_clipped", 0)
+        # selfT 非 0 说明 proposer 在写 `target: proposer`（自指）。已被归一为
+        # none 且不再计入 int_rate/r_int，但计数本身是 prompt 是否讲清楚的信号。
+        _n_self = getattr(trainer.executor, "n_self_target", 0)
+        # 跳深分布（第十轮，`max_hops` 2→3 的验收指标）。第 3 跳**没有机制把守**，
+        # 它要求修正后的 proposer 自己写出 `request verifier`；depth3 若接近 0，说明
+        # 加预算没被用上，该照 critic 标错那条的样子做成机械触发。`3v` 单列"第 3 跳
+        # 到达 verifier"的次数，因为只看总数分不出它到的是 verifier 还是又一次 critic。
+        _hd = getattr(trainer.executor, "n_hop_depth", None) or {}
+        _hop_s = "/".join(f"{d}:{_hd.get(d, 0)}" for d in (1, 2, 3) if _hd.get(d))
+        if _hop_s and _hd.get("3:verifier"):
+            _hop_s += f"(3v={_hd['3:verifier']})"
         print(
-            f"step={step} reward={stats['mean_reward']:.3f} acc={stats['accuracy']:.2f} "
+            f"step={step} t={_dt_rollout:.0f}+{time.time() - _t_train0:.0f}s "
+            f"reward={stats['mean_reward']:.3f} acc={stats['accuracy']:.2f} "
             f"loss={stats['loss']:.4f} kl={stats['kl']:.4f} "
             f"ent={stats.get('entropy', 0.0):.3f} "
             f"clip={stats.get('clip_frac', 0.0):.3f} "
             f"len={stats.get('resp_len', 0.0):.0f} "
             f"groups={_g_kept}/{_g_total} "
             f"int_rate={stats.get('int_rate', 0.0):.2f} "
+            # pP = 轮级 primary 首答正确率（**不是** acc，acc 是投票后的）。
+            # 它是 int_miss 零点位置的现场判据：零点 = 0.05/(0.086+miss)，
+            # miss=0.10 时是 0.269，所以要 (1−pP) > 0.27 交互才不会塌回去。
+            f"pP={stats.get('p_primary_rate', 0.0):.2f} "
             f"eff={'--' if _eff is None else f'{_eff:.2f}'} "
             f"qF={'--' if _qf is None else f'{_qf:.2f}'} "
             f"tgtC={'--' if _tc is None else f'{_tc:.2f}'} "
             f"sel={'--' if _sel is None else f'{_sel:+.2f}'} "
-            f"parse={stats.get('parse_rate', 1.0):.2f} "
-            f"gate={stats.get('gate_blocked', 0)} "
+            f"iW/C/G={'--' if _int_w is None else f'{_int_w:.2f}'}/"
+            f"{'--' if _int_c is None else f'{_int_c:.2f}'}/"
+            f"{'--' if _int_gap is None else f'{_int_gap:+.2f}'} "
+            f"parse={stats.get('parse_rate', 1.0):.2f}"
+            # 拆开报：nl = 无标签（走数字兜底 → 垃圾票），ea = 空答案（空串进票池）。
+            # `parse` 是两者的合取，单看它分不出掉的是哪一种，而两种的修法不同。
+            f"(nl{stats.get('no_label_rate', 0.0):.2f}"
+            f"/ea{stats.get('empty_answer_rate', 0.0):.2f}) "
+            f"gate={stats.get('gate_blocked', 0)}"
+            f"→{getattr(trainer.executor, 'n_gate_unlocked', 0)} "
             f"fnl={stats.get('funnel_flag', 0)}/{stats.get('funnel_corr', 0)}"
-            f"/{stats.get('funnel_flip', 0)} "
-            f"stop_rate={stats.get('stop_rate', 0.0):.2f} eps={eps_force:.2f}",
+            f"/{stats.get('funnel_flip', 0)}/{stats.get('funnel_unflip', 0)} "
+            f"dist={stats.get('pool_distinct', 0.0):.2f}"
+            f"/deg={stats.get('pool_degenerate', 0.0):.2f}"
+            f"/marg={stats.get('vote_margin', 0.0):.2f} "
+            f"stop_rate={stats.get('stop_rate', 0.0):.2f} eps={eps_force:.2f}"
+            + (f" clip_prompt={_n_clip}" if _n_clip else "")
+            + (f" selfT={_n_self}" if _n_self else "")
+            + (f" splitF={_n_split}/{_n_split_total}({_split_rate:.2%})"
+               + (f"[{_split_reason_s}]" if _split_reason_s else "")
+               if _n_split else "")
+            + (f" gapT={_n_boundary_gap}" if _n_boundary_gap else "")
+            + (f" decF={_n_decode_fb}" if _n_decode_fb else "")
+            + (f" fmt={_fmt_s}" if _fmt_bad else "")
+            + (f" iCh={int(stats.get('interaction_channel_count', 0))}"
+               f"/iAdv={stats.get('interaction_adv_abs', 0.0):.2f}"
+               f"/iPG={stats.get('interaction_pg_loss', 0.0):+.3f}"
+               if stats.get("interaction_channel_count", 0) else "")
+            + (f" iL=0:{_p0_count}/"
+               f"{'--' if _p0_adv is None else f'{_p0_adv:.2f}'}"
+               f",1:{_p1_count}/"
+               f"{'--' if _p1_adv is None else f'{_p1_adv:.2f}'}"
+               if (_p0_count or _p1_count) else "")
+            + (f" lpF={_n_lp_bad}/{_n_lp_total}({_lp_bad_rate:.2%})"
+               if _n_lp_bad else "")
+            + (f" hop={_hop_s}" if _hop_s else ""),
             flush=True,
         )
         log_data = {
@@ -359,14 +565,47 @@ def main(cfg: DictConfig):
         # + 行为（reward hacking 侦测）+ RACA v2 证据指标（§8），有则上报
         for _mk in ("entropy", "clip_frac", "ratio_mean", "ratio_max", "resp_len",
                     "all_pass_frac", "all_fail_frac", "group_reward_std",
-                    "parse_rate",
+                    "parse_rate", "no_label_rate", "empty_answer_rate",
                     "int_rate", "int_effectiveness", "int_selectivity",
+                    "int_rate_wrong", "int_rate_correct", "int_rate_gap",
+                    "n_primary_wrong", "n_primary_correct",
+                    "n_interact_wrong", "n_interact_correct", "p_primary_rate",
                     "q_forced", "int_critic_share",
                     "forced_rate", "stop_rate", "stop_acc", "exhaust_acc",
                     "gate_blocked",
-                    "funnel_flag", "funnel_corr", "funnel_flip"):
+                    "funnel_flag", "funnel_corr", "funnel_flip", "funnel_unflip",
+                    "pool_votes", "pool_distinct", "pool_degenerate",
+                    "vote_margin",
+                    "solution_pg_loss", "interaction_pg_loss",
+                    "solution_adv_abs", "interaction_adv_abs",
+                    "solution_channel_count", "interaction_channel_count",
+                    "solution_token_count", "interaction_token_count",
+                    "interaction_p0_channel_count", "interaction_p1_channel_count",
+                    "interaction_p0_adv_abs", "interaction_p1_adv_abs"):
             if _mk in stats:
                 log_data[_mk] = stats[_mk]
+        log_data["gate_unlocked"] = getattr(trainer.executor, "n_gate_unlocked", 0)
+        log_data["prompt_clipped"] = _n_clip
+        log_data["self_target"] = _n_self
+        log_data["credit_split_failed"] = _n_split
+        log_data["credit_split_attempted"] = _n_split_total
+        log_data["credit_split_failure_rate"] = _split_rate
+        for _reason, _count in _split_reasons.items():
+            log_data[f"credit_split_reason/{_reason}"] = int(_count)
+        log_data["credit_boundary_gap_tokens"] = _n_boundary_gap
+        log_data["credit_decode_fallback"] = _n_decode_fb
+        log_data["primary_format_valid"] = _fmt_ok
+        log_data["primary_format_total"] = _fmt_total
+        log_data["primary_format_rate"] = _fmt_rate
+        for _fmt_key, _fmt_count in _fmt.items():
+            log_data[f"primary_format/{_fmt_key}"] = int(_fmt_count)
+        log_data["logprob_mismatch"] = _n_lp_bad
+        log_data["logprob_checked"] = _n_lp_total
+        log_data["logprob_mismatch_rate"] = _lp_bad_rate
+        # 跳深分布逐深度上报（键为 int，wandb 需要字符串名）。
+        for _d in (1, 2, 3):
+            log_data[f"hop_depth_{_d}"] = int(_hd.get(_d, 0))
+        log_data["hop3_verifier"] = int(_hd.get("3:verifier", 0))
         if _g_total:
             # Fraction of question-groups that produced a usable advantage. A
             # sustained drop means rollouts are collapsing to identical rewards

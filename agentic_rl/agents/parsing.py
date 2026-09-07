@@ -26,7 +26,16 @@ def parse_interaction(text: str) -> tuple[str, str, str]:
     仅 action ∈ {request, challenge} 且 target 为合法角色时视为发起；
     其余（none/support/解析失败）一律 ("none", "none", "")。
     """
-    block = re.search(r"<interaction>(.*?)</interaction>", text, re.S)
+    # M1 后规范动作在末尾。token credit 也只切末尾完整块，因此解析必须优先读取
+    # **同一个块**；否则多块输出会出现「执行第一个动作、训练最后一个动作」的
+    # 信用错位。对旧数据/非规范输出保留首块 fallback，只用于兼容，不做 token split。
+    trailing = trailing_interaction_span(text)
+    if trailing is not None:
+        block = re.search(
+            r"<interaction>(.*?)</interaction>",
+            text[trailing[0]:trailing[1]], re.S)
+    else:
+        block = re.search(r"<interaction>(.*?)</interaction>", text, re.S)
     if not block:
         return "none", "none", ""
     content = block.group(1)
@@ -49,31 +58,316 @@ def parse_interaction(text: str) -> tuple[str, str, str]:
     return action, target, reason
 
 
+_INTER_BLOCK = re.compile(r"\s*<interaction>.*?</interaction>\s*", re.S)
+
+def trailing_interaction_span(text: str) -> tuple[int, int] | None:
+    """返回末尾完整 ``<interaction>...</interaction>`` 块的字符区间。
+
+    token 级信用路由只能在边界**可证明**时切分：Proposer primary 的解题优势
+    作用于块前 token，交互优势只作用于块内 token。这里选择最后一个完整块，并
+    要求闭标签之后只有空白；正文里引用的示例块、缺闭标签的残块、块后继续输出
+    正文都拒绝切分。起点向左包含紧邻块的空白，使通常的换行也归到 interaction
+    span，减少 tokenizer 在 ``\n<`` 处跨边界合并的概率。
+
+    返回的是 Python slice 风格 ``(start, end)``，其中 ``end == len(text)``；
+    找不到唯一安全的末尾块时返回 ``None``。这不改变 ``parse_interaction`` 的
+    宽容解析语义，只是给训练侧一个更严格的 credit boundary。
+    """
+    close_tag = "</interaction>"
+    close_start = text.rfind(close_tag)
+    if close_start < 0:
+        return None
+    close_end = close_start + len(close_tag)
+    if text[close_end:].strip():
+        return None
+    # 与最后一个闭标签配对的只能是它前面的**最后一个**开标签。若用非贪婪正则
+    # finditer，前面一个未闭合 `<interaction>` 会一路吞到最后闭标签，导致执行和
+    # credit 都落在错误块上。
+    open_tag = "<interaction>"
+    open_start = text.rfind(open_tag, 0, close_start)
+    if open_start < 0:
+        return None
+    inner = text[open_start + len(open_tag):close_start]
+    if open_tag in inner or close_tag in inner:
+        return None
+    start = open_start
+    while start > 0 and text[start - 1].isspace():
+        start -= 1
+    return start, len(text)
+
+
+def interaction_format_status(text: str) -> str:
+    """只读诊断：分类 worker 输出的 interaction 结构，不改变解析语义。"""
+    if trailing_interaction_span(text) is not None:
+        return "complete"
+
+    open_tag, close_tag = "<interaction>", "</interaction>"
+    open_start = text.rfind(open_tag)
+    close_start = text.rfind(close_tag)
+    if open_start < 0 and close_start < 0:
+        return "no_block"
+    if open_start >= 0 and (close_start < 0 or close_start < open_start):
+        return "open_without_close"
+    if open_start < 0:
+        return "close_without_open"
+    close_end = close_start + len(close_tag)
+    if text[close_end:].strip():
+        return "text_after_block"
+    return "malformed"
+
+
+def strip_interaction(text: str, *, trim: bool = True) -> str:
+    """剥掉 `<interaction>` 块——**仅用于把一个角色的输出展示给另一个角色**。
+
+    动机（v3.2 实测）：块的长度固定 68 字符，而 `blackboard.to_text()` 给 critic
+    意见留的窗口只有 80 字符，`request_context` / `proposer_correction_user` 是
+    `MAX_CHANNEL_CHARS`（v3.2 第四轮起 300，第十轮起 600）。块占着窗口 → critic
+    真正报的错传到下游只剩十几个字。M1 把块移到尾部只是让截断先吃正文；要真正腾出
+    信道，必须把块整个拿掉——它对**接收方**零信息量（发起意图已由 `request_context`
+    的 action/reason 显式表达）。
+
+    第十轮补记：块剥掉之后浮上来的下一层浪费是**整段引述本身重复**——实测 310 处
+    「对方内容」里 247 处是同一个 prompt 内已给过的逐字拷贝。所以"块占窗口"只是
+    第一层，"同一段话发两遍"是第二层，两层都得清掉窗口才真正腾出来。
+
+    **绝不能用在 `record()` 存下的 `response` 上**：那是训练目标，与 token_ids /
+    log_probs 逐位对齐，改一个字符就会让 per-token ratio 错位。这里只处理展示副本。
+
+    `trim=False` 供 `data/prepare_sft.py` 清洗 SFT 的 `user` 字段用：那是**已经
+    套好模板**的整段 prompt，再 strip 一次会连模板自带的首尾空白一起改掉。两处
+    共用同一个正则字面量是有意的——RL 侧的 prompt 现在是「模板 + 剥过块的输出」，
+    SFT 的 user 必须落到逐字节相同的形状，否则又是一处静默的训练/推理漂移。
+    """
+    out = _INTER_BLOCK.sub("", text)
+    return out.strip() if trim else out
+
+
+# 无界文本上限（v3.1）。v3 实测：parse 0.95→0.80 后，兜底抽取的 answer 可能
+# 是整段文本，reasoning 缺失时更是直接返回全部输出；两者都会进 responder
+# prompt 与黑板文本，随轮数累积后撑破 max_model_len（step 151 实测 5036>4096）。
+# 另：answer 是投票池的键，长文本 answer 彼此各不相同→各占一票稀释投票。
+# 数学答案（含 LaTeX）的长度上限；超出即视为**这一行不是答案**。
+#
+# v3.2（第六轮）：64 → 192。64 是拍的，实测它偏紧到会毁掉合法答案：
+# ① 模型侧：v2+v3 SFT 的 580 个 proposer turn 里命中 1 次，那一次是
+#    `\begin{pmatrix} 2 & 0 & 7 \\ 3 & 5 & -1 \\ -8 & -2 & 4 \end{pmatrix}`
+#    （68 字，完全正确），被兜底抽成 `'4'` —— 一个正确答案被记成错，且进投票池
+#    占一票。② gold 侧：`math_train_rl` 5265 题有 14 题 gold 超 64（最长 159，
+#    形如 `\left( -\infty, -\frac{1}{2} \right] \cup \left[ \frac{1}{2}, \infty \right)`），
+#    `math_test` 3669 题有 6 题（最长 81）。也就是说这条上限本身就在和数据集矛盾。
+# 192 覆盖全部已观测 gold（159）并留余量；答案长度 p99 = 46，放宽不会改动
+# 99% 的样本。
+#
+# 放宽是安全的，因为 64 从来不是它看上去在防的那道防线：
+# ① 「同行写 `最终答案：4<interaction>...`」由 `_INTER_OPEN` 前瞻挡（见
+#    `parse_reasoning`），而且正则的 `\n` 前瞻已把答案限死在一行内，靠长度去
+#    拦这种垃圾串本来就拦不住——原注释自己写着那种串"长度常不足 64 字符"。
+# ② 「答案后接着展开论述」是它唯一真正针对的情形，实测 580 个 turn 里 0 例。
+#
+# 注意：这个数与 `Blackboard._MAX_ANSWER_CHARS`（展示上限，仍是 64）**职责不同，
+# 不要互相看齐**。这里管「什么算答案」（投票与判分的输入），那里管 prompt 预算
+# （答案列表 × 轮数是乘数项）。但两者的**大小关系**有后果：本轮放宽之前两个数
+# 恰好都是 64，黑板那两处 `a[:64]` 因此永远切不到东西；放宽后它们才真正开始
+# 截断，所以同一轮把那两处改成了带标记的 `clip_text`。
+MAX_ANSWER_CHARS = 192
+MAX_REASONING_CHARS = 1500  # 完整推理保留上限（够容纳正常多步解题）
+
+# ── 信道截断的统一出口（v3.2 第四轮） ────────────────────────────────────
+# 本仓库反复栽在同一类病灶上（到这一轮已第五例：flaw 窗口 80、块未剥、reasoning
+# 前瞻裸 `<`、无标签兜底泄漏、`critic_found_errors` 裸 `<`）。复盘后的结论是：
+# **坏的不是「截断」，是「截断不可见」。** 截断本身必要——prompt 预算有限，
+# `_MAX_FLAW_CHARS` / `MAX_REASONING_CHARS` 都得存在。真正致命的是接收方拿到残
+# 文之后**无法分辨「对方说完了」和「对方还有话被砍了」**，于是照常给出一个自信
+# 的判断：critic 对着截在 `C\sqrt{` 处的 LaTeX 回答"有没有计算错误"，proposer
+# 对着半句话去"修正"。错误由此凭空产生，且全链路无人报错。
+#
+# 所以所有面向**另一个角色**的截断都必须走这里，带一个可见标记。这不是防御性
+# 编程：标记改变的是接收方的可判定性——看到标记它就知道该说"信息不全"而不是
+# "这步是错的"。
+#
+# 刻意不加计数器：`to_text` 每个 turn 被调用多次（controller / critic / verifier
+# / 修正各一次），在里面计数得到的是调用次数而非事件数，是个会误导人的读数。
+# 要量截断发生率就 grep 落盘 prompt 里的这个标记——比计数器更好，因为它还能告诉
+# 你是哪个 turn。`agentic_executor.clip_user` 的 `n_prompt_clipped` 是另一回事：
+# 那里每个 prompt 恰好过一次，计数是准的。
+CLIP_MARK = "…（后文已截断）"
+
+# 展示给另一个角色的自由文本窗口。三处共用同一个数（黑板 `发现问题`、
+# `request_context` 的 `对方内容`、`proposer_correction_user` 的引述），只留一个
+# 量级要记。历史取值理由见 `envs/blackboard.py:_MAX_FLAW_CHARS`。
+#
+# ── v3.2 第十轮：300 → 600 ────────────────────────────────────────────────
+# 实测（v2+v3 SFT 语料 `data/sft_train_v23.jsonl`，218 条 `critic_found_errors`
+# 为真的 critic 输出，剥块后）：中位 267 / p75 341 / p90 494 / p95 559 / max 1791。
+# 完整送达率随窗口：300→63.3%、400→84.9%、500→89.9%、**600→96.3%**、800→98.2%。
+# 600 是"刚好盖过 p90/p95"的位置；再往上每 200 字只买不到 2 个百分点。
+#
+# **预算是从哪来的——这条必须写清，否则下一个读者会以为我们只是把数字调大了。**
+# 同一轮补了 `request_context` 的去重。实测 310 处「对方内容」里 **247 处是同一个
+# prompt 里已经完整给过一遍的逐字重复**（critic 132 / verifier 115），每处白占约
+# 263 字；去掉这 247 份省下约 6.5 万字符，而窗口 300→600 只在 80 条真被截的消息
+# 上各多花约 263 字。**先做减法，加宽才付得起。** 反过来说：只抬窗口不去重，多出
+# 来的预算大部分买的是接收方手里已经有的文字。
+#
+# 一处**已知且被接受**的漂移，写在这里免得以后被当成 bug：`data/replay_v2_prompts.py`
+# 与派生链也用这个常量渲染 SFT 的 `user`，而 `sft_v3_m1` 是按 **300** 派生的数据训
+# 出来的。于是 SFT 教的引述截在 300、RL 给的截在 600。判定可接受的依据：漂的是
+# **长度**不是格式，且 SFT 语料里本来就有 148 条带 `CLIP_MARK` 的样本（两种形态模型
+# 都见过）。**代价是 `parse=` 升级成看盘项**——它若在前 30 步就往下掉，第一嫌疑就是
+# 这条漂移；那时的修法是按 600 重新派生并重跑 SFT（约 57 分钟，会产生新的 KL 锚点，
+# 与 `v32_m1` 不再可比）。
+MAX_CHANNEL_CHARS = 600
+
+
+def clip_text(text: str, limit: int) -> str:
+    """按字符截断并**留下可见标记**。所有跨角色的文本截断都必须走这里。
+
+    标记不占 `limit` 预算（`text[:limit] + 标记`），因此「保证送达 limit 个字符
+    正文」这条语义不因加标记而缩水；多出的十来个字符对 3008 token 的 prompt
+    预算可以忽略。
+    """
+    return text if len(text) <= limit else text[:limit] + CLIP_MARK
+
+
+# 标签的容错写法。抽成常量是为了让 reasoning 的**前瞻**与 answer 的**匹配**用
+# 同一套字面量——两处写歧了会造成「reasoning 吃掉答案段」这种极难发现的错位。
+_RSN_LABEL = r"推理过程[：:]"
+_ANS_LABEL = r"(?:最终答案|Final Answer)[：:]"
+
+# 块的开标签。**必须用它，不能用裸 `<`**（v3.2 第三轮修的实测缺陷）。
+# reasoning 的前瞻原先写 `(?=最终答案[：:]|<|$)`，配 `re.S` + 非贪婪 `.+?`，于是
+# 推理在**第一个 `<`** 处就停——而数学里 `<` 是不等号。实测 v2+v3 的 582 个
+# proposer turn 中 32 个（5.5%）中招，中位丢掉 77% 的推理（411 字 → 83 字），
+# 最坏 316 字只剩 10 字（`首先解第一段：若 x`）。这段残文正是
+# `traces[-1][0]`，会原样进 critic 的 `待审查解法：` 与 verifier 的 `推理：`——
+# 也就是说 critic 有 5.5% 的概率在**审查一个被截在第一个不等号处的片段**，还要
+# 回答"有没有计算错误"。这与 flaw 窗口 80 是同一类病灶（静默的信道截断），且
+# 自 v2（`524ddfa`）就在，与 M1 无关。
+# 换成块的开标签后语义才是原本想表达的那个，且数学文本不可能包含它。
+_INTER_OPEN = r"<interaction"
+
+
 def parse_reasoning(text: str) -> tuple[str, str]:
-    """proposer 输出 → (推理过程, 最终答案)。"""
-    reasoning = re.search(r"推理过程：(.+?)(?=最终答案：|<|$)", text, re.S)
-    answer = re.search(r"最终答案：(.+)", text)
+    """proposer 输出 → (推理过程, 最终答案)。两路返回值均有硬上限。
+
+    v3.2（M1）：`最终答案：` 的正则加了 `(?=<interaction|\\n|$)` 前瞻。M1 把
+    `<interaction>` 块从开头移到了**答案之后**，若模型把块写在同一行
+    （`最终答案：4<interaction>...`），原来的 `(.+)` 会把块吃进答案——长度常
+    不足 64 字符，于是这个带标签的垃圾串会被当成合法答案进投票池，各自占一票。
+    三个分支缺一不可：`\\n` 覆盖块换行写（最常见），`<interaction` 覆盖同行写，
+    `$` 覆盖答案就是输出末尾。注意光写 `$` 不够：未开 re.M 时 `$` 只匹配串尾，
+    非贪婪的 `.+?` 又跨不过换行，会导致整个匹配失败。前瞻用块的**开标签**而
+    非裸 `<`，理由见 `_INTER_OPEN` 的注释（裸 `<` 会撞上不等号，实测截掉 5.5%
+    的 proposer 推理）。
+
+    v3.2（第二轮）：标签容错扩到 **半角冒号 + 英文别名**。这不是防御性编程，
+    是修实测缺陷——SFT 数据里就有 `最终答案: 24`（半角）这种写法，原正则只认
+    全角 `：`，于是整条答案落进「取文中最后一个数字」的兜底，`45,045` 会被抽成
+    `045` 这类假答案进投票池占一票。**静默污染比解析失败更坏**，所以这里放宽。
+    同理只给「答案」加英文别名、不给「推理过程」加：答案解析失败 → 垃圾投票
+    （污染），而推理解析失败 → 整段输出当推理（仅冗长，无害），按同一条原则
+    只在污染侧放宽。`critic_found_errors` 刻意不加英文别名，理由见该函数。
+    """
+    reasoning = re.search(rf"{_RSN_LABEL}(.+?)(?={_ANS_LABEL}|{_INTER_OPEN}|$)", text, re.S)
+    answer = re.search(rf"{_ANS_LABEL}(.+?)(?={_INTER_OPEN}|\n|$)", text)
+    # 兜底路径专用的无块副本。前瞻只在**标签存在**时挡住块；标签缺失时旧代码
+    # 直接 `return text`，块就跟着整段输出被当成推理返回，而这个串正是
+    # `traces[-1][0]`——会原样出现在 critic 的 `待审查解法：` 与 verifier 的
+    # `推理：` 里。实测 SFT 数据 599 个 proposer turn 中 17 个（2.8%）如此；运行
+    # 时只会更多，因为 v3 的 `parse_rate` 一度掉到 0.80，掉的正是标签。
+    # 与前瞻是互补而非重复：前瞻管「有标签的正常输出」，这里管「无标签的兜底」，
+    # 两条路的失效条件不同。先 `strip_interaction` 剥规范块，再按开标签截一刀，
+    # 是为了连**没写闭标签**的残块一起挡掉（那种 `_INTER_BLOCK` 匹配不上）。
+    fallback_src = re.split(_INTER_OPEN, strip_interaction(text), maxsplit=1)[0]
     if not answer:
-        nums = re.findall(r"-?\d+\.?\d*", text)
+        nums = re.findall(r"-?\d+\.?\d*", fallback_src)
         ans_str = nums[-1] if nums else ""
     else:
         ans_str = answer.group(1).strip()
-    return (reasoning.group(1).strip() if reasoning else text, ans_str)
+        # 超过上限 → 这一行不像答案（多半是「最终答案：」后又展开论述），退回
+        # 「取其中最后一个数字」。注意这**不是**解析失败处理：早先的注释写着
+        # "当解析失败处理，而非截断后当真"，但代码做的恰恰是后者的变体——抽出的
+        # 数字仍会当成一张正常选票。留着这个行为是权衡后的结果，不是疏忽：
+        # 改成返回 `""` 看着更诚实，实际更坏——空串是 `_vote_pool` 的合法键，
+        # 加权投票里未被 verifier 验证的候选拿 0.5 先验，于是「两次解析失败」
+        # 权重 2×0.5=1.0 会压过「一次被验证的正确答案」0.9×1=0.9，直接把
+        # 空串投成最终答案。要先给票池加「不可解析候选不计票」才谈得上改这里。
+        if len(ans_str) > MAX_ANSWER_CHARS:
+            nums = re.findall(r"-?\d+\.?\d*", ans_str)
+            ans_str = nums[-1] if nums else ""
+    reasoning_str = reasoning.group(1).strip() if reasoning else fallback_src
+    # 推理超限**带标记**截断。实测 599 个 proposer turn 中 8 个（1.3%）超 1500，
+    # 最长 1753 字；旧代码在第 1500 个字符处硬切，实测切口落在 LaTeX 中间
+    # （`C\sqrt{`）。这个串正是 `traces[-1][0]` → critic 的 `待审查解法：`，于是
+    # critic 要对一段被截在半个公式处的推导回答"有没有计算错误"——它没有任何
+    # 线索知道后面还有 253 字。标记就是那个线索。
+    return (clip_text(reasoning_str, MAX_REASONING_CHARS), ans_str)
+
+
+def has_answer_label(text: str) -> bool:
+    """输出里是否真的写了答案标签（而非靠「取末尾数字」兜底）。
+
+    存在的意义是让 `primary_parsed` 这个格式健康指标与 `parse_reasoning` **共用
+    同一套标签字面量**。此前 executor 里硬编码 `"最终答案：" in out`，只认全角，
+    放宽解析后就会出现「解析成功但指标报格式崩」的自相矛盾读数——而这个指标正是
+    用来判断"reward 高是不是假的"，它自己不准就没有意义。
+    """
+    return bool(re.search(_ANS_LABEL, text))
 
 
 def parse_score(text: str) -> float | None:
-    """verifier 输出 → [0,1] 分数；解析失败返回 None。"""
-    m = re.search(r"分数:\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))", text)
+    """verifier 输出 → [0,1] 分数；解析失败返回 None。
+
+    v3.2：标签容错扩到 `分数：`（全角）与 `Score:`（英文）。原正则只认半角
+    `分数:`，而实测 764 条 verifier SFT turn 里有 15 条整条是英文（`Score: 1.0`），
+    解析失败后 executor 会回落 **0.5 先验**——这不是中性默认，而是把「没验证过」
+    和「验证了但拿不到分」混成同一个值，在 weighted vote 下系统性压制该答案。
+    失败模式是静默污染，故放宽。
+    """
+    m = re.search(r"(?:分数|Score)[：:]\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))", text)
     if not m:
         return None
     return max(0.0, min(1.0, float(m.group(1))))
 
 
 def critic_found_errors(critic_output: str) -> bool:
-    """鲁棒判断 critic 是否报了错（沿用 v1.x Fix 3 的解析逻辑）。"""
+    """鲁棒判断 critic 是否报了错（沿用 v1.x Fix 3 的解析逻辑）。
+
+    **刻意不加英文别名**（与 `parse_reasoning` / `parse_score` 不同）：这里的
+    判据是一对**互补**的启发式——先看有没有「无错误」，再看「错误分析」段是否
+    非空。只给后者加英文别名而前者认不出 "No errors found"，会让每一条英文
+    critic 输出都判成 flag（假阳性），直接污染 `r^critic` 的四格矩阵与 flag→corr
+    漏斗。失败模式在这里是「保守不 flag」（良性），所以宁可失败也不放宽。
+    整条英文的 critic turn 改为在 SFT 派生步剔除（`data/prepare_sft.py`）。
+
+    v3.2（第四轮）：前瞻由裸 `<` 改为 `_INTER_OPEN`。这是裸 `<` 病灶的第五例，
+    写法上和 `parse_reasoning` 那条一模一样（当时只扫了 `parse_reasoning`，漏了
+    这里），但**行为后果与那条完全不同，必须说清，否则会误导下一个人**：
+
+    这里改前改后**判定完全等价**，不是"实测没翻转"而是**结构上不可能翻转**。
+    先说证据：长度 ≤4 的字母表穷举 11110 个串、真实 critic turn 2228 条，两版
+    判定不同的**一个都没有**。再说机制，两条缺一不可：① `.+?` 至少吃 1 个字符，
+    而 `\\s*` 已贪婪吃掉前导空白，所以 `err_text` 恒非空——`bool(err_text)` 这个
+    分支永远为真，前瞻停在哪都不影响它；② 输出里任何位置的「无错误」都被**上面
+    第一个分支**在整段上拦掉了，轮不到截断后的 `err_text` 去判。
+    换言之被裸 `<` 截短的只是 `err_text` 的**长度**，而这个函数只看它空不空。
+
+    （这条更正是**变异测试逼出来的**：原先这里写着"有一条可达的假阴性路径——
+    critic 用尖括号做强调时 err_text 被截成空串"。把修复回滚成裸 `<` 之后，
+    专门为这条路径写的
+    `test_critic_flag_survives_angle_bracket_emphasis` 照样通过——一个抓不到
+    自己那个变异的测试，说明被测的那个失败模式根本不存在。先写测试再回滚验证，
+    比"想一想觉得有道理"可靠得多。）
+
+    所以本次改动的理由**只有一条**：留着它，整个仓库就还有一个裸 `<`，
+    `test_no_bare_lt_lookahead_in_parsers` 那条不变量就立不起来。这一类已经
+    犯了五次，靠记性显然不行，得靠一个会失败的测试；而那个测试要能成立，
+    前提是仓库里一个裸 `<` 都不剩。为一条不变量做的一致性改动是正当的，
+    但它**不是 bug 修复**，不该记进"修了几个缺陷"里。
+    """
     if "无错误" in critic_output or "无错" in critic_output:
         return False
-    err_match = re.search(r"错误分析[：:]\s*(.+?)(?=<|$)", critic_output, re.S)
+    err_match = re.search(rf"错误分析[：:]\s*(.+?)(?={_INTER_OPEN}|$)", critic_output, re.S)
     if err_match:
         err_text = err_match.group(1).strip()
         return bool(err_text) and "无错误" not in err_text and "无错" not in err_text

@@ -54,15 +54,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="checkpoints/sft_v2")
     ap.add_argument("--config", default="configs/llm/qwen3_8b.yaml")
+    ap.add_argument("--model_path", default=None,
+                    help="覆盖 config 里的 model_path（Primus 等平台路径不同时用）")
     ap.add_argument("--n", type=int, default=6, help="抽多少道题（每题 5 个 prompt）")
     ap.add_argument("--max-new", type=int, default=400)
     args = ap.parse_args()
 
-    model_path = None
-    for line in open(args.config):
-        if "model_path" in line:
-            model_path = line.split(":", 1)[1].strip().strip('"').strip("'")
-    assert model_path, f"未能从 {args.config} 解析 model_path"
+    model_path = args.model_path
+    if not model_path:
+        for line in open(args.config):
+            if "model_path" in line:
+                model_path = line.split(":", 1)[1].strip().strip('"').strip("'")
+    assert model_path, f"未能从 {args.config} 解析 model_path（或用 --model_path 指定）"
 
     print(f"加载 base={model_path}\n     sft={args.ckpt}", flush=True)
     model, tokenizer = load_trainable_models(model_path, sft_checkpoint=args.ckpt)

@@ -21,6 +21,7 @@ def main():
     from llm.trainable_llm import load_trainable_models
     from llm.vllm_engine import VLLMInferenceEngine
     from agents.agentic_executor import AgenticExecutor
+    from agents.parsing import parse_interaction
 
     model, tokenizer = load_trainable_models(config["llm"]["model_path"])
 
@@ -53,8 +54,9 @@ def main():
         total_interactions += sum(
             1 for msg in ep["messages"]
             if msg["role_name"] in ("proposer", "critic", "verifier")
-            and "<interaction>" in msg["response"]
-            and "action: none" not in msg["response"]
+            # 与运行时同一把尺子（baseline 的 int_rate 要能和 RL 侧对着看，
+            # 两处各写一套字面量判据就没有可比性）
+            and parse_interaction(msg["response"])[0] != "none"
         )
         print(f"[{i+1}/{len(dataset)}] correct={ep['is_correct']} acc={correct/(i+1):.3f}", flush=True)
 

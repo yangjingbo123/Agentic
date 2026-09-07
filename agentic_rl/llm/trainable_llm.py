@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import torch
 from contextlib import contextmanager
@@ -94,11 +95,16 @@ class RoleModel:
 def load_trainable_models(model_path: str, lora_rank: int = 16, sft_checkpoint: str = None):
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-    # 训练模型固定在 cuda:0，vLLM 使用剩余 GPU，避免显存冲突
+    # 训练模型固定在 cuda:0，vLLM 使用剩余 GPU，避免显存冲突。
+    # flash-attn 非必需：镜像缺包时回退 sdpa（正确性一致，速度略降），
+    # 避免在 Primus 等定制镜像上因 pip 编译 flash-attn 阻塞作业。
+    attn_impl = ("flash_attention_2"
+                 if importlib.util.find_spec("flash_attn") else "sdpa")
+    print(f"[load] attn_implementation = {attn_impl}", flush=True)
     base = AutoModelForCausalLM.from_pretrained(
         model_path, torch_dtype=torch.bfloat16,
         device_map="cuda:0",
-        attn_implementation="flash_attention_2",
+        attn_implementation=attn_impl,
     )
 
     lora_cfg = LoraConfig(

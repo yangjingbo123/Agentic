@@ -12,6 +12,36 @@ import time
 _ADAPTER_NAMES = ("proposer", "controller", "critic", "verifier")
 
 
+class GenerationResult:
+    """向后兼容的三元生成结果，并旁挂只读结束原因元数据。"""
+
+    def __init__(self, text, log_probs, token_ids, finish_reason=None, stop_reason=None):
+        self.text = text
+        self.log_probs = log_probs
+        self.token_ids = token_ids
+        self.finish_reason = finish_reason
+        self.stop_reason = stop_reason
+
+    def __iter__(self):
+        yield self.text
+        yield self.log_probs
+        yield self.token_ids
+
+    def __getitem__(self, index):
+        return (self.text, self.log_probs, self.token_ids)[index]
+
+    def __len__(self):
+        return 3
+
+
+def _generation_result(result):
+    return GenerationResult(
+        result["text"], result["log_probs"], result["token_ids"],
+        finish_reason=result.get("finish_reason"),
+        stop_reason=result.get("stop_reason"),
+    )
+
+
 class VLLMInferenceEngine:
     """Parent-side client for a vLLM worker pinned to a separate CUDA process."""
 
@@ -25,6 +55,8 @@ class VLLMInferenceEngine:
         tensor_parallel_size: int = 1,
         startup_timeout_s: float = 300,
         rpc_timeout_s: float = 600,
+        vllm_use_v1: str = "0",
+        enforce_eager: bool = True,
     ):
         if not vllm_gpu:
             raise ValueError("vllm_gpu must be set for the subprocess vLLM worker")
@@ -36,6 +68,8 @@ class VLLMInferenceEngine:
         self.vllm_gpu = str(vllm_gpu)
         self.startup_timeout_s = startup_timeout_s
         self.rpc_timeout_s = rpc_timeout_s
+        self.vllm_use_v1 = str(vllm_use_v1)
+        self.enforce_eager = bool(enforce_eager)
         self._lock = threading.Lock()
         self._next_request_id = 0
         self._closed = False
@@ -61,7 +95,16 @@ class VLLMInferenceEngine:
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = self.vllm_gpu
-        env["VLLM_USE_V1"] = "0"
+        # V0/V1 交由 worker 自己根据 --vllm-use-v1 设置（auto 时不设）；
+        # 这里先清掉继承值，避免外层 shell 的 VLLM_USE_V1 默默生效。
+        env.pop("VLLM_USE_V1", None)
+        # V1 引擎的 ZMQ IPC socket 与 Triton JIT 产物都必须落在**本地**文件系统：
+        # 前者需 socket 语义，后者要 gcc 编译并 dlopen .so。若 TMPDIR/HOME 被指向
+        # OSS/NAS（平台常见），会分别报 ZMQError: Input/output error 与 gcc
+        # non-zero exit。这里不跟随 TMPDIR，未显式指定时钉在 /tmp。
+        env.setdefault("VLLM_RPC_BASE_PATH", "/tmp")
+        env.setdefault("TRITON_CACHE_DIR", "/tmp/triton-cache")
+        os.makedirs(env["TRITON_CACHE_DIR"], exist_ok=True)
         env["PYTHONPATH"] = project_root + os.pathsep + env.get("PYTHONPATH", "")
 
         cmd = [
@@ -85,7 +128,12 @@ class VLLMInferenceEngine:
             str(max_model_len),
             "--tensor-parallel-size",
             str(tensor_parallel_size),
+            "--vllm-use-v1",
+            self.vllm_use_v1,
         ]
+        if not self.enforce_eager:
+            # 开启 CUDA graph：V1 下小 batch 场景提速明显
+            cmd.append("--no-enforce-eager")
         self._proc = subprocess.Popen(cmd, cwd=project_root, env=env, text=True)
         self._worker_cmd = cmd
         self._sock = None
@@ -156,7 +204,7 @@ class VLLMInferenceEngine:
 
     def generate(self, role: str, prompt: str, temperature: float = 1.0) -> tuple[str, list[float], list[int]]:
         result = self._request("generate", role=role, prompt=prompt, temperature=temperature)
-        return result["text"], result["log_probs"], result["token_ids"]
+        return _generation_result(result)
 
     def generate_batch(self, requests: list[dict]) -> list[tuple[str, list[float], list[int]]]:
         """requests: list of {"role": str, "prompt": str, "temperature": float}.
@@ -164,7 +212,7 @@ class VLLMInferenceEngine:
         Pass temperature=0.0 for greedy eval decoding.
         Returns list in same order."""
         results = self._request("generate_batch", requests=requests)
-        return [(r["text"], r["log_probs"], r["token_ids"]) for r in results]
+        return [_generation_result(r) for r in results]
 
     def sync_lora(self, model):
         """Save adapters in the parent process, then hand the manifest to the worker."""

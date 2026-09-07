@@ -23,7 +23,7 @@
 #   若镜像无 flash-attn：删 llm/trainable_llm.py 的 attn_implementation 参数（退化 sdpa）。
 #
 # 首次上线建议先提交一个 SMOKE=1 的验证作业（CPU 自检 + 2 步训练即退出），
-# 通过后再提正式 200 步作业 —— 同 med_rl 的 verify → train 两段式惯例。
+# 通过后再提正式作业；本轮默认 80 步并同步评测 MATH-1000 + AIME-150。
 
 set -xeuo pipefail
 
@@ -122,7 +122,7 @@ echo "SFT_CKPT   = ${SFT_CKPT}"
 # ---------------------------------------------------------------------------
 # 输出 / 临时目录：全部落持久化挂载
 # ---------------------------------------------------------------------------
-EXP_NAME=${EXP_NAME:-v3_primus}
+EXP_NAME=${EXP_NAME:-v33_raca_aime150_balanced}
 SAVE_ROOT="${PRIMUS_SAVE_CHECKPOINT_DIR:-$(pwd)/checkpoints}"
 CKPT_DIR="${SAVE_ROOT}/rl-${EXP_NAME}"
 mkdir -p "${CKPT_DIR}"
@@ -167,11 +167,11 @@ python test_grader.py
 # ---------------------------------------------------------------------------
 # 训练。SMOKE=1 → 2 步小跑验证保存/续训链路（不评估收敛性）
 # ---------------------------------------------------------------------------
-MAX_STEPS=${MAX_STEPS:-200}
+MAX_STEPS=${MAX_STEPS:-80}
 EXTRA_ARGS=""
 if [[ "${SMOKE:-0}" == "1" ]]; then
     MAX_STEPS=2
-    EXTRA_ARGS="agentic.eval_samples=20 agentic.val_before_train=false"
+    EXTRA_ARGS="agentic.eval_samples=20 agentic.eval_aime_samples=10 agentic.val_before_train=false"
     echo "== SMOKE 模式：max_steps=2，验证 rollout/更新/保存链路 =="
 fi
 

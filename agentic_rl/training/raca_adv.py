@@ -85,7 +85,12 @@ def token_credit_components(advantage_spec, interaction_span, original_positions
     return components
 
 
-def compute_raca_advantages(turn_data_list: list, delta: float = 1e-4) -> list:
+def compute_raca_advantages(
+    turn_data_list: list,
+    delta: float = 1e-4,
+    balance_interaction_layers: bool = False,
+    interaction_balance_cap: float = 2.0,
+) -> list:
     """对同一问题的 N 个 rollout 计算逐 turn 优势。
 
     turn_data_list: N 个 raca_turn_data（{tid: {role, round, sigma,
@@ -157,21 +162,49 @@ def compute_raca_advantages(turn_data_list: list, delta: float = 1e-4) -> list:
                 anchor_groups[key].append(
                     (ep_idx, tid, r, dedup_key, credit_name, weight))
 
-    # (ep_idx, tid) → {credit_name: weighted standardized advantage}
-    step_channels: dict = defaultdict(dict)
+    # 先计算可用 anchor 的统计量。interaction 的 p=0/1 两层即使各自 z-score，
+    # 最终仍按 turn 数累积；模型变强后多数的 p=1 层会压过 p=0 层。因此可选地
+    # 把同一 sigma 下两个有效层的总权重拉到相近水平。
+    group_stats = {}
     for key, entries in anchor_groups.items():
-        # 代表样本：同 (episode, round, role, is_response, raw reward) 只保留一个。
         reps = {}
-        for ep_idx, tid, r, dk, _name, _weight in entries:
+        for _ep_idx, _tid, r, dk, _name, _weight in entries:
             reps.setdefault(dk, r)
         rep_rewards = list(reps.values())
         if len(rep_rewards) < 2:
             continue
         mu, sig = _mean_std(rep_rewards)
-        if sig <= delta:
+        if sig > delta:
+            group_stats[key] = (mu, sig, len(entries))
+
+    layer_weights = {key: 1.0 for key in group_stats}
+    if balance_interaction_layers:
+        cap = max(float(interaction_balance_cap), 1.0)
+        by_context = defaultdict(list)
+        for key, (_mu, _sig, count) in group_stats.items():
+            role, sigma, is_resp, channel, layer_key = key
+            if role == "proposer" and not is_resp and channel == "int":
+                by_context[(role, sigma, is_resp, channel)].append(
+                    (key, count, layer_key))
+        for layers in by_context.values():
+            # 只有 p=0 与 p=1 都提供有效比较信号时才平衡；单层存在时保持 1.0。
+            if len({layer_key for _key, _count, layer_key in layers}) < 2:
+                continue
+            target = sum(count for _key, count, _layer in layers) / len(layers)
+            for key, count, _layer in layers:
+                raw = target / max(count, 1)
+                layer_weights[key] = min(cap, max(1.0 / cap, raw))
+
+    # (ep_idx, tid) → {credit_name: weighted standardized advantage}
+    step_channels: dict = defaultdict(dict)
+    for key, entries in anchor_groups.items():
+        if key not in group_stats:
             continue
+        mu, sig, _count = group_stats[key]
+        layer_weight = layer_weights.get(key, 1.0)
         for ep_idx, tid, r, _dk, credit_name, weight in entries:
-            value = weight * ((r - mu) / sig)   # lambda 在 z-score **之后**生效
+            # lambda 与 layer balance 都在 z-score **之后**生效。
+            value = weight * layer_weight * ((r - mu) / sig)
             slot = step_channels[(ep_idx, tid)]
             slot[credit_name] = slot.get(credit_name, 0.0) + value
 

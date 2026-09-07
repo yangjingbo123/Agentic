@@ -34,6 +34,10 @@ class GRPOAgenticTrainer:
         self.ppo_epochs    = config.get("ppo_epochs", 1)
         self.raca_delta    = config.get("raca_delta", 1e-4)   # variance floor
         self.kl_coef       = config.get("kl_coef", 0.04)      # KL penalty coefficient
+        self.balance_interaction_layers = bool(
+            config.get("balance_interaction_layers", False))
+        self.interaction_balance_cap = float(
+            config.get("interaction_balance_cap", 2.0))
 
     # ── Rollout 行为/信号质量指标：委托给零依赖的 training/metrics.py ──────
 
@@ -79,6 +83,8 @@ class GRPOAgenticTrainer:
         all_per_turn_adv: list = []
         n_groups      = 0   # question-groups eligible for advantage computation
         n_groups_kept = 0   # ...that produced at least one usable advantage
+        int_layer_count = {0: 0, 1: 0}
+        int_layer_abs = {0: 0.0, 1: 0.0}
 
         # v2 证据指标：对全部 rollout 统计（含被优势过滤掉的 episode）
         int_metrics = self._interaction_metrics(batch_rollouts)
@@ -90,15 +96,32 @@ class GRPOAgenticTrainer:
             per_ep_adv = compute_raca_advantages(
                 [ep.get("raca_turn_data", {}) for ep in episode_group],
                 delta=self.raca_delta,
+                balance_interaction_layers=self.balance_interaction_layers,
+                interaction_balance_cap=self.interaction_balance_cap,
             )
             kept = 0
             for ep, adv in zip(episode_group, per_ep_adv):
+                td = ep.get("raca_turn_data", {})
+                for tid, spec in adv.items():
+                    if not isinstance(spec, dict) or "interaction" not in spec:
+                        continue
+                    layer = int(td.get(tid, {}).get("layer_key", 0))
+                    if layer in int_layer_count:
+                        int_layer_count[layer] += 1
+                        int_layer_abs[layer] += abs(float(spec["interaction"]))
                 if adv:   # skip episodes where no turn got an advantage
                     all_episodes.append(ep)
                     all_per_turn_adv.append(adv)
                     kept += 1
             if kept:
                 n_groups_kept += 1
+
+        for layer in (0, 1):
+            count = int_layer_count[layer]
+            int_metrics[f"interaction_p{layer}_channel_count"] = count
+            if count:
+                int_metrics[f"interaction_p{layer}_adv_abs"] = (
+                    int_layer_abs[layer] / count)
 
         if not all_episodes:
             if self.vllm_engine is not None:

@@ -39,6 +39,19 @@ def rollout_metrics(batch_rollouts: list) -> dict:
         # 它与 `accuracy` **不是一回事**：那个是 episode 投票后的结果，这个是逐轮
         # proposer 首答的正确率，两者能差十几个点，别混着读。
         out["p_primary_rate"] = float(np.mean(ps))
+        wrong_u = [float(m["u"]) for m in rounds if not m["p_primary"]]
+        correct_u = [float(m["u"]) for m in rounds if m["p_primary"]]
+        out["n_primary_wrong"] = len(wrong_u)
+        out["n_primary_correct"] = len(correct_u)
+        out["n_interact_wrong"] = int(sum(wrong_u))
+        out["n_interact_correct"] = int(sum(correct_u))
+        if wrong_u:
+            out["int_rate_wrong"] = float(np.mean(wrong_u))
+        if correct_u:
+            out["int_rate_correct"] = float(np.mean(correct_u))
+        if wrong_u and correct_u:
+            out["int_rate_gap"] = (
+                out["int_rate_wrong"] - out["int_rate_correct"])
         out["forced_rate"]  = float(np.mean([m["forced"] for m in rounds]))
         out["gate_blocked"] = int(sum(m["gate_blocked"] for m in rounds))
         # 交互有效率：P(轮末修对 | 自发求助且 primary 错)（即 q_spont）

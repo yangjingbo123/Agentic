@@ -7,7 +7,7 @@ max_rounds: 4
 max_interactions: 3
 max_grad_norm: 1.0
 kl_coef: 0.04  # KL penalty coefficient (reference = frozen SFT snapshot, ref_* adapters)
-max_steps: 200
+max_steps: 80
 save_freq: 20
 eval_freq: 10
 # 尺子精度（不是实验变量，是测量协议默认值，应对所有实验生效）：
@@ -17,6 +17,8 @@ eval_freq: 10
 # 仍全在测试集内，不碰训练集）后配末 5 点平均，2·se 降到 1.43 点。
 # 代价：单次 eval 慢 3.3 倍。历史 n=300 数字由 train.py 的 acc300 切片对齐。
 eval_samples: 1000
+# AIME 2022--2026 全量 150 题，与 MATH-1000 在每个 eval step 同时评测。
+eval_aime_samples: 150
 # RACA controller reward
 ctrl_alpha: 0.3
 ctrl_beta: 0.2
@@ -79,6 +81,16 @@ lambda_int: 1.0
 # true：解题与交互优势按各自 token span 路由；false：回退旧的整 turn 标量优势。
 # 保留该开关用于严格消融，正式配置默认启用。
 token_credit: true
+# 格式异常不能逃避已有 interaction credit：
+# - 有 <interaction> 但未闭合：开标签到输出末尾继续接收 A_int；
+# - 完全无块：优先把 A_int 路由到 EOS/special token，否则路由到最后 N 个可见 token。
+# 这不是新奖励，只是保证现有 interaction advantage 总有可归因的动作位置。
+malformed_interaction_credit: true
+malformed_tail_tokens: 4
+# p_primary=0/1 的 interaction anchor 各自 z-score 后，按实际 turn 数平衡总梯度，
+# 避免模型变强后「答对层」样本数量压过「答错层」、把策略整体推向 action:none。
+balance_interaction_layers: true
+interaction_balance_cap: 2.0
 # 每轮交互链响应跳数上限；0 = 消融A（完全禁用交互）。
 # v3.2 第十轮 2 → 3。**2 不是"给少了"，是被机械硬触发吃满了**：标准路径
 # proposer 出解 → hop1 critic 审查 → hop2 critic 标错硬触发 proposer 修正

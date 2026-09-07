@@ -84,11 +84,55 @@ def prepare_math(levels=(3, 4, 5)):
 
 
 def prepare_aime():
-    """AIME 2024/2025，共90题，全部作为测试集"""
-    ds = load_dataset("AI-MO/aimo-validation-aime")
-    data = [{"question": item["problem"], "answer": str(item["answer"])}
-            for item in ds["train"]]
-    save_jsonl(data, "data/aime_test.jsonl")
+    """AIME I/II 2022--2026，共150题，全部作为测试集。
+
+    2022--2024 使用 AI-MO validation 集；2025/2026 使用 Math-AI 发布集。
+    revision 与 data/AIME_SOURCES.md 对齐，避免上游更新造成静默漂移。
+    """
+    specs = [
+        ("AI-MO/aimo-validation-aime", "train",
+         "13f9e12f613e720c2a2b2f345dd04b998a29494d", None),
+        ("math-ai/aime25", "test",
+         "563bb8404243c5f09de6ec262f2db674fe5bce9b", 2025),
+        ("math-ai/aime26", "test",
+         "79037aebdb6580008fb960d17cb21fd3099083e3", 2026),
+    ]
+    all_data = []
+    for dataset_name, split, revision, fixed_year in specs:
+        ds = load_dataset(dataset_name, revision=revision)[split]
+        part = []
+        for item in ds:
+            if fixed_year is None:
+                m = re.search(
+                    r"/(20\d{2})_AIME_(I|II)_Problems/Problem_(\d+)",
+                    item["url"],
+                )
+                if not m:
+                    raise ValueError(f"无法从 URL 解析 AIME 元数据: {item['url']}")
+                year, exam, problem = int(m.group(1)), m.group(2), int(m.group(3))
+            else:
+                idx = int(item["id"])
+                # aime25 id=0..29；aime26 id=1..30。
+                zero = idx if fixed_year == 2025 else idx - 1
+                year = fixed_year
+                exam = "I" if zero < 15 else "II"
+                problem = zero + 1 if zero < 15 else zero - 14
+            part.append({
+                "question": item["problem"],
+                "answer": str(item["answer"]).zfill(3),
+                "year": year,
+                "exam": exam,
+                "problem": problem,
+                "source": dataset_name,
+                "source_revision": revision,
+            })
+        part.sort(key=lambda x: (x["year"], x["exam"], x["problem"]))
+        save_jsonl(part, f"data/aime_{fixed_year or '2022_2024'}.jsonl")
+        all_data.extend(part)
+
+    if len(all_data) != 150 or len({x["question"] for x in all_data}) != 150:
+        raise ValueError("AIME 2022--2026 应恰好包含 150 道唯一题目")
+    save_jsonl(all_data, "data/aime_2022_2026.jsonl")
 
 
 if __name__ == "__main__":
@@ -96,7 +140,6 @@ if __name__ == "__main__":
     prepare_gsm8k()
     print("Preparing MATH Level 3-5...")
     prepare_math()
-    print("Preparing AIME 2024/2025...")
+    print("Preparing AIME 2022--2026...")
     prepare_aime()
     print("Done.")
-

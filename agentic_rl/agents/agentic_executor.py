@@ -64,6 +64,12 @@ class AgenticExecutor:
         # 新版将 proposer 的解题/交互优势路由到各自 token span；关闭时回退到
         # 历史的整 turn 标量优势，便于做严格消融和紧急回滚。
         self.token_credit = config.get("token_credit", True)
+        # 格式异常时不新增奖励，只给现有 A_int 找一个可归因的动作位置：残缺块
+        # 从 <interaction> 到末尾；完全无块时优先 EOS，否则末尾 N 个可见 token。
+        self.malformed_interaction_credit = config.get(
+            "malformed_interaction_credit", True)
+        self.malformed_tail_tokens = max(
+            1, int(config.get("malformed_tail_tokens", 4)))
         # ── prompt 长度保险（v3.1） ────────────────────────────────────────
         # v3 实测 step 151：decoder prompt 5036 > max_model_len 4096 直接崩作业。
         # 已在 parsing/blackboard 侧堵住已知无界点，但任何嵌入自由文本的 prompt
@@ -202,6 +208,7 @@ class AgenticExecutor:
                 # interaction 标签时，整段可见文本都属于 solution。
                 if open_start >= 0:
                     boundary_char = open_start
+                    interaction_available = self.malformed_interaction_credit
                 elif close_start >= 0:
                     boundary_char = close_start
                 else:
@@ -283,9 +290,22 @@ class AgenticExecutor:
                         last_good_k, last_good_text = k, prefix
                 return None, None, 0, None, "decode_boundary_missing"
 
-            # 没有任何 interaction 标签时，无需做字符边界搜索：所有可见 token
-            # 都可安全接收 solution credit。
+            # 完全无 interaction 块：开启兼容 credit 时，把“不继续生成结构块”的
+            # 动作归因到 EOS/special token；若 vLLM 不返回 EOS，则退化到末尾 N 个
+            # 可见 token。否则保持旧行为，仅训练 solution。
             if not interaction_available and boundary_char >= len(text):
+                if self.malformed_interaction_credit and ids:
+                    if visible_end < len(ids):
+                        tail_start, tail_end = visible_end, len(ids)
+                    else:
+                        tail_end = visible_end
+                        tail_start = max(0, tail_end - self.malformed_tail_tokens)
+                    spans = {}
+                    if tail_start > 0:
+                        spans["solution"] = (0, tail_start)
+                    if tail_start < tail_end:
+                        spans["interaction"] = (tail_start, tail_end)
+                    return spans, None, 0, "malformed_tail"
                 spans = {"solution": (0, visible_end)} if visible_end else {}
                 return spans, format_error, 0, "solution_only"
 

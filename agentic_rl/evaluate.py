@@ -125,54 +125,143 @@ def evaluate(executor: AgenticExecutor, dataset: list) -> dict:
     }
 
 
-def main():
-    # yaml / vLLM 都只在真跑评测时才需要；留在模块顶层会让这个文件在无重依赖的
-    # 环境里 import 不进来，evaluate() 的指标逻辑也就没法进纯 CPU 测试。
-    import yaml
+def per_item_rows(dataset: list, episodes: list, suite: str) -> list:
+    """生成可复查的逐题结果；不保存完整 prompt/trajectory，控制输出体积。"""
+    rows = []
+    for item, ep in zip(dataset, episodes):
+        row = {
+            "suite": suite,
+            "question": item["question"],
+            "gold": item["answer"],
+            "prediction": ep.get("final_answer", ""),
+            "is_correct": bool(ep.get("is_correct", False)),
+            "n_turns": len(ep.get("raca_turn_data", {})),
+        }
+        for key in ("year", "exam", "problem", "level", "source"):
+            if key in item:
+                row[key] = item[key]
+        rows.append(row)
+    return rows
 
+
+def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config",     default="configs/default.yaml")
-    parser.add_argument("--checkpoint", default="checkpoints")
-    parser.add_argument("--split",      default="test", choices=["train", "test"])
+    parser.add_argument("--config", default="configs/config.yaml")
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--data", default=None,
+                        help="直接指定 JSONL；优先于 --suite")
+    parser.add_argument("--suite", default="math_test",
+                        choices=["math_train", "math_test", "math_l3", "math_l4",
+                                 "math_l5", "aime"])
     parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=128,
+                        help="每次送入 executor 的题目数，避免全量评测 RPC 过大")
+    parser.add_argument("--output", default=None,
+                        help="逐题结果 JSONL；默认 results/<suite>.jsonl")
     args = parser.parse_args()
+
+    # 重依赖只在真跑评测时导入；--help 不要求本地已安装运行时依赖。
+    import os
+    import yaml
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
+    # configs/config.yaml 是 Hydra defaults，需要补读实际子配置；旧的完整 YAML 仍兼容。
+    if "llm" not in config or "agentic" not in config or "data" not in config:
+        with open("configs/llm/qwen3_8b.yaml") as f:
+            config["llm"] = yaml.safe_load(f)
+        with open("configs/agentic/default.yaml") as f:
+            config["agentic"] = yaml.safe_load(f)
+        with open("configs/data/math.yaml") as f:
+            config["data"] = yaml.safe_load(f)
 
-    data_path = config["data"][f"{args.split}_path"]
+    if args.data:
+        data_path = args.data
+    elif args.suite == "math_train":
+        data_path = config["data"]["train_path"]
+    elif args.suite == "aime":
+        data_path = config["data"]["aime_path"]
+    else:
+        data_path = config["data"]["test_path"]
+
     with open(data_path) as f:
         dataset = [json.loads(line) for line in f]
+    level_map = {"math_l3": "Level 3", "math_l4": "Level 4", "math_l5": "Level 5"}
+    if args.suite in level_map:
+        dataset = [item for item in dataset if item.get("level") == level_map[args.suite]]
     if args.max_samples:
         dataset = dataset[:args.max_samples]
 
     model, tokenizer = load_finetuned_models(
         config["llm"]["model_path"], args.checkpoint
     )
-    # vLLM 引擎必须真起一个：`run_episodes_batch` 第一行就 `raise RuntimeError`
-    # （no_vllm 路径在 v2 已移除），此前这里传 None，脚本跑第一条就崩——也就是
-    # 说这个离线评测入口整个是死的。起法与 evaluate_baseline.py 保持一致。
     from llm.vllm_engine import VLLMInferenceEngine
+    visible = [x.strip() for x in os.environ.get(
+        "CUDA_VISIBLE_DEVICES", "").split(",") if x.strip()]
+    slot = int(config["agentic"].get("vllm_gpu_slot", 1))
+    if visible and slot >= len(visible):
+        raise ValueError(
+            f"vllm_gpu_slot={slot}, but CUDA_VISIBLE_DEVICES has {len(visible)} entries")
+    vllm_gpu = visible[slot] if visible else str(slot)
     print("Initializing vLLM engine...", flush=True)
     vllm_engine = VLLMInferenceEngine(
         config["llm"]["model_path"],
         max_tokens=config["agentic"].get("max_tokens", 512),
-        gpu_memory_utilization=0.45,
+        gpu_memory_utilization=config["agentic"].get(
+            "vllm_gpu_memory_utilization", 0.45),
+        max_model_len=config["agentic"].get("vllm_max_model_len", 4096),
+        vllm_use_v1=str(config["agentic"].get("vllm_use_v1", "0")),
+        enforce_eager=bool(config["agentic"].get("vllm_enforce_eager", True)),
+        vllm_gpu=vllm_gpu,
     )
+    vllm_engine.sync_lora(model)
     print("vLLM ready.", flush=True)
     executor = AgenticExecutor(model, tokenizer, config.get("agentic", {}),
                                vllm_engine=vllm_engine, eval_mode=True)
 
-    print(f"Evaluating on {len(dataset)} samples ({args.split})...")
-    results = evaluate(executor, dataset)
+    print(f"Evaluating {args.suite} on {len(dataset)} samples from {data_path}...", flush=True)
+    episodes = []
+    batch_size = max(1, int(args.batch_size))
+    for start in range(0, len(dataset), batch_size):
+        part = dataset[start:start + batch_size]
+        episodes.extend(executor.run_episodes_batch(
+            [item["question"] for item in part],
+            [item["answer"] for item in part],
+        ))
+        print(f"  [eval] {min(start + batch_size, len(dataset))}/{len(dataset)}",
+              flush=True)
 
-    print(f"Accuracy:             {results['accuracy']:.4f} ({int(results['accuracy']*results['n'])}/{results['n']})")
+    class ReplayExecutor:
+        def __init__(self, values, source):
+            self._values = iter(values)
+            self._critic_found_errors = source._critic_found_errors
+        def run_episode(self, _q, _a):
+            return next(self._values)
+
+    results = evaluate(ReplayExecutor(episodes, executor), dataset)
+    output = args.output or os.path.join("results", f"{args.suite}.jsonl")
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    with open(output, "w", encoding="utf-8") as f:
+        for row in per_item_rows(dataset, episodes, args.suite):
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    print(f"Accuracy:             {results['accuracy']:.4f} "
+          f"({int(results['accuracy']*results['n'])}/{results['n']})")
     print(f"Avg turns:            {results['avg_turns']:.2f}")
     print(f"Interaction rate:     {results['interaction_rate']:.2f}")
     print(f"Proposer accuracy:    {results['proposer_accuracy']:.4f}")
-    print(f"Critic precision:     {results['critic_precision']:.4f}  (flag rate: {results['critic_flag_rate']:.4f})")
+    print(f"Critic precision:     {results['critic_precision']:.4f}  "
+          f"(flag rate: {results['critic_flag_rate']:.4f})")
     print(f"Verifier consistency: {results['verifier_consistency']:.4f}"
           f"  (未给分 {results['verifier_unparsed']} turn，未计入分母)")
+    if args.suite == "aime":
+        for year in sorted({item.get("year") for item in dataset if item.get("year")}):
+            pairs = [(item, ep) for item, ep in zip(dataset, episodes)
+                     if item.get("year") == year]
+            yc = sum(bool(ep.get("is_correct")) for _item, ep in pairs)
+            print(f"AIME {year}:            {yc}/{len(pairs)} "
+                  f"({yc/max(len(pairs), 1):.4f})")
+    print(f"Predictions:          {output}")
 
 
 if __name__ == "__main__":

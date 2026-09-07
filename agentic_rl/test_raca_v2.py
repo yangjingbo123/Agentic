@@ -850,6 +850,33 @@ def test_structured_proposer_advantages_do_not_cancel_before_token_routing():
     assert set(adv[2][1]) == {"solution", "interaction"}
 
 
+def test_interaction_layer_balance_equalizes_total_mass_without_flipping_signs():
+    """p=0/1 层样本数失衡时，平衡总量但保持各层内部优劣方向。"""
+    def turn(r_int, p_t):
+        v = mk_turn("proposer", 0, "verify", False, r_int)
+        v.update({"r_prop": 0.0, "r_int": r_int, "r_int_w": r_int,
+                  "lambda_int": 1.0, "layer_key": p_t, "token_credit": True})
+        return {1: v}
+
+    # p=1 层 6 条、p=0 层 2 条；两层都各自包含正负比较信号。
+    eps = [turn(0.0 if i < 3 else -0.05, 1) for i in range(6)] + [
+        turn(0.30, 0), turn(-0.10, 0)]
+    raw = compute_raca_advantages(eps, balance_interaction_layers=False)
+    balanced = compute_raca_advantages(
+        eps, balance_interaction_layers=True, interaction_balance_cap=2.0)
+
+    def mass(values, indices):
+        return sum(abs(values[i][1]["interaction"]) for i in indices)
+
+    raw_p1, raw_p0 = mass(raw, range(6)), mass(raw, range(6, 8))
+    bal_p1, bal_p0 = mass(balanced, range(6)), mass(balanced, range(6, 8))
+    assert raw_p1 > raw_p0, "未平衡时多数层总梯度应该更大"
+    assert approx(bal_p1, bal_p0), (bal_p1, bal_p0)
+    for i in range(8):
+        assert (raw[i][1]["interaction"] > 0) == \
+               (balanced[i][1]["interaction"] > 0), "层平衡改变了层内排序方向"
+
+
 def test_forced_turn_exits_int_advantage_but_keeps_prop_advantage():
     """forced proposer 不进入 int anchor group，但仍然正常进入 r_prop 通道。
 
@@ -1151,7 +1178,7 @@ def test_executor_records_exact_interaction_token_boundary():
     assert eos_msg["interaction_span"][1] == len(response)
     assert len(eos_msg["response_ids"]) == len(response) + 1
 
-    # 无完整末尾块：interaction 缺席并计数，但 solution 仍继续训练。
+    # 完全无块：现有 A_int 路由到末尾 N 个 token，不能再靠省略结构逃避交互梯度。
     bad_script = {
         "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>",
                        "<meta-plan>\ndecision: stop\nreason: r\n</meta-plan>"],
@@ -1161,18 +1188,50 @@ def test_executor_records_exact_interaction_token_boundary():
     bad_ex = _mk_executor(CharEngine(bad_script), stop_gate=False, max_rounds=2)
     bad = bad_ex.run_episodes_batch(["1+1=?"], ["2"])[0]
     bad_primary = [m for m in bad["messages"] if m["role_name"] == "proposer"][0]
-    assert bad_primary["interaction_span"] is None
-    assert bad_primary["interaction_span_error"] == "no_close_tag"
+    n_bad = len(bad_primary["response_ids"])
+    assert bad_primary["interaction_span"] == (n_bad - 4, n_bad)
+    assert "interaction_span_error" not in bad_primary
     assert bad_primary["credit_spans"] == {
-        "solution": (0, len(bad_primary["response_ids"]))}, \
-        "缺 interaction 标签时 solution credit 没有保留"
-    assert bad_ex.n_credit_split_failed == 1
-    assert bad_ex.n_credit_split_failures == {"no_close_tag": 1}
+        "solution": (0, n_bad - 4), "interaction": (n_bad - 4, n_bad)}
+    assert bad_ex.n_credit_split_failed == 0
     from training.raca_adv import token_credit_components
     parts = token_credit_components(
         {"solution": 1.0, "interaction": -1.0},
         bad_primary["credit_spans"], range(len(bad_primary["response_ids"])))
-    assert [name for name, _, _ in parts] == ["solution"]
+    assert [name for name, _, _ in parts] == ["solution", "interaction"]
+
+    # 有 EOS/special token 时优先只把 A_int 放到 EOS，不覆盖正常答案尾部。
+    no_block_text = "推理过程：1+1=2\n最终答案：2"
+    eos_no_block = {
+        "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>"],
+        "proposer": [no_block_text], "critic": [], "verifier": [],
+    }
+    eos_no_block_ex = _mk_executor(
+        SpecialEngine(eos_no_block), tokenizer=SpecialTokenizer(),
+        stop_gate=False, max_rounds=1, max_hops=0)
+    eos_no_block_ep = eos_no_block_ex.run_episodes_batch(["1+1=?"], ["2"])[0]
+    eos_no_block_msg = next(
+        m for m in eos_no_block_ep["messages"] if m["role_name"] == "proposer")
+    assert eos_no_block_msg["credit_spans"] == {
+        "solution": (0, len(no_block_text)),
+        "interaction": (len(no_block_text), len(no_block_text) + 1),
+    }
+
+    # 消融开关关闭时保持旧行为：只留 solution，并记录 interaction 缺失。
+    old_ex = _mk_executor(
+        CharEngine({
+            "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>",
+                           "<meta-plan>\ndecision: stop\nreason: r\n</meta-plan>"],
+            "proposer": ["推理过程：1+1=2\n最终答案：2"],
+            "critic": [], "verifier": [],
+        }),
+        stop_gate=False, max_rounds=2, malformed_interaction_credit=False)
+    old_ep = old_ex.run_episodes_batch(["1+1=?"], ["2"])[0]
+    old_msg = next(m for m in old_ep["messages"] if m["role_name"] == "proposer")
+    assert old_msg["interaction_span"] is None
+    assert old_msg["credit_spans"] == {
+        "solution": (0, len(old_msg["response_ids"]))}
+    assert old_ex.n_credit_split_failures == {"no_close_tag": 1}
 
     # logprob 少于 token_ids 时，扁平数组仍补位以免后续 turn 错位，但 message 必须
     # 标成无效，训练器会整 turn 跳过；不能把补出的 0.0 当成真实 old logprob。
@@ -1251,6 +1310,35 @@ def test_cross_boundary_token_is_excluded_instead_of_dropping_turn():
         "solution": (0, 1), "interaction": (2, 3)}
     assert msg["credit_boundary_gap_tokens"] == 1
     assert ex.n_credit_boundary_tokens == 1
+    assert ex.n_credit_split_failed == 0
+
+
+def test_open_interaction_without_close_keeps_existing_interaction_credit():
+    """残缺块从开标签到结尾接收 A_int，不引入新的 format reward。"""
+    response = ("推理过程：1+1=2\n最终答案：2\n"
+                "<interaction>\naction: none\ntarget: none")
+
+    class CharEngine(FakeEngine):
+        def generate_batch(self, requests):
+            out = []
+            for req in requests:
+                self.calls.append(req["role"])
+                self.prompts.append((req["role"], req["prompt"]))
+                self.temps.append(req.get("temperature"))
+                text = self.script[req["role"]].pop(0)
+                out.append((text, [-0.5] * len(text), list(text)))
+            return out
+
+    script = {
+        "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>"],
+        "proposer": [response], "critic": [], "verifier": [],
+    }
+    ex = _mk_executor(CharEngine(script), stop_gate=False, max_rounds=1, max_hops=0)
+    ep = ex.run_episodes_batch(["1+1=?"], ["2"])[0]
+    msg = next(m for m in ep["messages"] if m["role_name"] == "proposer")
+    start = response.index("\n<interaction>")
+    assert msg["credit_spans"] == {
+        "solution": (0, start), "interaction": (start, len(response))}
     assert ex.n_credit_split_failed == 0
 
 
@@ -1642,6 +1730,22 @@ def test_offline_eval_uses_the_runtime_parsers():
     assert res["interaction_rate"] == 1.0
 
 
+def test_offline_eval_rows_preserve_aime_metadata():
+    import evaluate as offline
+
+    item = {"question": "q", "answer": "080", "year": 2025,
+            "exam": "II", "problem": 5, "source": "math-ai/aime25"}
+    ep = {"final_answer": "80", "is_correct": True,
+          "raca_turn_data": {1: {}}, "messages": [], "turn_ids": []}
+    rows = offline.per_item_rows([item], [ep], "aime")
+    assert rows == [{
+        "suite": "aime", "question": "q", "gold": "080",
+        "prediction": "80", "is_correct": True, "n_turns": 1,
+        "year": 2025, "exam": "II", "problem": 5,
+        "source": "math-ai/aime25",
+    }]
+
+
 def test_integration_gate_blocked_injects_verifier():
     """v2.1：controller 想停但黑板无分数时，强制注入 verifier 解锁终止路径。
 
@@ -1949,6 +2053,11 @@ def test_signal_quality_metrics():
     m = T_metrics([[ep(True, meta=meta_ok), ep(False, meta=meta_bad)]])
     assert approx(m["int_rate"], 0.5)
     assert approx(m["int_effectiveness"], 1.0)   # 唯一求助样本修对了
+    assert approx(m["int_rate_wrong"], 1.0)
+    assert approx(m["int_rate_correct"], 0.0)
+    assert approx(m["int_rate_gap"], 1.0)
+    assert m["n_primary_wrong"] == 1 and m["n_primary_correct"] == 1
+    assert m["n_interact_wrong"] == 1 and m["n_interact_correct"] == 0
     assert approx(m["parse_rate"], 0.5)
     assert m["gate_blocked"] == 1
     assert approx(m["int_selectivity"], -1.0)    # u 与 p_primary 完全负相关
@@ -1973,6 +2082,64 @@ def test_signal_quality_metrics():
 
     # 空输入不崩
     assert T_metrics([]) == {}
+
+
+def test_aime_2022_2026_dataset_contract():
+    """AIME-150 必须逐年完整、保留三位答案，并与 MATH/SFT 零重叠。"""
+    import json
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent / "data"
+    rows = [json.loads(line) for line in open(
+        root / "aime_2022_2026.jsonl", encoding="utf-8")]
+    assert len(rows) == 150 and len({r["question"] for r in rows}) == 150
+    assert {year: sum(r["year"] == year for r in rows)
+            for year in range(2022, 2027)} == {year: 30 for year in range(2022, 2027)}
+    assert {(year, exam): sum(r["year"] == year and r["exam"] == exam for r in rows)
+            for year in range(2022, 2027) for exam in ("I", "II")} == {
+                (year, exam): 15
+                for year in range(2022, 2027) for exam in ("I", "II")}
+    assert all(len(str(r["answer"])) == 3 and str(r["answer"]).isdigit()
+               for r in rows)
+    assert all(r.get("source") and r.get("source_revision") for r in rows)
+    assert all(r["exam"] in ("I", "II") and 1 <= int(r["problem"]) <= 15
+               for r in rows)
+
+    aime_q = {r["question"] for r in rows}
+    for name in ("math_train_rl.jsonl", "math_test.jsonl",
+                 "sft_train_v2.jsonl", "sft_train_v3.jsonl"):
+        path = root / name
+        if path.exists():
+            other = {json.loads(line).get("question")
+                     for line in open(path, encoding="utf-8")}
+            assert not (aime_q & other), f"AIME 与 {name} 有数据重叠"
+
+
+def test_train_defines_separate_math_and_aime_eval_suites():
+    """训练内 MATH/AIME 必须分命名空间、分历史，并保存逐题预测。"""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent / "train.py").read_text(encoding="utf-8")
+    assert '"math_l5"' in src and '"aime"' in src
+    assert '_eval_histories = {name: [] for name in eval_suites}' in src
+    assert 'f"eval/{suite_name}/accuracy"' in src
+    assert 'step_{step:03d}_{suite_name}.jsonl' in src
+    assert 'combined.update(_run_eval_suite' in src
+
+
+def test_default_run_enables_aime_and_interaction_stabilizers():
+    """正式默认配置必须从 step0 跑新实验，并开启本轮确认的三项设置。"""
+    from preflight_v2 import _load_flat_yaml
+
+    cfg = _load_flat_yaml("configs/agentic/default.yaml")
+    data = _load_flat_yaml("configs/data/math.yaml")
+    assert cfg["max_steps"] == 80
+    assert cfg["eval_samples"] == 1000 and cfg["eval_aime_samples"] == 150
+    assert cfg["malformed_interaction_credit"] is True
+    assert cfg["malformed_tail_tokens"] == 4
+    assert cfg["balance_interaction_layers"] is True
+    assert approx(float(cfg["interaction_balance_cap"]), 2.0)
+    assert data["aime_path"] == "data/aime_2022_2026.jsonl"
 
 
 # ── v3.2：信道修复（剥块 + 放宽 flaw 窗口）────────────────────────────────

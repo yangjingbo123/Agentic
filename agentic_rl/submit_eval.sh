@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=agentic_eval
 #SBATCH --partition=interruptible_gpu
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 #SBATCH --constraint=a100_80g|h100
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=40G
@@ -22,8 +22,14 @@ SFT_CKPT=/scratch/users/k24104674/jingbo_checkpoints/sft
 RL_CKPT=/scratch/users/k24104674/jingbo_checkpoints/rl-math-grpo_3
 
 echo "======== SFT Model ========"
-python evaluate.py --checkpoint $SFT_CKPT --split test --max_samples ${MAX_SAMPLES:-200}
+python evaluate.py --checkpoint "$SFT_CKPT" --suite math_test \
+  --max_samples "${MAX_SAMPLES:-3669}" --output results/sft_math_test.jsonl
+python evaluate.py --checkpoint "$SFT_CKPT" --suite aime \
+  --output results/sft_aime_2022_2026.jsonl
 
 echo ""
-echo "======== RL Model (step 128) ========"
-python evaluate.py --checkpoint $RL_CKPT --split test --max_samples ${MAX_SAMPLES:-200}
+echo "======== RL Model ========"
+python evaluate.py --checkpoint "$RL_CKPT" --suite math_test \
+  --max_samples "${MAX_SAMPLES:-3669}" --output results/rl_math_test.jsonl
+python evaluate.py --checkpoint "$RL_CKPT" --suite aime \
+  --output results/rl_aime_2022_2026.jsonl

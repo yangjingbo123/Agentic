@@ -1,0 +1,7 @@
+name: gigpo
+delta: 1.0e-4
+macro_weight: 1.0
+micro_weight: 1.0
+gamma: 1.0
+anchor_mode: exact
+report_name: GiGPO-Adapted

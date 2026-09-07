@@ -1,0 +1,3 @@
+name: fixed_four_role_grpo
+credit: outcome_grpo
+pipeline: [proposer, controller, critic, proposer_correction, verifier]

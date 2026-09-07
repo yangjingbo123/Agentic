@@ -1,0 +1,4 @@
+name: fixed_four_role
+pipeline: [proposer, controller, critic, proposer_correction, verifier]
+temperature: 0.0
+report_name: Fixed-Pipeline (P-C-Correction-V)

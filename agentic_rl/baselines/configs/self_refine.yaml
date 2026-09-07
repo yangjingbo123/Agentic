@@ -1,0 +1,3 @@
+name: self_refine
+max_refine_rounds: 1
+temperature: 0.0

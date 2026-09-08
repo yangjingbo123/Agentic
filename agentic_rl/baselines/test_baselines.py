@@ -249,6 +249,16 @@ def test_gigpo_discounted_terminal_return():
 
 def test_production_raca_files_have_no_worktree_diff():
     import subprocess
+    # Local development runs inside a Git worktree, but Primus deploys a ZIP
+    # archive without .git metadata.  The isolation assertion is meaningful
+    # only in a worktree; all algorithm/data contract tests still run on Primus.
+    probe = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        cwd=str(ROOT), text=True, capture_output=True)
+    if probe.returncode != 0 or probe.stdout.strip() != "true":
+        print("  [skip] RACA worktree diff check: Git metadata unavailable")
+        return
+
     protected = [
         "train.py", "training/grpo_trainer.py", "training/raca_adv.py",
         "agents/raca_rewards.py", "agents/agentic_executor.py",

@@ -252,10 +252,14 @@ def test_production_raca_files_have_no_worktree_diff():
     # Local development runs inside a Git worktree, but Primus deploys a ZIP
     # archive without .git metadata.  The isolation assertion is meaningful
     # only in a worktree; all algorithm/data contract tests still run on Primus.
-    probe = subprocess.run(
-        ["git", "rev-parse", "--is-inside-work-tree"],
-        cwd=str(ROOT), text=True, capture_output=True)
-    if probe.returncode != 0 or probe.stdout.strip() != "true":
+    try:
+        probe = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=str(ROOT), text=True, capture_output=True)
+    except FileNotFoundError:
+        probe = None
+    if (probe is None or probe.returncode != 0
+            or probe.stdout.strip() != "true"):
         print("  [skip] RACA worktree diff check: Git metadata unavailable")
         return
 
@@ -298,6 +302,19 @@ def test_unified_launcher_dispatch_and_guards():
             ["bash", str(script), "--dry-run", forbidden],
             cwd=str(ROOT), text=True, capture_output=True)
         assert result.returncode == 2, (forbidden, result.returncode)
+
+
+def test_baseline_hydra_entry_uses_absolute_config_directory():
+    source = (ROOT / "baselines" / "hydra_runner.py").read_text(encoding="utf-8")
+    assert 'initialize_config_dir(config_dir=CONFIG_DIR' in source
+    assert 'compose(config_name="config", overrides=overrides)' in source
+    assert 'production_train.main, "__wrapped__"' in source
+    assert '@hydra.main' not in source
+    for name in ("train_credit.py", "train_single_agent_grpo.py",
+                 "train_fixed_four_role_grpo.py"):
+        wrapper = (ROOT / "baselines" / name).read_text(encoding="utf-8")
+        assert "run_production_train" in wrapper
+        assert "from train import main as hydra_main" not in wrapper
 
 
 if __name__ == "__main__":

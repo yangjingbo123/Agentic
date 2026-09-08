@@ -97,14 +97,18 @@ mkdir -p "${CKPT_DIR}" /tmp/triton-cache
 export BASELINE_METRICS_JSONL="${CKPT_DIR}/baseline_metrics.jsonl"
 python - "${MANIFEST}" <<'PY'
 import json, os, subprocess, sys
+try:
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], text=True, capture_output=True
+    ).stdout.strip() or "unknown"
+except FileNotFoundError:
+    commit = "unknown"
 manifest = {
     "baseline": os.environ["BASELINE_NAME"],
     "experiment": os.environ.get("EXP_NAME", ""),
     "seed": int(os.environ.get("BASELINE_SEED", "1")),
     "config": json.loads(os.environ["BASELINE_CONFIG_JSON"]),
-    "git_commit": subprocess.run(
-        ["git", "rev-parse", "HEAD"], text=True, capture_output=True
-    ).stdout.strip() or "unknown",
+    "git_commit": commit,
 }
 with open(sys.argv[1], "w", encoding="utf-8") as f:
     json.dump(manifest, f, ensure_ascii=False, indent=2)

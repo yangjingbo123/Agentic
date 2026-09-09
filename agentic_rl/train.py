@@ -190,6 +190,19 @@ def main(cfg: DictConfig):
                     "is_correct": bool(ep.get("is_correct", False)),
                     "n_turns": len(ep.get("raca_turn_data", {})),
                     "stopped": bool(ep.get("stopped", False)),
+                    "initial_answer": ep.get("initial_answer", ""),
+                    "initial_is_correct": bool(ep.get("initial_is_correct", False)),
+                    "n_rescues": int(ep.get("n_rescues", 0)),
+                    "n_harms": int(ep.get("n_harms", 0)),
+                    "n_corrections_verified": int(
+                        ep.get("n_corrections_verified", 0)),
+                    "n_corrections_accepted": int(
+                        ep.get("n_corrections_accepted", 0)),
+                    "n_corrections_rejected": int(
+                        ep.get("n_corrections_rejected", 0)),
+                    "auto_stopped": bool(ep.get("auto_stopped", False)),
+                    "role_calls": ep.get("role_calls", {}),
+                    "generated_tokens": int(ep.get("generated_tokens", 0)),
                 }
                 for key in ("year", "exam", "problem", "level", "source"):
                     if key in item:
@@ -218,6 +231,12 @@ def main(cfg: DictConfig):
         eff = behavior.get("int_effectiveness")
         int_rate = behavior.get("int_rate", 0.0)
         stop_rate = behavior.get("stop_rate", 0.0)
+        verified_corr = behavior.get("verified_corrections", 0)
+        accepted_corr = behavior.get("accepted_corrections", 0)
+        rejected_corr = behavior.get("rejected_corrections", 0)
+        auto_stop_rate = behavior.get("auto_stop_rate", 0.0)
+        initial_acc = behavior.get("initial_accuracy")
+        net_rescue = behavior.get("net_rescue_per_100")
         avg_turns = float(np.mean([
             len(ep.get("raca_turn_data", {})) for ep in episodes
         ])) if episodes else 0.0
@@ -231,7 +250,15 @@ def main(cfg: DictConfig):
             f"eval/{suite_name}/avg_turns": avg_turns,
             f"eval/{suite_name}/int_rate": int_rate,
             f"eval/{suite_name}/stop_rate": stop_rate,
+            f"eval/{suite_name}/verified_corrections": verified_corr,
+            f"eval/{suite_name}/accepted_corrections": accepted_corr,
+            f"eval/{suite_name}/rejected_corrections": rejected_corr,
+            f"eval/{suite_name}/auto_stop_rate": auto_stop_rate,
         }
+        if initial_acc is not None:
+            log_data[f"eval/{suite_name}/initial_accuracy"] = initial_acc
+        if net_rescue is not None:
+            log_data[f"eval/{suite_name}/net_rescue_per_100"] = net_rescue
         if int_wrong is not None:
             log_data[f"eval/{suite_name}/int_rate_wrong"] = int_wrong
         if int_correct is not None:
@@ -274,7 +301,11 @@ def main(cfg: DictConfig):
             f"correct={correct}/{n} tail{len(tail)}={acc_tail:.3f}{extras} "
             f"turns={avg_turns:.1f} int={int_rate:.2f} "
             f"intW/C/G={_fmt(int_wrong)}/{_fmt(int_correct)}/{_fmt(int_gap)} "
-            f"eff={_fmt(eff)} stop={stop_rate:.2f}",
+            f"eff={_fmt(eff)} stop={stop_rate:.2f} "
+            f"vCorr={verified_corr}/acc{accepted_corr}/rej{rejected_corr} "
+            f"autoS={auto_stop_rate:.2f} "
+            f"init={'--' if initial_acc is None else f'{initial_acc:.3f}'} "
+            f"net={'--' if net_rescue is None else f'{net_rescue:+.1f}'}/100",
             flush=True,
         )
         pred_path = _save_eval_predictions(suite_name, step, items, episodes)
@@ -321,10 +352,36 @@ def main(cfg: DictConfig):
             print(f"  [resume] {adapter_name}: loaded {loaded} params", flush=True)
         print(f"Resumed from step={step}", flush=True)
 
-    # infinite dataloader — shuffle and cycle, no epoch concept
+    # Infinite sampler. v34 optionally shifts the same MATH training set toward
+    # Level-5 over time; no AIME/test examples enter training.
+    use_level5_curriculum = bool(cfg.agentic.get("level5_curriculum", False))
+    level5_start = float(cfg.agentic.get("level5_ratio_start", 0.45))
+    level5_end = float(cfg.agentic.get("level5_ratio_end", 0.75))
+    level5_pool = [item for item in dataset if item.get("level") == "Level 5"]
+    lower_pool = [item for item in dataset if item.get("level") != "Level 5"]
+    if use_level5_curriculum and (not level5_pool or not lower_pool):
+        print("[warn] Level-5 curriculum disabled: one data partition is empty", flush=True)
+        use_level5_curriculum = False
+    sampler_pools = {"level5": level5_pool, "lower": lower_pool}
+    sampler_idx = {"level5": 0, "lower": 0}
+    for pool in sampler_pools.values():
+        random.shuffle(pool)
+
     data_pool = dataset[:]
     random.shuffle(data_pool)
     pool_idx = 0
+
+    def draw_from_pool(name, count):
+        result = []
+        pool = sampler_pools[name]
+        while len(result) < count:
+            if sampler_idx[name] >= len(pool):
+                random.shuffle(pool)
+                sampler_idx[name] = 0
+            take = min(count - len(result), len(pool) - sampler_idx[name])
+            result.extend(pool[sampler_idx[name]:sampler_idx[name] + take])
+            sampler_idx[name] += take
+        return result
 
     # Ensure vLLM uses LoRA weights from the start, not the base model
     if vllm_engine is not None and not any(vllm_engine._lora_loaded.values()):
@@ -357,12 +414,22 @@ def main(cfg: DictConfig):
             )
 
     while step < max_steps:
-        # take next batch, reshuffle when exhausted
-        if pool_idx + batch_size > len(data_pool):
-            random.shuffle(data_pool)
-            pool_idx = 0
-        batch = data_pool[pool_idx: pool_idx + batch_size]
-        pool_idx += batch_size
+        # Take next batch. Curriculum changes only the train-set mixture.
+        if use_level5_curriculum:
+            progress = step / max(max_steps - 1, 1)
+            target_l5 = level5_start + (level5_end - level5_start) * progress
+            n_level5 = min(batch_size, max(0, int(round(batch_size * target_l5))))
+            batch = (draw_from_pool("level5", n_level5)
+                     + draw_from_pool("lower", batch_size - n_level5))
+            random.shuffle(batch)
+        else:
+            if pool_idx + batch_size > len(data_pool):
+                random.shuffle(data_pool)
+                pool_idx = 0
+            batch = data_pool[pool_idx: pool_idx + batch_size]
+            pool_idx += batch_size
+        batch_l5_ratio = float(np.mean(
+            [1.0 if item.get("level") == "Level 5" else 0.0 for item in batch]))
 
         # RACA v2: ε 强制注入概率线性衰减（冷启动保护，§2.4）
         _eps0 = float(cfg.agentic.get("eps_force_init", 0.3))
@@ -490,10 +557,11 @@ def main(cfg: DictConfig):
         # selfT 非 0 说明 proposer 在写 `target: proposer`（自指）。已被归一为
         # none 且不再计入 int_rate/r_int，但计数本身是 prompt 是否讲清楚的信号。
         _n_self = getattr(trainer.executor, "n_self_target", 0)
-        # 跳深分布（第十轮，`max_hops` 2→3 的验收指标）。第 3 跳**没有机制把守**，
-        # 它要求修正后的 proposer 自己写出 `request verifier`；depth3 若接近 0，说明
-        # 加预算没被用上，该照 critic 标错那条的样子做成机械触发。`3v` 单列"第 3 跳
-        # 到达 verifier"的次数，因为只看总数分不出它到的是 verifier 还是又一次 critic。
+        _n_corr_verified = getattr(trainer.executor, "n_correction_verified", 0)
+        _n_corr_rejected = getattr(trainer.executor, "n_correction_gate_rejected", 0)
+        _n_auto_stopped = getattr(trainer.executor, "n_auto_stopped", 0)
+        # 跳深分布继续描述自发链；v34 correction→verifier 的机械批次不占 hop，
+        # 由 vCorr/autoS 单独统计。`3v` 仅表示额外的自发第 3 跳 verifier。
         _hd = getattr(trainer.executor, "n_hop_depth", None) or {}
         _hop_s = "/".join(f"{d}:{_hd.get(d, 0)}" for d in (1, 2, 3) if _hd.get(d))
         if _hop_s and _hd.get("3:verifier"):
@@ -530,9 +598,13 @@ def main(cfg: DictConfig):
             f"dist={stats.get('pool_distinct', 0.0):.2f}"
             f"/deg={stats.get('pool_degenerate', 0.0):.2f}"
             f"/marg={stats.get('vote_margin', 0.0):.2f} "
-            f"stop_rate={stats.get('stop_rate', 0.0):.2f} eps={eps_force:.2f}"
+            f"stop_rate={stats.get('stop_rate', 0.0):.2f} eps={eps_force:.2f} "
+            f"l5={batch_l5_ratio:.2f}"
             + (f" clip_prompt={_n_clip}" if _n_clip else "")
             + (f" selfT={_n_self}" if _n_self else "")
+            + (f" vCorr={_n_corr_verified}/rej{_n_corr_rejected}"
+               if (_n_corr_verified or _n_corr_rejected) else "")
+            + (f" autoS={_n_auto_stopped}" if _n_auto_stopped else "")
             + (f" splitF={_n_split}/{_n_split_total}({_split_rate:.2%})"
                + (f"[{_split_reason_s}]" if _split_reason_s else "")
                if _n_split else "")
@@ -542,6 +614,8 @@ def main(cfg: DictConfig):
             + (f" iCh={int(stats.get('interaction_channel_count', 0))}"
                f"/iAdv={stats.get('interaction_adv_abs', 0.0):.2f}"
                f"/iPG={stats.get('interaction_pg_loss', 0.0):+.3f}"
+               f"/iEnt={stats.get('interaction_entropy', 0.0):.2f}"
+               f"/iKL={stats.get('interaction_kl', 0.0):.4f}"
                if stats.get("interaction_channel_count", 0) else "")
             + (f" iL=0:{_p0_count}/"
                f"{'--' if _p0_adv is None else f'{_p0_adv:.2f}'}"
@@ -560,6 +634,7 @@ def main(cfg: DictConfig):
             "kl":              stats["kl"],
             "skipped_batches": skipped_batches,
             "eps_force":       eps_force,
+            "train_level5_ratio": batch_l5_ratio,
         }
         # 策略健康（熵坍塌/漂移/权重脱节）+ 信号质量（梯度还能用多久）
         # + 行为（reward hacking 侦测）+ RACA v2 证据指标（§8），有则上报
@@ -572,7 +647,10 @@ def main(cfg: DictConfig):
                     "n_interact_wrong", "n_interact_correct", "p_primary_rate",
                     "q_forced", "int_critic_share",
                     "forced_rate", "stop_rate", "stop_acc", "exhaust_acc",
-                    "gate_blocked",
+                    "gate_blocked", "initial_accuracy", "n_rescues",
+                    "n_harms", "net_rescue_per_100", "verified_corrections",
+                    "accepted_corrections", "rejected_corrections",
+                    "auto_stop_rate",
                     "funnel_flag", "funnel_corr", "funnel_flip", "funnel_unflip",
                     "pool_votes", "pool_distinct", "pool_degenerate",
                     "vote_margin",
@@ -581,12 +659,18 @@ def main(cfg: DictConfig):
                     "solution_channel_count", "interaction_channel_count",
                     "solution_token_count", "interaction_token_count",
                     "interaction_p0_channel_count", "interaction_p1_channel_count",
-                    "interaction_p0_adv_abs", "interaction_p1_adv_abs"):
+                    "interaction_p0_adv_abs", "interaction_p1_adv_abs",
+                    "interaction_entropy", "interaction_kl",
+                    "role_valid_proposer", "role_valid_controller",
+                    "role_valid_critic", "role_valid_verifier"):
             if _mk in stats:
                 log_data[_mk] = stats[_mk]
         log_data["gate_unlocked"] = getattr(trainer.executor, "n_gate_unlocked", 0)
         log_data["prompt_clipped"] = _n_clip
         log_data["self_target"] = _n_self
+        log_data["correction_verified"] = _n_corr_verified
+        log_data["correction_gate_rejected"] = _n_corr_rejected
+        log_data["auto_stopped"] = _n_auto_stopped
         log_data["credit_split_failed"] = _n_split
         log_data["credit_split_attempted"] = _n_split_total
         log_data["credit_split_failure_rate"] = _split_rate

@@ -58,6 +58,21 @@ class AgenticExecutor:
         # v3 测量（§19）：修正正确率两次 ≤ 裸重采样 → 修正票退出投票池
         # （仍进黑板供上下文/σ/r_int 因果信用，只是不计票）。
         self.correction_in_vote = config.get("correction_in_vote", True)
+        # v34 accuracy path: corrections are mechanically verified and only
+        # verifier-approved corrections may participate in the production vote.
+        self.verify_after_correction = bool(
+            config.get("verify_after_correction", False))
+        self.verified_correction_gate = bool(
+            config.get("verified_correction_gate", False))
+        self.correction_verifier_threshold = float(
+            config.get("correction_verifier_threshold", 0.5))
+        # High-confidence consensus may stop without waiting for the learned
+        # controller to emit stop on the following round.
+        self.auto_stop_verified = bool(config.get("auto_stop_verified", False))
+        self.auto_stop_verifier_threshold = float(
+            config.get("auto_stop_verifier_threshold", 0.85))
+        self.auto_stop_min_support = max(
+            1, int(config.get("auto_stop_min_support", 2)))
         # v3 测量（§19）：旧错解+批评的上下文对下一轮重答有锚定伤害
         # （通道② Δ=−0.085/−0.055）；False = FLAW 不进 primary prompt。
         self.flaw_in_primary = config.get("flaw_in_primary_prompt", True)
@@ -94,16 +109,14 @@ class AgenticExecutor:
         # vLLM 返回的 response_ids / log_probs 长度不一致。扁平数组仍需补位保持后续
         # turn 对齐，但该 turn 必须标成无效并在 PPO 前整条跳过，不能把补的 0 当真值。
         self.n_logprob_mismatch = 0
+        self.n_correction_verified = 0
+        self.n_correction_gate_rejected = 0
+        self.n_auto_stopped = 0
         # 交互链按**跳深**分布（第十轮，`max_hops` 2→3 的配套读数）。
         # 为什么非要这个数：第 1 跳（proposer→critic/verifier）由 proposer 的块决定，
         # 第 2 跳里 critic 标错→proposer 修正是**机械触发**（写死 "proposer"），但
-        # 第 3 跳（修正→verifier）**没有机制**，它要求修正后的 proposer 自己写出
-        # `request verifier`。而这个仓库已经在同一个坑里栽过一次——`:377` 注释记着
-        # "v2.1 实测 eff≈0：修正跳由**未学会的行为**把守，correction_turns 几乎恒空
-        # → q≈0 → 发起恒负期望 → int_rate 塌"，所以才把它改成机械触发。
-        # 于是 `max_hops: 3` 买到的只是**可能性**，不是保证。这个计数器就是判据：
-        # depth3 若接近 0，说明该照 critic 那条的样子把它也做成机械触发（行为改动，
-        # 单独一步）；若明显非 0，才说明加预算本身就够了。
+        # v34 已把 correction→verifier 放到 hop 循环后的机械批次中，因此该计数器
+        # 现在只描述其它自发链路深度；机械验证由 n_correction_verified 单独统计。
         self.n_hop_depth = Counter()
         self._rng = random.Random()
 
@@ -124,6 +137,9 @@ class AgenticExecutor:
         self.n_credit_decode_fallback = 0
         self.n_primary_format.clear()
         self.n_logprob_mismatch = 0     # 同上（response/logprob 对齐）
+        self.n_correction_verified = 0
+        self.n_correction_gate_rejected = 0
+        self.n_auto_stopped = 0
         self.n_hop_depth.clear()    # 同上（跳深分布）
 
         n = len(questions)
@@ -133,15 +149,42 @@ class AgenticExecutor:
         log_probs_list = [[] for _ in range(n)]
         turn_counters  = [0] * n
         round_records  = [[] for _ in range(n)]
-        corr_answers   = [[] for _ in range(n)]   # 修正票（可能被投票排除）
+        corr_answers   = [[] for _ in range(n)]   # 全部修正票
+        accepted_corr_answers = [[] for _ in range(n)]  # verifier 通过的修正票
         stop_ctrl_tids = [None] * n
         stop_sigmas    = [None] * n
+        auto_stopped_flags = [False] * n
         active         = list(range(n))
 
         def next_tid(i):
             tid = turn_counters[i]
             turn_counters[i] += 1
             return tid
+
+        def register_verification(i, st, reviewed, score):
+            """Attach a verifier score to the matching correction and gate it."""
+            if score is not None:
+                for corr in reversed(st["correction_turns"]):
+                    if corr.get("answer") == reviewed:
+                        was_verified = bool(corr.get("verified"))
+                        corr["verifier_score"] = float(score)
+                        corr["verified"] = True
+                        if not was_verified:
+                            self.n_correction_verified += 1
+                        if (score >= self.correction_verifier_threshold
+                                and not any(math_equal(reviewed, accepted)
+                                            for accepted in accepted_corr_answers[i])):
+                            accepted_corr_answers[i].append(reviewed)
+                        break
+
+            if (not self.auto_stop_verified or score is None
+                    or score < self.auto_stop_verifier_threshold):
+                return
+            support = sum(
+                1 for _reasoning, answer in blackboards[i].traces
+                if answer and math_equal(answer, reviewed))
+            if support >= self.auto_stop_min_support:
+                st["auto_stop"] = True
 
         def make_prompt(system, user):
             user = clip_user(system, user)
@@ -475,6 +518,7 @@ class AgenticExecutor:
                     "correction_turns": [],
                     "corrected_answer": None,
                     "pending":          [],
+                    "auto_stop":        False,
                 }
             active = still_active
             if not ep_st:
@@ -658,10 +702,14 @@ class AgenticExecutor:
                         st["verifier_turns"].append({
                             "tid": tid, "score": score, "reviewed_answer": reviewed,
                         })
+                        register_verification(i, st, reviewed, score)
                     else:  # proposer 修正：新 trace 进黑板（上下文/σ/因果通路）
                         reasoning, answer = parse_reasoning(out)
                         bb.add_message(Message(0, MessageType.TRACE, (reasoning, answer)))
-                        st["correction_turns"].append({"tid": tid, "answer": answer})
+                        st["correction_turns"].append({
+                            "tid": tid, "answer": answer, "reasoning": reasoning,
+                            "shown": shown, "verified": False,
+                        })
                         st["corrected_answer"] = answer
                         corr_answers[i].append(answer)
                         # 本轮内此前的 critic flag 得到了修正响应 → 因果窗口在本轮
@@ -681,11 +729,48 @@ class AgenticExecutor:
                             {"from": target, "action": "request",
                              "target": "proposer", "reason": r2}))
                         st["pending"].append((target, shown, "request", "proposer", r2, False))
-                    elif a2 != "none" and t2 != target:
+                    elif (not st.get("auto_stop")
+                          and a2 != "none" and t2 != target):
                         bb.add_message(Message(
                             list(ROLE_NAMES).index(target), MessageType.INTERACTION,
                             {"from": target, "action": a2, "target": t2, "reason": r2}))
                         st["pending"].append((target, shown, a2, t2, r2, False))
+
+            # ── 3.4 修正后机械验证（v34，不占 hop 预算） ───────────────
+            # v33 实测第三跳到 verifier 仅约 5--10%，导致 correction 缺少质量门控、
+            # stop gate 长期拿不到分数。这里只验证每轮最新、且尚未获得有效分数的修正。
+            if self.verify_after_correction:
+                correction_verify_info = []
+                for i, st in ep_st.items():
+                    pending_corr = [c for c in st["correction_turns"]
+                                    if not c.get("verified") and c.get("answer")]
+                    if not pending_corr:
+                        continue
+                    corr = pending_corr[-1]
+                    sys = PromptTemplates.verifier_system()
+                    usr = (f"待验证答案：{corr['answer']}\n推理：{corr['reasoning']}\n"
+                           f"当前状态：{blackboards[i].to_text()}")
+                    prompt = make_prompt(sys, usr)
+                    correction_verify_info.append(
+                        (i, next_tid(i), sys, usr, corr["answer"], prompt))
+                if correction_verify_info:
+                    verify_res = self.vllm_engine.generate_batch(
+                        [{"role": "verifier", "prompt": prompt,
+                          "temperature": self.temperature}
+                         for _, _, _, _, _, prompt in correction_verify_info])
+                    for (i, tid, sys, usr, reviewed, prompt), res in zip(
+                            correction_verify_info, verify_res):
+                        out = record(i, "verifier", sys, usr, res, tid,
+                                     prompt_text=prompt)
+                        score = parse_score(out)
+                        blackboards[i].add_message(Message(
+                            2, MessageType.SCORE,
+                            (reviewed, score if score is not None else 0.5)))
+                        ep_st[i]["verifier_turns"].append({
+                            "tid": tid, "score": score,
+                            "reviewed_answer": reviewed, "mechanical": True,
+                        })
+                        register_verification(i, ep_st[i], reviewed, score)
 
             # ── 3.5 闸门解锁批次（v3.1，不占 hop 预算） ────────────────
             # v2.0 写的解锁通道在上文 elif（proposer 未自发起）分支里，当时
@@ -725,6 +810,7 @@ class AgenticExecutor:
                         ep_st[i]["verifier_turns"].append({
                             "tid": tid, "score": score, "reviewed_answer": reviewed,
                         })
+                        register_verification(i, ep_st[i], reviewed, score)
                     self.n_gate_unlocked += len(unlock_info)
 
             # ── 4. round record 落盘 ───────────────────────────────────────
@@ -745,7 +831,16 @@ class AgenticExecutor:
                     "critic_turns":     st["critic_turns"],
                     "verifier_turns":   st["verifier_turns"],
                     "correction_turns": st["correction_turns"],
+                    "auto_stop":         st.get("auto_stop", False),
                 })
+
+            auto_stopped = [i for i, st in ep_st.items() if st.get("auto_stop")]
+            for i in auto_stopped:
+                auto_stopped_flags[i] = True
+            if auto_stopped:
+                stopped_set = set(auto_stopped)
+                active = [i for i in active if i not in stopped_set]
+                self.n_auto_stopped += len(auto_stopped)
 
         # ── finalise ─────────────────────────────────────────────────────────
         results = []
@@ -753,8 +848,22 @@ class AgenticExecutor:
             # 生产路径：这三行是唯一决定交出去的答案的地方，下面的反事实臂**一行都
             # 不许碰它**。四臂是旁挂的观测；哪个臂的 exclude 串到这里来，就等于悄悄
             # 改了判定，而 acc 的变化会被误读成开关的效果。测试钉住了这条。
-            exclude = None if self.correction_in_vote else corr_answers[i]
-            final_answer = self._majority_vote(blackboards[i], exclude)
+            if not self.correction_in_vote:
+                exclude = corr_answers[i]
+            elif self.verified_correction_gate:
+                accepted = accepted_corr_answers[i]
+                exclude = [answer for answer in corr_answers[i]
+                           if not any(math_equal(answer, ok) for ok in accepted)]
+                self.n_correction_gate_rejected += len(exclude)
+            else:
+                exclude = None
+            # Once a correction has passed its verifier gate, use verifier-aware
+            # aggregation for that episode; unverified answers retain prior 0.5.
+            production_vote_mode = (
+                "weighted" if (self.verified_correction_gate
+                               and accepted_corr_answers[i]) else None)
+            final_answer = self._majority_vote(
+                blackboards[i], exclude, mode=production_vote_mode)
             is_correct = math_equal(final_answer, correct_answers[i])
             # 消融对照（§19.3 判据①）：同一批 episode 上多种计票各自的正确性，
             # 免二次 rollout 即可在线量化聚合方式的 Δacc。所有臂都**无条件**计算，
@@ -782,6 +891,7 @@ class AgenticExecutor:
                 self.max_rounds, self.cfg,
                 stop_ctrl_tid=stop_ctrl_tids[i],
                 stop_sigma=stop_sigmas[i] or "verify",
+                mechanical_stop=auto_stopped_flags[i],
             )
             # 票池埋点：offline f 臂测出 k=4 等权投票值 +10 点，但那是 k 份独立
             # 采样；这里的票是同一条 episode 逐轮产生、后轮能看见前轮答案。若
@@ -811,12 +921,32 @@ class AgenticExecutor:
                 # 「两把尺子」的种子。要读生产路径请用 `is_correct`。
                 "is_correct_uniform":  uni_excl,
                 "is_correct_weighted": wt_excl,
-                "stopped":         stop_ctrl_tids[i] is not None,
+                "stopped":         (stop_ctrl_tids[i] is not None
+                                    or auto_stopped_flags[i]),
                 "n_votes":         n_votes,
                 "n_distinct":      len(pool),
                 # 首位领先幅度（占总票数）。=1.0 意味着全票一致，投票没做任何事。
                 "vote_margin":     ((top2[0][1] - (top2[1][1] if len(top2) > 1 else 0))
                                     / n_votes) if n_votes else 0.0,
+                "n_corrections_verified": sum(
+                    1 for rnd in round_records[i]
+                    for corr in rnd.get("correction_turns", [])
+                    if corr.get("verified")),
+                "n_corrections_accepted": len(accepted_corr_answers[i]),
+                "n_corrections_rejected": len(exclude or []),
+                "auto_stopped": auto_stopped_flags[i],
+                "initial_answer": (round_records[i][0]["primary_answer"]
+                                   if round_records[i] else ""),
+                "initial_is_correct": bool(
+                    round_records[i]
+                    and math_equal(round_records[i][0]["primary_answer"],
+                                   correct_answers[i])),
+                "n_rescues": int(sum(1 for meta in round_meta if meta.get("flip"))),
+                "n_harms": int(sum(1 for meta in round_meta if meta.get("unflip"))),
+                "role_calls": dict(Counter(
+                    msg.get("role_name", "unknown") for msg in all_messages[i])),
+                "generated_tokens": int(sum(
+                    len(msg.get("response_ids", [])) for msg in all_messages[i])),
             })
         return results
 
@@ -839,7 +969,9 @@ class AgenticExecutor:
         - 批次级（`run_episodes_batch` 开头会重置）：`n_gate_unlocked`、
           `n_self_target`、`n_credit_split_failed`、`n_credit_split_failures`、
           `n_credit_boundary_tokens`、`n_credit_decode_fallback`、
-          `n_primary_format`、`n_logprob_mismatch`、`n_hop_depth` → **赋值**为各分片之和。
+          `n_primary_format`、`n_logprob_mismatch`、`n_hop_depth`、
+          `n_correction_verified`、`n_correction_gate_rejected`、`n_auto_stopped`
+          → **赋值**为各分片之和。
         - 累计级（只在 `__init__` 归零、跨步累加）：`n_prompt_clipped` → **累加**。
 
         一律写 `+=` 会让批次级的数变成整轮累计（只增不减，被误读成"越来越糟"）；
@@ -864,6 +996,12 @@ class AgenticExecutor:
             self.n_primary_format.update(getattr(o, "n_primary_format", None) or {})
         self.n_logprob_mismatch = sum(
             getattr(o, "n_logprob_mismatch", 0) for o in others)
+        self.n_correction_verified = sum(
+            getattr(o, "n_correction_verified", 0) for o in others)
+        self.n_correction_gate_rejected = sum(
+            getattr(o, "n_correction_gate_rejected", 0) for o in others)
+        self.n_auto_stopped = sum(
+            getattr(o, "n_auto_stopped", 0) for o in others)
         self.n_prompt_clipped += sum(
             getattr(o, "n_prompt_clipped", 0) for o in others)
         self.n_hop_depth.clear()

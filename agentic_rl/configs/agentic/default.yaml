@@ -2,7 +2,9 @@ batch_size: 32
 n_samples: 16
 lr: 1.0e-5
 clip_epsilon: 0.2
-max_tokens: 1024
+# v34：v33 后期 primary 格式失败几乎全部由 1024-token length stop 造成；
+# 提高到 1280，仍由 max_prompt_tokens 保证总上下文不超过 4096。
+max_tokens: 1280
 max_rounds: 4
 max_interactions: 3
 max_grad_norm: 1.0
@@ -90,7 +92,21 @@ malformed_tail_tokens: 4
 # p_primary=0/1 的 interaction anchor 各自 z-score 后，按实际 turn 数平衡总梯度，
 # 避免模型变强后「答对层」样本数量压过「答错层」、把策略整体推向 action:none。
 balance_interaction_layers: true
-interaction_balance_cap: 2.0
+# v34：p=1 interaction layer 在 v33 后期常只有十几个有效 turn，cap=2 仍被
+# p=0 数百个 turn 压过。提高到 4，但仍限制极端小样本的噪声放大。
+interaction_balance_cap: 4.0
+# v34：solution 保持原 SFT trust region；interaction block 降低 KL 束缚并加少量
+# 熵正则，打破 SFT 起点 action:request 的近确定性，给 p=1 层产生 none 对照。
+interaction_kl_coef: 0.01
+interaction_entropy_coef: 0.002
+interaction_entropy_correct_only: true
+# v34：按角色分别平均 loss，再按权重合并；防止 critic turn 激增时稀释 proposer。
+role_loss_normalization: true
+role_loss_weights:
+  proposer: 0.55
+  controller: 0.15
+  critic: 0.15
+  verifier: 0.15
 # 每轮交互链响应跳数上限；0 = 消融A（完全禁用交互）。
 # v3.2 第十轮 2 → 3。**2 不是"给少了"，是被机械硬触发吃满了**：标准路径
 # proposer 出解 → hop1 critic 审查 → hop2 critic 标错硬触发 proposer 修正
@@ -99,12 +115,9 @@ interaction_balance_cap: 2.0
 # 一次都进不来 → 黑板没分数 → stop_gate 不许停 → step150 有 193 次 stop
 # 被拦下。`gate_unlock` 那个补丁就是为这个死锁加的。
 #
-# **一条必须写清的限定**：第 3 跳（修正 → verifier）**没有机制把守**，它要求
-# 修正后的 proposer 自己写出 `request verifier`。这个仓库已经在同一个坑里
-# 栽过一次（v2.1：修正跳由未学会的行为把守 → correction_turns 几乎恒空 →
-# q≈0 → int_rate 塌），所以才把 critic 那一跳改成机械触发。于是把预算加到 3
-# 买到的只是**可能性**，不是保证。验收读数是 step 行的 `hop=1:x/2:y/3:z(3v=w)`：
-# z 接近 0 就说明该照 critic 那条的样子把它也做成机械触发（行为改动，单独一步）。
+# v34 已把 correction → verifier 改为 hop 循环后的机械验证，不再依赖修正
+# proposer 自己请求。max_hops=3 仍保留给其它自发链路；机械 verifier 不占 hop 预算，
+# 单独由 vCorr/autoS 指标验收。
 #
 # max_rounds 刻意不动（仍 4）：round 的成本是**乘的**（每多一轮黑板多一层，
 # 后面所有 prompt 都变长），hop 的成本是**加的**（多一个 turn）；而 v3 step151
@@ -151,7 +164,9 @@ correction_in_vote: true
 # **这是本轮唯一只能靠 acc / sel 判定的改动**（另外五项各有专用仪表：d_corr、
 # d_vote、hop 跳深、clip_prompt、fnl 四段），所以它是与 `v32_m1` 基线对比时
 # 唯一的混淆项，判读结论时必须点出这一点。
-flaw_in_primary_prompt: true
+# v34：critic 反馈只用于轮内 correction；下一轮 primary 重新独立求解，避免
+# 把上一轮可能错误/过时的批评继续锚定到新答案。
+flaw_in_primary_prompt: false
 eps_force_init: 0.3  # 强制注入审查/验证的初始概率（冷启动保护，随 step 线性衰减）
 # v2.3：ε 底数 0.05→0.25 基本不衰减，保证 critic/修正链与 q_forced 随机对照
 # 始终有数据。原注释写“forced r_int=0，所以不给发起决策梯度”——**这句被
@@ -160,13 +175,25 @@ eps_force_init: 0.3  # 强制注入审查/验证的初始概率（冷启动保�
 eps_force_min: 0.25
 # 强制注入时选 verifier 的概率；v2.0 固定注 critic 导致 verifier 零训练数据，
 # 而它恰好是 stop 闸门的看门人 → stop_rate 跟着塌。
-eps_verifier_share: 0.5
+eps_verifier_share: 0.7
+# v34：修正后的答案必须有 verifier 覆盖；低分修正不进入最终票池。
+verify_after_correction: true
+verified_correction_gate: true
+correction_verifier_threshold: 0.5
+# 高置信且至少有两个等价候选时机械早停，减少反复改坏已正确答案。
+auto_stop_verified: true
+auto_stop_verifier_threshold: 0.85
+auto_stop_min_support: 2
 # RACA variance threshold: groups whose reward std is <= this are treated as
 # degenerate and dropped (they carry no comparative signal).
 raca_delta: 1.0e-4
 # Abort after this many consecutive batches that yield no gradient at all
 # (guards against a livelock now that skipped batches don't consume a step).
 max_consecutive_skips: 50
+# v34：训练后半程逐步增加 Level-5 比例；使用同一 MATH 训练集，不接触 AIME。
+level5_curriculum: true
+level5_ratio_start: 0.45
+level5_ratio_end: 0.75
 vllm_gpu_slot: 1
 vllm_cuda_visible_devices: null
 vllm_gpu_memory_utilization: 0.65

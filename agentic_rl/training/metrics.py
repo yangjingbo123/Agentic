@@ -103,6 +103,18 @@ def rollout_metrics(batch_rollouts: list) -> dict:
         out["funnel_flip"] = int(sum(1 for m in rounds if m.get("flip")))
         out["funnel_unflip"] = int(sum(1 for m in rounds if m.get("unflip")))
 
+    # ── initial→final transition metrics（v34，论文可读口径） ───────────────
+    initial = [bool(ep["initial_is_correct"]) for ep in eps
+               if "initial_is_correct" in ep]
+    if initial:
+        out["initial_accuracy"] = float(np.mean(initial))
+    if eps:
+        rescues = int(sum(ep.get("n_rescues", 0) for ep in eps))
+        harms = int(sum(ep.get("n_harms", 0) for ep in eps))
+        out["n_rescues"] = rescues
+        out["n_harms"] = harms
+        out["net_rescue_per_100"] = 100.0 * (rescues - harms) / len(eps)
+
     # ── stop 校准：P(correct | stop) vs P(correct | 耗尽轮次) ────────────────
     stopped   = [ep["is_correct"] for ep in eps if ep.get("stopped")]
     exhausted = [ep["is_correct"] for ep in eps if not ep.get("stopped")]
@@ -150,6 +162,17 @@ def rollout_metrics(batch_rollouts: list) -> dict:
             [1.0 if ep.get("n_distinct", 0) <= 1 else 0.0 for ep in eps]))
         out["vote_margin"]     = float(np.mean(
             [ep.get("vote_margin", 0.0) for ep in eps]))
+
+    # ── v34 verified-correction / mechanical-stop counters ─────────────────
+    if eps:
+        out["verified_corrections"] = int(sum(
+            ep.get("n_corrections_verified", 0) for ep in eps))
+        out["accepted_corrections"] = int(sum(
+            ep.get("n_corrections_accepted", 0) for ep in eps))
+        out["rejected_corrections"] = int(sum(
+            ep.get("n_corrections_rejected", 0) for ep in eps))
+        out["auto_stop_rate"] = float(np.mean(
+            [1.0 if ep.get("auto_stopped") else 0.0 for ep in eps]))
 
     # ── 信号质量（GRPO 命门） ────────────────────────────────────────────────
     # 以 episode 级正确性分组统计（controller 层 Layer 1 信号的直接代理）。

@@ -29,6 +29,12 @@ class BaselineGRPOTrainer(GRPOAgenticTrainer):
         extra.setdefault("delta", config.get("raca_delta", 1e-4))
         self.baseline_name = name
         self.credit_assigner = build_credit_assigner(name, extra)
+        # Keep baseline PPO regularization standard even when the RACA v34
+        # config enables interaction-specific KL/entropy and role balancing.
+        self.interaction_kl_coef = self.kl_coef
+        self.interaction_entropy_coef = 0.0
+        self.interaction_entropy_correct_only = True
+        self.role_loss_normalization = False
         self.metrics_path = os.environ.get("BASELINE_METRICS_JSONL")
         self.update_index = 0
         print("[baseline] credit assigner = %s config=%s" %

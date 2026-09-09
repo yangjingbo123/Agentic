@@ -124,6 +124,7 @@ def compute_turn_data(
     cfg: dict,
     stop_ctrl_tid: int | None = None,
     stop_sigma: str = "verify",
+    mechanical_stop: bool = False,
 ) -> tuple[dict, list]:
     """RACA v2 逐 turn 奖励。
 
@@ -290,7 +291,8 @@ def compute_turn_data(
 
     # ── Controller episode 结果奖励（§4.5，公式与 v1 一致） ─────────────────
     t_stop = len(round_records)
-    remaining = (max_rounds - t_stop) / max(max_rounds, 1)
+    remaining = (0.0 if mechanical_stop else
+                 (max_rounds - t_stop) / max(max_rounds, 1))
     outcome_tid = stop_ctrl_tid if stop_ctrl_tid is not None else last_ctrl_tid
 
     if outcome_tid is not None:

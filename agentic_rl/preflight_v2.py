@@ -172,7 +172,14 @@ def check_config():
     for k in ("c_int", "int_miss", "lambda_int", "token_credit",
               "malformed_interaction_credit", "malformed_tail_tokens",
               "balance_interaction_layers", "interaction_balance_cap",
-              "eval_samples", "eval_aime_samples", "max_steps",
+              "interaction_kl_coef", "interaction_entropy_coef",
+              "interaction_entropy_correct_only",
+              "role_loss_normalization", "verify_after_correction",
+              "verified_correction_gate", "correction_verifier_threshold",
+              "auto_stop_verified", "auto_stop_verifier_threshold",
+              "auto_stop_min_support", "level5_curriculum",
+              "level5_ratio_start", "level5_ratio_end",
+              "eval_samples", "eval_aime_samples", "max_steps", "max_tokens",
               "max_hops", "stop_gate",
               "eps_force_init", "eps_force_min"):
         check(k in cfg, f"v2 超参 {k} = {cfg.get(k)}")
@@ -192,6 +199,40 @@ def check_config():
           "balance_interaction_layers 必须是布尔值")
     check(float(cfg.get("interaction_balance_cap", 0) or 0) >= 1.0,
           f"interaction_balance_cap >= 1（当前 {cfg.get('interaction_balance_cap')}）")
+    check(float(cfg.get("interaction_kl_coef", -1) or 0) >= 0.0,
+          f"interaction_kl_coef >= 0（当前 {cfg.get('interaction_kl_coef')}）")
+    check(float(cfg.get("interaction_entropy_coef", -1) or 0) >= 0.0,
+          f"interaction_entropy_coef >= 0（当前 {cfg.get('interaction_entropy_coef')}）")
+    check(isinstance(cfg.get("interaction_entropy_correct_only"), bool),
+          "interaction_entropy_correct_only 必须是布尔值")
+    check(isinstance(cfg.get("role_loss_normalization"), bool),
+          "role_loss_normalization 必须是布尔值")
+    role_weight_sum = sum(float(cfg.get(role, 0.0) or 0.0)
+                          for role in ("proposer", "controller", "critic", "verifier"))
+    check(abs(role_weight_sum - 1.0) < 1e-9,
+          f"role_loss_weights 总和必须为 1（当前 {role_weight_sum:.3f}）")
+    check(isinstance(cfg.get("verify_after_correction"), bool),
+          "verify_after_correction 必须是布尔值")
+    check(isinstance(cfg.get("verified_correction_gate"), bool),
+          "verified_correction_gate 必须是布尔值")
+    if cfg.get("verified_correction_gate") and not cfg.get("verify_after_correction"):
+        check(False, "verified_correction_gate=true 时必须开启 verify_after_correction",
+              fatal=True)
+    if cfg.get("auto_stop_verified") and not cfg.get("verify_after_correction"):
+        check(False, "auto_stop_verified=true 时必须开启 verify_after_correction",
+              fatal=True)
+    check(0.0 <= float(cfg.get("correction_verifier_threshold", -1)) <= 1.0,
+          "correction_verifier_threshold 必须在 [0,1]")
+    check(0.0 <= float(cfg.get("auto_stop_verifier_threshold", -1)) <= 1.0,
+          "auto_stop_verifier_threshold 必须在 [0,1]")
+    check(int(cfg.get("auto_stop_min_support", 0) or 0) >= 1,
+          "auto_stop_min_support 必须 >= 1")
+    l5_start = float(cfg.get("level5_ratio_start", -1))
+    l5_end = float(cfg.get("level5_ratio_end", -1))
+    check(0.0 <= l5_start <= l5_end <= 1.0,
+          f"Level-5 curriculum 比例合法（当前 {l5_start}->{l5_end}）")
+    check(int(cfg.get("max_tokens", 0) or 0) == 1280,
+          f"v34 rollout max_tokens=1280（当前 {cfg.get('max_tokens')}）")
     check(int(cfg.get("eval_samples", 0) or 0) == 1000,
           f"MATH 同步评测固定 1000 题（当前 {cfg.get('eval_samples')}）")
     check(int(cfg.get("eval_aime_samples", 0) or 0) == 150,

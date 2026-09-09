@@ -136,6 +136,16 @@ def per_item_rows(dataset: list, episodes: list, suite: str) -> list:
             "prediction": ep.get("final_answer", ""),
             "is_correct": bool(ep.get("is_correct", False)),
             "n_turns": len(ep.get("raca_turn_data", {})),
+            "initial_answer": ep.get("initial_answer", ""),
+            "initial_is_correct": bool(ep.get("initial_is_correct", False)),
+            "n_rescues": int(ep.get("n_rescues", 0)),
+            "n_harms": int(ep.get("n_harms", 0)),
+            "n_corrections_verified": int(ep.get("n_corrections_verified", 0)),
+            "n_corrections_accepted": int(ep.get("n_corrections_accepted", 0)),
+            "n_corrections_rejected": int(ep.get("n_corrections_rejected", 0)),
+            "auto_stopped": bool(ep.get("auto_stopped", False)),
+            "role_calls": ep.get("role_calls", {}),
+            "generated_tokens": int(ep.get("generated_tokens", 0)),
         }
         for key in ("year", "exam", "problem", "level", "source"):
             if key in item:

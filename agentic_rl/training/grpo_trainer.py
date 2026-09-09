@@ -34,6 +34,17 @@ class GRPOAgenticTrainer:
         self.ppo_epochs    = config.get("ppo_epochs", 1)
         self.raca_delta    = config.get("raca_delta", 1e-4)   # variance floor
         self.kl_coef       = config.get("kl_coef", 0.04)      # KL penalty coefficient
+        # v34: keep solution reasoning anchored to SFT while allowing the short
+        # interaction block to escape the SFT policy's near-deterministic request habit.
+        self.interaction_kl_coef = float(
+            config.get("interaction_kl_coef", self.kl_coef))
+        self.interaction_entropy_coef = float(
+            config.get("interaction_entropy_coef", 0.0))
+        self.interaction_entropy_correct_only = bool(
+            config.get("interaction_entropy_correct_only", True))
+        self.role_loss_normalization = bool(
+            config.get("role_loss_normalization", False))
+        self.role_loss_weights = dict(config.get("role_loss_weights", {}) or {})
         self.balance_interaction_layers = bool(
             config.get("balance_interaction_layers", False))
         self.interaction_balance_cap = float(
@@ -71,6 +82,45 @@ class GRPOAgenticTrainer:
                     continue
             total += 1
         return total
+
+    def _count_valid_turns_by_role(self, episode: dict, per_turn_adv: dict) -> dict:
+        """Same guards as `_count_valid_turns`, split by role adapter."""
+        vocab_size = self.model._model.config.vocab_size
+        lp_count = {}
+        for tid in episode.get("turn_ids", []):
+            lp_count[tid] = lp_count.get(tid, 0) + 1
+        counts = {}
+        for msg in episode["messages"]:
+            tid = msg.get("turn_id")
+            spec = per_turn_adv.get(tid)
+            if spec is None:
+                continue
+            ids = list(msg.get("response_ids", []))
+            if (not msg.get("logprob_aligned", True)
+                    or not ids or len(ids) != lp_count.get(tid, 0)
+                    or any(tok < 0 or tok >= vocab_size for tok in ids)):
+                continue
+            if isinstance(spec, dict):
+                span_spec = msg.get("credit_spans", msg.get("interaction_span"))
+                if not token_credit_components(spec, span_spec, range(len(ids))):
+                    continue
+            role = msg.get("role_name", "proposer")
+            counts[role] = counts.get(role, 0) + 1
+        return counts
+
+    def _role_normalizers(self, role_counts: dict):
+        """Return denominators so weighted per-role means sum to one."""
+        present = {role: count for role, count in role_counts.items() if count > 0}
+        if not present:
+            return {}
+        raw_weights = {role: max(0.0, float(self.role_loss_weights.get(role, 1.0)))
+                       for role in present}
+        total_weight = sum(raw_weights.values())
+        if total_weight <= 0:
+            raw_weights = {role: 1.0 for role in present}
+            total_weight = float(len(present))
+        return {role: count / max(raw_weights[role] / total_weight, 1e-12)
+                for role, count in present.items()}
 
     def update(self, batch_rollouts: list) -> dict:
         """RACA update.
@@ -143,11 +193,15 @@ class GRPOAgenticTrainer:
               f"mean_ctrl_reward={mean_r:.3f} "
               f"groups={n_groups_kept}/{n_groups}", flush=True)
 
-        # Pre-count total valid turns for normalization
-        total_valid = sum(
-            self._count_valid_turns(ep, adv)
-            for ep, adv in zip(all_episodes, all_per_turn_adv)
-        )
+        # Pre-count valid turns. v34 optionally normalizes each role adapter
+        # independently so abundant critic turns cannot shrink proposer updates.
+        role_counts = {}
+        for ep, adv in zip(all_episodes, all_per_turn_adv):
+            for role, count in self._count_valid_turns_by_role(ep, adv).items():
+                role_counts[role] = role_counts.get(role, 0) + count
+        total_valid = sum(role_counts.values())
+        normalization = (self._role_normalizers(role_counts)
+                         if self.role_loss_normalization else total_valid)
         if total_valid == 0:
             if self.vllm_engine is not None:
                 self.vllm_engine.sync_lora(self.model)
@@ -164,7 +218,9 @@ class GRPOAgenticTrainer:
                "solution_pg_sum": 0.0, "interaction_pg_sum": 0.0,
                "solution_adv_abs_sum": 0.0, "interaction_adv_abs_sum": 0.0,
                "n_solution_channel": 0, "n_interaction_channel": 0,
-               "n_solution_tok": 0, "n_interaction_tok": 0}
+               "n_solution_tok": 0, "n_interaction_tok": 0,
+               "interaction_entropy_sum": 0.0,
+               "interaction_kl_sum": 0.0, "n_interaction_reg": 0}
 
         for _ in range(self.ppo_epochs):
             self.optimizer.zero_grad()
@@ -173,7 +229,7 @@ class GRPOAgenticTrainer:
             epoch_n_valid = 0
 
             for ep, adv in zip(all_episodes, all_per_turn_adv):
-                ep_loss, n_valid, diag = self._compute_loss(ep, adv, total_valid)
+                ep_loss, n_valid, diag = self._compute_loss(ep, adv, normalization)
                 if n_valid > 0:
                     did_backward = True
                 epoch_loss    += ep_loss
@@ -183,7 +239,9 @@ class GRPOAgenticTrainer:
                           "solution_pg_sum", "interaction_pg_sum",
                           "solution_adv_abs_sum", "interaction_adv_abs_sum",
                           "n_solution_channel", "n_interaction_channel",
-                          "n_solution_tok", "n_interaction_tok"):
+                          "n_solution_tok", "n_interaction_tok",
+                          "interaction_entropy_sum", "interaction_kl_sum",
+                          "n_interaction_reg"):
                     agg[k] += diag.get(k, 0)
                 agg["ratio_max"] = max(agg["ratio_max"], diag.get("ratio_max", 0.0))
 
@@ -225,6 +283,10 @@ class GRPOAgenticTrainer:
             "kl":          agg["kl_sum"] / _nt,
             "groups_total": n_groups,
             "groups_kept":  n_groups_kept,
+            "role_valid_proposer": role_counts.get("proposer", 0),
+            "role_valid_controller": role_counts.get("controller", 0),
+            "role_valid_critic": role_counts.get("critic", 0),
+            "role_valid_verifier": role_counts.get("verifier", 0),
             # ── 策略健康指标（标准 GRPO 看盘项） ──
             "entropy":     agg["ent_sum"] / _nt,      # 断崖下跌 = 熵坍塌
             "clip_frac":   agg["clip_sum"] / _npg,    # 仅统计真正收到 PG credit 的 token
@@ -244,6 +306,10 @@ class GRPOAgenticTrainer:
             "interaction_channel_count": agg["n_interaction_channel"],
             "solution_token_count": agg["n_solution_tok"],
             "interaction_token_count": agg["n_interaction_tok"],
+            "interaction_entropy": (agg["interaction_entropy_sum"] /
+                                    max(agg["n_interaction_reg"], 1)),
+            "interaction_kl": (agg["interaction_kl_sum"] /
+                               max(agg["n_interaction_reg"], 1)),
             **int_metrics,
         }
 
@@ -256,7 +322,7 @@ class GRPOAgenticTrainer:
         self,
         episode: dict,
         per_turn_adv: dict,   # turn_id → float advantage
-        normalization: int,
+        normalization,  # int total turns or {role: denominator}
     ) -> tuple:
         """Per-turn GRPO clip loss with KL penalty.
 
@@ -293,7 +359,9 @@ class GRPOAgenticTrainer:
                 "solution_pg_sum": 0.0, "interaction_pg_sum": 0.0,
                 "solution_adv_abs_sum": 0.0, "interaction_adv_abs_sum": 0.0,
                 "n_solution_channel": 0, "n_interaction_channel": 0,
-                "n_solution_tok": 0, "n_interaction_tok": 0}
+                "n_solution_tok": 0, "n_interaction_tok": 0,
+                "interaction_entropy_sum": 0.0,
+                "interaction_kl_sum": 0.0, "n_interaction_reg": 0}
 
         for msg in messages:
             turn_id = msg.get("turn_id", 0)
@@ -326,6 +394,12 @@ class GRPOAgenticTrainer:
                 advantage_spec, span_spec, valid_positions)
             if not components:
                 continue
+            interaction_indices = []
+            if role == "proposer":
+                probe = token_credit_components(
+                    {"interaction": 1.0}, span_spec, valid_positions)
+                if probe:
+                    interaction_indices = probe[0][2]
 
             # 优先复用 rollout 实际送入 vLLM 的 prompt。尤其在 executor 触发
             # clip_user() 时，根据原始 system/user 重建会得到另一条上下文，使 PPO
@@ -374,6 +448,21 @@ class GRPOAgenticTrainer:
                     _lp  = F.log_softmax(_blk, dim=-1)
                     _ent_sum += float((-(_lp.exp() * _lp).sum(-1)).sum().item())
                     del _lp, _blk
+
+            interaction_entropy = None
+            interaction_idx = None
+            layer_key = episode.get("raca_turn_data", {}).get(
+                turn_id, {}).get("layer_key")
+            entropy_allowed = (not self.interaction_entropy_correct_only
+                               or layer_key == 1)
+            if (self.interaction_entropy_coef > 0.0 and interaction_indices
+                    and entropy_allowed):
+                interaction_idx = torch.tensor(
+                    interaction_indices, dtype=torch.long, device=_resp_logits.device)
+                int_logits = _resp_logits.index_select(0, interaction_idx)
+                int_logp = F.log_softmax(int_logits, dim=-1)
+                interaction_entropy = -(int_logp.exp() * int_logp).sum(-1).mean()
+                del int_logp, int_logits
             del _resp_logits
 
             if not torch.isfinite(new_lps).all():
@@ -424,10 +513,28 @@ class GRPOAgenticTrainer:
             # 方向正确地把策略拉向 base model（GRPO 标准做法）。
             # clamp 防 exp 溢出：delta>20 时 kl 已巨大，梯度方向不变。
             delta_lp = (ref_lps[:n_align].to(new_lps.device) - new_lps[:n_align]).clamp(max=20.0)
-            kl = (torch.exp(delta_lp) - delta_lp - 1.0).mean()
-            turn_loss = pg_loss + self.kl_coef * kl
+            kl_tok = torch.exp(delta_lp) - delta_lp - 1.0
+            kl = kl_tok.mean()
+            if role == "proposer" and interaction_indices:
+                if interaction_idx is None:
+                    interaction_idx = torch.tensor(
+                        interaction_indices, dtype=torch.long, device=kl_tok.device)
+                coef = torch.full_like(kl_tok, float(self.kl_coef))
+                coef.index_fill_(0, interaction_idx, float(self.interaction_kl_coef))
+                kl_loss = (coef * kl_tok).mean()
+                int_kl = kl_tok.index_select(0, interaction_idx).mean()
+            else:
+                kl_loss = self.kl_coef * kl
+                int_kl = None
+            turn_loss = pg_loss + kl_loss
+            if interaction_entropy is not None:
+                turn_loss = turn_loss - self.interaction_entropy_coef * interaction_entropy
 
-            (turn_loss / normalization).backward()  # immediate backward
+            turn_normalization = (normalization.get(role)
+                                  if isinstance(normalization, dict) else normalization)
+            if not turn_normalization:
+                continue
+            (turn_loss / turn_normalization).backward()  # immediate backward
             total_loss += pg_loss.item()
             n_valid    += 1
 
@@ -449,6 +556,11 @@ class GRPOAgenticTrainer:
                 diag["n_pg_tok"]  += active_ratio.numel()
                 diag["resp_len_sum"] += n_resp
                 diag["n_turn"]    += 1
+                if interaction_entropy is not None:
+                    diag["interaction_entropy_sum"] += float(
+                        interaction_entropy.detach().item())
+                    diag["interaction_kl_sum"] += float(int_kl.detach().item())
+                    diag["n_interaction_reg"] += 1
 
         if n_valid == 0:
             return 0.0, 0, diag

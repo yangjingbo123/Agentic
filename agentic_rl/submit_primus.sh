@@ -122,7 +122,12 @@ echo "SFT_CKPT   = ${SFT_CKPT}"
 # ---------------------------------------------------------------------------
 # 输出 / 临时目录：全部落持久化挂载
 # ---------------------------------------------------------------------------
-EXP_NAME=${EXP_NAME:-v33_raca_aime150_balanced}
+if [[ "${SMOKE:-0}" == "1" ]]; then
+    DEFAULT_EXP_NAME=v34_raca_accuracy_smoke
+else
+    DEFAULT_EXP_NAME=v34_raca_accuracy
+fi
+EXP_NAME=${EXP_NAME:-${DEFAULT_EXP_NAME}}
 SAVE_ROOT="${PRIMUS_SAVE_CHECKPOINT_DIR:-$(pwd)/checkpoints}"
 CKPT_DIR="${SAVE_ROOT}/rl-${EXP_NAME}"
 mkdir -p "${CKPT_DIR}"

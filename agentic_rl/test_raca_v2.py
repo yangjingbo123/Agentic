@@ -1741,6 +1741,11 @@ def test_offline_eval_rows_preserve_aime_metadata():
     assert rows == [{
         "suite": "aime", "question": "q", "gold": "080",
         "prediction": "80", "is_correct": True, "n_turns": 1,
+        "initial_answer": "", "initial_is_correct": False,
+        "n_rescues": 0, "n_harms": 0,
+        "n_corrections_verified": 0, "n_corrections_accepted": 0,
+        "n_corrections_rejected": 0, "auto_stopped": False,
+        "role_calls": {}, "generated_tokens": 0,
         "year": 2025, "exam": "II", "problem": 5,
         "source": "math-ai/aime25",
     }]
@@ -2134,11 +2139,23 @@ def test_default_run_enables_aime_and_interaction_stabilizers():
     cfg = _load_flat_yaml("configs/agentic/default.yaml")
     data = _load_flat_yaml("configs/data/math.yaml")
     assert cfg["max_steps"] == 80
+    assert cfg["max_tokens"] == 1280
     assert cfg["eval_samples"] == 1000 and cfg["eval_aime_samples"] == 150
     assert cfg["malformed_interaction_credit"] is True
     assert cfg["malformed_tail_tokens"] == 4
     assert cfg["balance_interaction_layers"] is True
-    assert approx(float(cfg["interaction_balance_cap"]), 2.0)
+    assert approx(float(cfg["interaction_balance_cap"]), 4.0)
+    assert approx(float(cfg["interaction_kl_coef"]), 0.01)
+    assert approx(float(cfg["interaction_entropy_coef"]), 0.002)
+    assert cfg["interaction_entropy_correct_only"] is True
+    assert cfg["role_loss_normalization"] is True
+    assert cfg["verify_after_correction"] is True
+    assert cfg["verified_correction_gate"] is True
+    assert approx(float(cfg["correction_verifier_threshold"]), 0.5)
+    assert cfg["auto_stop_verified"] is True
+    assert cfg["flaw_in_primary_prompt"] is False
+    assert cfg["level5_curriculum"] is True
+    assert approx(float(cfg["level5_ratio_end"]), 0.75)
     assert data["aime_path"] == "data/aime_2022_2026.jsonl"
 
 
@@ -3894,6 +3911,110 @@ def test_sharded_rollout_path_absorbs_counters():
     second = rets[0].value.elts[1]
     assert isinstance(second, ast.Name) and second.id == "ex", \
         f"_run_chunk 返回的第二项不是 executor（实际 {ast.dump(second)[:60]}）"
+
+
+def test_v34_mechanical_verifier_accepts_good_correction():
+    script = {
+        "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>"],
+        "proposer": [
+            "推理过程：wrong\n最终答案：5\n" + INTER.format(a="request", t="critic"),
+            "推理过程：fixed\n最终答案：4\n" + INTER.format(a="none", t="none"),
+        ],
+        "critic": ["错误分析：第二步错误\n" + INTER.format(a="none", t="none")],
+        "verifier": ["分数: 0.9\n验证说明：修正正确\n"
+                     + INTER.format(a="none", t="none")],
+    }
+    eng = FakeEngine(script)
+    ex = _mk_executor(
+        eng, max_rounds=1, max_hops=2, stop_gate=False,
+        verify_after_correction=True, verified_correction_gate=True,
+        correction_verifier_threshold=0.5, auto_stop_verified=False)
+    result = ex.run_episodes_batch(["1+3=?"], ["4"])[0]
+    assert [x for x in eng.calls if x != "controller"] == [
+        "proposer", "critic", "proposer", "verifier"]
+    assert result["final_answer"] == "4" and result["is_correct"]
+    assert result["n_corrections_verified"] == 1
+    assert result["n_corrections_accepted"] == 1
+    assert result["n_corrections_rejected"] == 0
+    assert ex.n_correction_verified == 1
+
+
+def test_v34_verifier_gate_rejects_bad_correction():
+    script = {
+        "controller": ["<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>"],
+        "proposer": [
+            "推理过程：primary\n最终答案：4\n" + INTER.format(a="request", t="critic"),
+            "推理过程：bad fix\n最终答案：5\n" + INTER.format(a="none", t="none"),
+        ],
+        "critic": ["错误分析：误判\n" + INTER.format(a="none", t="none")],
+        "verifier": ["分数: 0.2\n验证说明：修正不可信\n"
+                     + INTER.format(a="none", t="none")],
+    }
+    eng = FakeEngine(script)
+    ex = _mk_executor(
+        eng, max_rounds=1, max_hops=2, stop_gate=False,
+        verify_after_correction=True, verified_correction_gate=True,
+        correction_verifier_threshold=0.5, auto_stop_verified=False)
+    result = ex.run_episodes_batch(["1+3=?"], ["4"])[0]
+    assert result["final_answer"] == "4" and result["is_correct"]
+    assert result["n_corrections_verified"] == 1
+    assert result["n_corrections_accepted"] == 0
+    assert result["n_corrections_rejected"] == 1
+    assert ex.n_correction_gate_rejected == 1
+
+
+def test_v34_high_confidence_consensus_auto_stops():
+    script = {
+        "controller": [
+            "<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>",
+            "<meta-plan>\ndecision: continue\nreason: r\n</meta-plan>",
+        ],
+        "proposer": [
+            "推理过程：a\n最终答案：4\n" + INTER.format(a="request", t="verifier"),
+            "推理过程：b\n最终答案：4\n" + INTER.format(a="request", t="verifier"),
+        ],
+        "critic": [],
+        "verifier": [
+            "分数: 0.9\n验证说明：ok\n" + INTER.format(a="none", t="none"),
+            "分数: 0.9\n验证说明：ok\n" + INTER.format(a="none", t="none"),
+        ],
+    }
+    eng = FakeEngine(script)
+    ex = _mk_executor(
+        eng, max_rounds=4, max_hops=1, stop_gate=False,
+        auto_stop_verified=True, auto_stop_verifier_threshold=0.85,
+        auto_stop_min_support=2)
+    result = ex.run_episodes_batch(["1+3=?"], ["4"])[0]
+    assert result["stopped"] and result["auto_stopped"]
+    assert len(result["raca_round_meta"]) == 2
+    assert ex.n_auto_stopped == 1
+    assert all(len(v) == 0 for v in eng.script.values()), eng.script
+
+
+def test_v34_trainer_and_curriculum_wiring_is_present():
+    from pathlib import Path
+    root = Path(__file__).resolve().parent
+    trainer = (root / "training/grpo_trainer.py").read_text(encoding="utf-8")
+    train_src = (root / "train.py").read_text(encoding="utf-8")
+    assert "interaction_kl_coef" in trainer
+    assert "interaction_entropy_coef" in trainer
+    assert "_role_normalizers" in trainer
+    assert "normalization.get(role)" in trainer
+    assert "level5_curriculum" in train_src
+    assert "train_level5_ratio" in train_src
+
+
+def test_v34_mechanical_stop_does_not_reward_continue_as_early_stop():
+    rounds = [make_round(0, primary="4"), make_round(1, primary="4")]
+    natural, _ = compute_turn_data(
+        rounds, "4", True, 4, CFG, stop_ctrl_tid=10, stop_sigma="verify")
+    mechanical, _ = compute_turn_data(
+        rounds, "4", True, 4, CFG, stop_ctrl_tid=None,
+        stop_sigma="verify", mechanical_stop=True)
+    assert approx(natural[10]["reward"], 1.15)
+    # Auto-stop was not the controller's action: keep outcome reward but remove
+    # the early-stop bonus from the controller's continue token.
+    assert approx(mechanical[10]["reward"], 1.0)
 
 
 if __name__ == "__main__":

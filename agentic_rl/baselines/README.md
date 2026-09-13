@@ -74,6 +74,9 @@ METHOD=fixed_four_role  bash baselines/submit_primus_system_eval.sh
 
 Each evaluation writes per-item JSONL, a summary JSON, accuracy, prompt tokens,
 generated tokens, and LLM calls per problem.
+The system evaluator loads one model/vLLM engine for both suites. Completed
+JSONL outputs are reused, so a failed AIME stage does not rerun a completed
+MATH-1000 evaluation.
 
 ## Fairness rules
 

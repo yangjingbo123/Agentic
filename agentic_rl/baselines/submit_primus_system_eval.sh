@@ -68,14 +68,9 @@ cat > "${OUT_ROOT}/system_manifest.json" <<EOF
 }
 EOF
 EAGER_ARG="--enforce_eager"; [[ "${ENFORCE_EAGER:-true}" == true ]] || EAGER_ARG=""
-COMMON=(--method "${METHOD}" --checkpoint "${SFT_CKPT}" --model_path "${MODEL_PATH}" \
-        --batch_size "${BATCH_SIZE:-16}" --n_samples "${N_SAMPLES}" \
-        --temperature "${TEMPERATURE:-0.7}" --vllm_use_v1 "${VLLM_V1}")
-python baselines/evaluate_system.py "${COMMON[@]}" ${EAGER_ARG} \
-  --suite math_l5 --data data/math_test.jsonl --max_samples 1000 \
-  --output "${OUT_ROOT}/math_l5.jsonl"
-python baselines/evaluate_system.py "${COMMON[@]}" ${EAGER_ARG} \
-  --suite aime --data data/aime_2022_2026.jsonl --max_samples 150 \
-  --output "${OUT_ROOT}/aime.jsonl"
-python baselines/summarize.py "${OUT_ROOT}/math_l5.jsonl" "${OUT_ROOT}/aime.jsonl" \
-  --output "${OUT_ROOT}/combined_summary.json"
+python baselines/evaluate_system.py \
+  --method "${METHOD}" --checkpoint "${SFT_CKPT}" --model_path "${MODEL_PATH}" \
+  --suite all --math_data data/math_test.jsonl --aime_data data/aime_2022_2026.jsonl \
+  --math_samples 1000 --aime_samples 150 --output_dir "${OUT_ROOT}" \
+  --batch_size "${BATCH_SIZE:-16}" --n_samples "${N_SAMPLES}" \
+  --temperature "${TEMPERATURE:-0.7}" --vllm_use_v1 "${VLLM_V1}" ${EAGER_ARG}

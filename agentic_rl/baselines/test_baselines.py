@@ -320,5 +320,29 @@ def test_baseline_hydra_entry_uses_absolute_config_directory():
         assert "from train import main as hydra_main" not in wrapper
 
 
+def test_system_launcher_uses_one_engine_for_both_suites():
+    source = (ROOT / "baselines" / "submit_primus_system_eval.sh").read_text(
+        encoding="utf-8")
+    assert source.count("python baselines/evaluate_system.py") == 1
+    assert "--suite all" in source
+    assert "--output_dir" in source
+
+
+def test_completed_system_output_is_resumable(tmp_dir=None):
+    import tempfile
+    from baselines.evaluate_system import complete_rows
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "math.jsonl"
+        rows = [
+            {"method": "sft_cot", "suite": "math_l5", "question": str(i),
+             "gold": "1", "prediction": "1", "is_correct": True}
+            for i in range(3)
+        ]
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        assert complete_rows(str(path), 3, "math_l5") == rows
+        assert complete_rows(str(path), 4, "math_l5") is None
+        assert complete_rows(str(path), 3, "aime") is None
+
+
 if __name__ == "__main__":
     run()

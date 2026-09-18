@@ -13,7 +13,8 @@ if str(ROOT) not in sys.path:
 from baselines.registry import CREDIT_ASSIGNERS
 
 TRAINABLE = set(CREDIT_ASSIGNERS)
-SYSTEMS = {"sft_cot", "self_consistency", "self_refine", "fixed_four_role"}
+SYSTEMS = {"sft_cot", "self_consistency", "self_refine", "fixed_four_role",
+           "iterative_proposal_voting"}
 
 
 def rows(path):

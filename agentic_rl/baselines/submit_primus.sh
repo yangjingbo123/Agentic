@@ -9,6 +9,7 @@
 #   bash baselines/submit_primus.sh outcome_grpo
 #   SEED=2 SMOKE=1 bash baselines/submit_primus.sh at_grpo
 #   N_SAMPLES=8 bash baselines/submit_primus.sh self_consistency
+#   N_INDEPENDENT=3 N_INTERACTIVE=2 bash baselines/submit_primus.sh iterative_proposal_voting
 #   bash baselines/submit_primus.sh --list
 #   bash baselines/submit_primus.sh --dry-run gigpo
 #
@@ -38,6 +39,9 @@ Evaluation-only system baselines:
   self_consistency       N-sample majority vote (N_SAMPLES=8 by default)
   self_refine            Initial answer + feedback + one refinement
   fixed_four_role        Fixed four-role SFT pipeline
+  iterative_proposal_voting
+                         3 independent + 2 pool-conditioned proposer answers,
+                         equivalence-majority vote, proposer-only tie breaks
 
 Options:
   --list                 Print method names only
@@ -53,6 +57,8 @@ Common environment variables:
 
 Evaluation variables:
   N_SAMPLES=8, BATCH_SIZE=16, TEMPERATURE=0.7
+  N_INDEPENDENT=3, N_INTERACTIVE=2, MAX_TIE_BREAK=2
+  PROPOSAL_CONTEXT_CHARS=600
 
 RACA is intentionally rejected. Use ../submit_primus.sh only for the existing
 RACA experiment; it must not be rerun as a baseline.
@@ -63,7 +69,8 @@ list_methods() {
   printf '%s\n' \
     outcome_grpo role_reward at_grpo gigpo \
     single_agent_grpo fixed_four_role_grpo \
-    sft_cot self_consistency self_refine fixed_four_role
+    sft_cot self_consistency self_refine fixed_four_role \
+    iterative_proposal_voting
 }
 
 if [[ ${1:-} == "--list" ]]; then
@@ -98,7 +105,7 @@ case "${METHOD}" in
     TARGET="${SCRIPT_DIR}/submit_primus_baseline.sh"
     COMMAND=(env "BASELINE_NAME=${METHOD}" bash "${TARGET}" "$@")
     ;;
-  sft_cot|self_consistency|self_refine|fixed_four_role)
+  sft_cot|self_consistency|self_refine|fixed_four_role|iterative_proposal_voting)
     if (( $# )); then
       echo "ERROR: evaluation baselines accept configuration through environment variables, not positional arguments." >&2
       echo "Use N_SAMPLES=..., BATCH_SIZE=..., or TEMPERATURE=... before the command." >&2

@@ -21,6 +21,7 @@ bash baselines/submit_primus.sh sft_cot
 bash baselines/submit_primus.sh self_consistency
 bash baselines/submit_primus.sh self_refine
 bash baselines/submit_primus.sh fixed_four_role
+bash baselines/submit_primus.sh iterative_proposal_voting
 ```
 
 The front-end dispatches trainable methods to `submit_primus_baseline.sh` and
@@ -70,6 +71,7 @@ METHOD=sft_cot          bash baselines/submit_primus_system_eval.sh
 METHOD=self_consistency bash baselines/submit_primus_system_eval.sh
 METHOD=self_refine      bash baselines/submit_primus_system_eval.sh
 METHOD=fixed_four_role  bash baselines/submit_primus_system_eval.sh
+METHOD=iterative_proposal_voting bash baselines/submit_primus_system_eval.sh
 ```
 
 Each evaluation writes per-item JSONL, a summary JSON, accuracy, prompt tokens,
@@ -77,6 +79,14 @@ generated tokens, and LLM calls per problem.
 The system evaluator loads one model/vLLM engine for both suites. Completed
 JSONL outputs are reused, so a failed AIME stage does not rerun a completed
 MATH-1000 evaluation.
+
+`iterative_proposal_voting` is proposer-only and does not call a controller,
+critic, or verifier. It generates three independent solutions, then two more
+solutions conditioned on a compact blackboard of prior candidates. Answers are
+clustered with the project mathematical-equivalence grader and receive uniform
+votes. A tied vote requests up to two additional proposer solutions. Configure
+it with `N_INDEPENDENT`, `N_INTERACTIVE`, `MAX_TIE_BREAK`, and
+`PROPOSAL_CONTEXT_CHARS`.
 
 ## Fairness rules
 

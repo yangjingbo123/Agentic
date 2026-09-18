@@ -1,7 +1,5 @@
 """Small batched runtimes for system-level baselines."""
 
-from collections import Counter
-
 from agents.agentic_executor import math_equal
 from agents.parsing import parse_reasoning, parse_score
 from baselines.systems import prompts
@@ -28,11 +26,15 @@ def message(role, prompt, text, lps, ids):
             "response": text, "response_ids": ids, "log_probs": lps}
 
 
-def majority_answer(answers):
-    """Majority vote under the project's mathematical-equivalence grader."""
+def vote_profile(answers):
+    """Equivalence-aware vote statistics with a stable first-class tie break."""
     valid = [a for a in answers if a]
     if not valid:
-        return ""
+        return {
+            "answer": "", "is_tie": True, "valid_votes": 0,
+            "n_distinct": 0, "winning_votes": 0, "vote_margin": 0.0,
+            "representatives": [], "counts": [],
+        }
     representatives = []
     counts = []
     for answer in valid:
@@ -47,8 +49,25 @@ def majority_answer(answers):
         else:
             counts[matched] += 1
     best = max(counts)
-    # Stable tie break: first sampled equivalence class.
-    return representatives[counts.index(best)]
+    leaders = [idx for idx, count in enumerate(counts) if count == best]
+    second = (best if len(leaders) > 1 else
+              max((count for count in counts if count < best), default=0))
+    return {
+        # Stable tie break: first sampled equivalence class.
+        "answer": representatives[leaders[0]],
+        "is_tie": len(leaders) > 1,
+        "valid_votes": len(valid),
+        "n_distinct": len(representatives),
+        "winning_votes": best,
+        "vote_margin": (best - second) / max(len(valid), 1),
+        "representatives": representatives,
+        "counts": counts,
+    }
+
+
+def majority_answer(answers):
+    """Majority vote under the project's mathematical-equivalence grader."""
+    return vote_profile(answers)["answer"]
 
 
 class SingleAgentExecutor:
@@ -105,9 +124,12 @@ class SingleAgentExecutor:
 
 
 class SystemEvaluator:
-    METHODS = {"sft_cot", "self_consistency", "self_refine", "fixed_four_role"}
+    METHODS = {"sft_cot", "self_consistency", "self_refine",
+               "fixed_four_role", "iterative_proposal_voting"}
 
-    def __init__(self, tokenizer, engine, method, n_samples=8, temperature=0.0):
+    def __init__(self, tokenizer, engine, method, n_samples=8, temperature=0.0,
+                 independent_proposals=3, interactive_proposals=2,
+                 max_tie_break_proposals=2, proposal_context_chars=600):
         if method not in self.METHODS:
             raise ValueError("unknown system baseline %r" % method)
         self.tokenizer = tokenizer
@@ -115,6 +137,10 @@ class SystemEvaluator:
         self.method = method
         self.n_samples = max(1, int(n_samples))
         self.temperature = float(temperature)
+        self.independent_proposals = max(1, int(independent_proposals))
+        self.interactive_proposals = max(0, int(interactive_proposals))
+        self.max_tie_break_proposals = max(0, int(max_tie_break_proposals))
+        self.proposal_context_chars = max(80, int(proposal_context_chars))
 
     def _generate(self, role, systems, users, temperature=None):
         ps = [render(self.tokenizer, s, u) for s, u in zip(systems, users)]
@@ -134,6 +160,8 @@ class SystemEvaluator:
             return self._self_consistency(questions, golds)
         if self.method == "self_refine":
             return self._self_refine(questions, golds)
+        if self.method == "iterative_proposal_voting":
+            return self._iterative_proposal_voting(questions, golds)
         return self._fixed_four_role(questions, golds)
 
     def _episode(self, gold, answer, calls, extra=None):
@@ -164,6 +192,118 @@ class SystemEvaluator:
             result.append(self._episode(gold, majority_answer(answers), calls,
                                         {"candidate_answers": answers}))
         return result
+
+    @staticmethod
+    def _proposal_record(row, phase):
+        reasoning, answer = parse_reasoning(row["text"])
+        return {
+            "text": row["text"], "reasoning": reasoning, "answer": answer,
+            "phase": phase,
+        }
+
+    def _iterative_proposal_voting(self, questions, golds):
+        """Generate only proposer answers, then equivalence-majority vote.
+
+        The first proposals are independent samples. Later proposals see a
+        compact blackboard of earlier answers/reasoning and must solve again.
+        Ties trigger additional proposer answers; no critic, verifier, routing,
+        or weighted vote is used.
+        """
+        n = len(questions)
+        pools = [[] for _ in questions]
+        calls = [[] for _ in questions]
+        sample_temperature = max(self.temperature, 0.7)
+
+        expanded_questions = [
+            question for question in questions
+            for _ in range(self.independent_proposals)
+        ]
+        independent_indices = [
+            idx + 1 for _question in questions
+            for idx in range(self.independent_proposals)
+        ]
+        independent = self._generate(
+            "proposer",
+            [prompts.PROPOSAL_VOTING_SYSTEM] * len(expanded_questions),
+            [prompts.independent_proposal_user(question, idx)
+             for question, idx in zip(expanded_questions, independent_indices)],
+            sample_temperature,
+        )
+        for question_idx in range(n):
+            start = question_idx * self.independent_proposals
+            rows = independent[start:start + self.independent_proposals]
+            for row in rows:
+                calls[question_idx].append(row)
+                pools[question_idx].append(
+                    self._proposal_record(row, "independent"))
+
+        for _round in range(self.interactive_proposals):
+            users = [prompts.proposal_pool_user(
+                question, pool, len(pool) + 1,
+                max_reasoning_chars=self.proposal_context_chars)
+                for question, pool in zip(questions, pools)]
+            generated = self._generate(
+                "proposer", [prompts.PROPOSAL_VOTING_SYSTEM] * n,
+                users, sample_temperature)
+            for idx, row in enumerate(generated):
+                calls[idx].append(row)
+                pools[idx].append(self._proposal_record(row, "interactive"))
+
+        tie_break_counts = [0] * n
+        unresolved = [idx for idx, pool in enumerate(pools)
+                      if vote_profile([p["answer"] for p in pool])["is_tie"]]
+        for _round in range(self.max_tie_break_proposals):
+            if not unresolved:
+                break
+            users = [prompts.proposal_pool_user(
+                questions[idx], pools[idx], len(pools[idx]) + 1,
+                max_reasoning_chars=self.proposal_context_chars,
+                tie_break=True) for idx in unresolved]
+            generated = self._generate(
+                "proposer",
+                [prompts.PROPOSAL_VOTING_SYSTEM] * len(unresolved),
+                users, sample_temperature)
+            next_unresolved = []
+            for idx, row in zip(unresolved, generated):
+                calls[idx].append(row)
+                pools[idx].append(self._proposal_record(row, "tie_break"))
+                tie_break_counts[idx] += 1
+                profile = vote_profile([p["answer"] for p in pools[idx]])
+                if profile["is_tie"]:
+                    next_unresolved.append(idx)
+            unresolved = next_unresolved
+
+        results = []
+        for gold, pool, proposal_calls, n_tie in zip(
+                golds, pools, calls, tie_break_counts):
+            answers = [candidate["answer"] for candidate in pool]
+            profile = vote_profile(answers)
+            answer = profile["answer"]
+            class_counts = [
+                {"answer": representative, "votes": count}
+                for representative, count in zip(
+                    profile["representatives"], profile["counts"])
+            ]
+            results.append(self._episode(gold, answer, proposal_calls, {
+                "initial_answer": answers[0] if answers else "",
+                "initial_is_correct": bool(
+                    answers and math_equal(answers[0], gold)),
+                "candidate_answers": answers,
+                "candidate_correctness": [
+                    bool(candidate and math_equal(candidate, gold))
+                    for candidate in answers],
+                "proposal_phases": [candidate["phase"] for candidate in pool],
+                "n_independent_proposals": self.independent_proposals,
+                "n_interactive_proposals": self.interactive_proposals,
+                "n_tie_break_proposals": n_tie,
+                "n_distinct_answers": profile["n_distinct"],
+                "winning_votes": profile["winning_votes"],
+                "valid_votes": profile["valid_votes"],
+                "vote_margin": profile["vote_margin"],
+                "vote_classes": class_counts,
+                "unresolved_tie": profile["is_tie"],
+            }))
+        return results
 
     def _self_refine(self, questions, golds):
         initial = self._generate("proposer", [prompts.SINGLE_SYSTEM] * len(questions),

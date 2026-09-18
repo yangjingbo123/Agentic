@@ -50,6 +50,29 @@ def summary_from_rows(rows, method, suite):
         values = [float(row[src]) for row in rows if src in row]
         if values:
             summary[dst] = sum(values) / len(values)
+    if any("initial_is_correct" in row for row in rows):
+        values = [bool(row.get("initial_is_correct")) for row in rows]
+        summary["initial_accuracy"] = sum(values) / len(values)
+        summary["accuracy_gain_over_initial"] = (
+            summary["accuracy"] - summary["initial_accuracy"])
+    if any("candidate_correctness" in row for row in rows):
+        candidates = [bool(value) for row in rows
+                      for value in row.get("candidate_correctness", [])]
+        if candidates:
+            summary["proposal_accuracy"] = sum(candidates) / len(candidates)
+            summary["total_proposals"] = len(candidates)
+        for src, dst in (
+                ("n_distinct_answers", "distinct_answers_per_problem"),
+                ("winning_votes", "winning_votes_per_problem"),
+                ("vote_margin", "vote_margin_mean"),
+                ("n_tie_break_proposals", "tie_break_calls_per_problem")):
+            values = [float(row[src]) for row in rows if src in row]
+            if values:
+                summary[dst] = sum(values) / len(values)
+        summary["tie_break_problem_rate"] = sum(
+            1 for row in rows if row.get("n_tie_break_proposals", 0) > 0) / n
+        summary["unresolved_tie_rate"] = sum(
+            1 for row in rows if row.get("unresolved_tie")) / n
     if suite == "aime":
         summary["by_year"] = {}
         for year in sorted({row.get("year") for row in rows if row.get("year")}):
@@ -100,6 +123,15 @@ def evaluate_suite(evaluator, dataset, method, suite, output, batch_size):
             "prompt_tokens": episode["prompt_tokens"],
             "generated_tokens": episode["generated_tokens"],
         }
+        for key in (
+                "initial_answer", "initial_is_correct", "candidate_answers",
+                "candidate_correctness", "proposal_phases",
+                "n_independent_proposals", "n_interactive_proposals",
+                "n_tie_break_proposals", "n_distinct_answers",
+                "winning_votes", "valid_votes", "vote_margin",
+                "vote_classes", "unresolved_tie"):
+            if key in episode:
+                row[key] = episode[key]
         for key in ("year", "exam", "problem", "level"):
             if key in item:
                 row[key] = item[key]
@@ -119,6 +151,15 @@ def evaluate_suite(evaluator, dataset, method, suite, output, batch_size):
         summary.get("prompt_tokens_per_problem", 0.0),
         summary.get("generated_tokens_per_problem", 0.0),
         summary.get("llm_calls_per_problem", 0.0)))
+    if "proposal_accuracy" in summary:
+        print("initial_acc=%.4f proposal_acc=%.4f gain=%+.4f "
+              "distinct/problem=%.2f tie_break_rate=%.3f unresolved_tie=%.3f" % (
+                  summary.get("initial_accuracy", 0.0),
+                  summary["proposal_accuracy"],
+                  summary.get("accuracy_gain_over_initial", 0.0),
+                  summary.get("distinct_answers_per_problem", 0.0),
+                  summary.get("tie_break_problem_rate", 0.0),
+                  summary.get("unresolved_tie_rate", 0.0)))
     if "by_year" in summary:
         print("AIME years=" + ",".join(
             "%s:%d/%d" % (year, value["correct"], value["total"])
@@ -132,7 +173,8 @@ def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--method", required=True,
                         choices=["sft_cot", "self_consistency", "self_refine",
-                                 "fixed_four_role"])
+                                 "fixed_four_role",
+                                 "iterative_proposal_voting"])
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--model_path", required=True)
     parser.add_argument("--suite", default="all",
@@ -150,6 +192,10 @@ def build_parser():
     parser.add_argument("--no_resume", action="store_true")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--n_samples", type=int, default=8)
+    parser.add_argument("--independent_proposals", type=int, default=3)
+    parser.add_argument("--interactive_proposals", type=int, default=2)
+    parser.add_argument("--max_tie_break_proposals", type=int, default=2)
+    parser.add_argument("--proposal_context_chars", type=int, default=600)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max_tokens", type=int, default=1024)
     parser.add_argument("--max_model_len", type=int, default=4096)
@@ -216,7 +262,11 @@ def main():
             engine.sync_lora(model)
             evaluator = SystemEvaluator(
                 tokenizer, engine, args.method, n_samples=args.n_samples,
-                temperature=args.temperature)
+                temperature=args.temperature,
+                independent_proposals=args.independent_proposals,
+                interactive_proposals=args.interactive_proposals,
+                max_tie_break_proposals=args.max_tie_break_proposals,
+                proposal_context_chars=args.proposal_context_chars)
             for suite, dataset, output in pending:
                 summaries[suite] = evaluate_suite(
                     evaluator, dataset, args.method, suite, output,

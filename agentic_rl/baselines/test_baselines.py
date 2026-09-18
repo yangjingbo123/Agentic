@@ -16,7 +16,7 @@ from baselines.credit.gigpo import GiGPOAssigner
 from baselines.credit.outcome_grpo import OutcomeGRPOAssigner
 from baselines.credit.role_reward import RoleRewardAssigner
 from baselines.registry import build_credit_assigner
-from baselines.systems.runtime import majority_answer
+from baselines.systems.runtime import majority_answer, vote_profile
 
 
 def approx(a, b, eps=1e-7):
@@ -117,13 +117,17 @@ def test_majority_answer_has_stable_tie_break():
     assert majority_answer(["2", "1", "1", "2"]) == "2"
     assert majority_answer(["", "3", ""]) == "3"
     assert majority_answer(["080", "80", "079"]) in ("080", "80")
+    tied = vote_profile(["2", "1", "1", "2"])
+    assert tied["is_tie"] and tied["winning_votes"] == 2
+    assert tied["n_distinct"] == 2
+    assert tied["vote_margin"] == 0.0
 
 
 def test_baseline_configs_exist_and_do_not_include_raca():
     names = {p.stem for p in (ROOT / "baselines" / "configs").glob("*.yaml")}
     expected = {"outcome_grpo", "role_reward", "at_grpo", "gigpo",
                 "single_agent_grpo", "fixed_four_role_grpo", "sft_cot", "self_consistency",
-                "self_refine", "fixed_four_role"}
+                "self_refine", "fixed_four_role", "iterative_proposal_voting"}
     assert expected <= names
     assert "raca" not in names
 
@@ -199,7 +203,8 @@ def test_single_agent_executor_contract():
 def test_system_baseline_call_budgets():
     from baselines.systems.runtime import SystemEvaluator
     expected = {"sft_cot": 1, "self_consistency": 4,
-                "self_refine": 3, "fixed_four_role": 5}
+                "self_refine": 3, "fixed_four_role": 5,
+                "iterative_proposal_voting": 5}
     for method, calls in expected.items():
         engine = _FakeEngine()
         evaluator = SystemEvaluator(
@@ -208,6 +213,40 @@ def test_system_baseline_call_budgets():
         assert rows[0]["n_calls"] == calls, (method, rows[0]["n_calls"])
         assert len(engine.calls) == calls
         assert rows[0]["is_correct"]
+        if method == "iterative_proposal_voting":
+            assert all(call["role"] == "proposer" for call in engine.calls)
+            assert all("已有候选池" in call["prompt"] for call in engine.calls[-2:])
+            assert rows[0]["proposal_phases"] == [
+                "independent", "independent", "independent",
+                "interactive", "interactive"]
+            assert rows[0]["n_tie_break_proposals"] == 0
+
+
+class _ScriptedEngine:
+    def __init__(self, answers):
+        self.answers = iter(answers)
+        self.calls = []
+
+    def generate_batch(self, requests):
+        self.calls.extend(requests)
+        return [_Result("推理过程：独立推导\n最终答案：%s" % next(self.answers))
+                for _request in requests]
+
+
+def test_iterative_proposal_voting_resolves_tie_with_proposer_only():
+    from baselines.systems.runtime import SystemEvaluator
+    engine = _ScriptedEngine(["1", "2", "3", "2"])
+    evaluator = SystemEvaluator(
+        _FakeTokenizer(), engine, "iterative_proposal_voting",
+        independent_proposals=3, interactive_proposals=0,
+        max_tie_break_proposals=2, temperature=0.7)
+    row = evaluator.run_batch(["q"], ["2"])[0]
+    assert row["final_answer"] == "2"
+    assert row["is_correct"]
+    assert row["n_calls"] == 4
+    assert row["n_tie_break_proposals"] == 1
+    assert row["proposal_phases"][-1] == "tie_break"
+    assert all(call["role"] == "proposer" for call in engine.calls)
 
 
 def test_fixed_pipeline_training_executor_contract():
@@ -285,6 +324,7 @@ def test_unified_launcher_dispatch_and_guards():
         "outcome_grpo", "role_reward", "at_grpo", "gigpo",
         "single_agent_grpo", "fixed_four_role_grpo", "sft_cot",
         "self_consistency", "self_refine", "fixed_four_role",
+        "iterative_proposal_voting",
     }
     assert set(listed) == expected
 
@@ -342,6 +382,30 @@ def test_completed_system_output_is_resumable(tmp_dir=None):
         assert complete_rows(str(path), 3, "math_l5") == rows
         assert complete_rows(str(path), 4, "math_l5") is None
         assert complete_rows(str(path), 3, "aime") is None
+
+
+def test_proposal_voting_summary_fields():
+    from baselines.evaluate_system import summary_from_rows
+    rows = [
+        {"is_correct": True, "initial_is_correct": False,
+         "candidate_correctness": [False, True, True, False, True],
+         "n_distinct_answers": 2, "winning_votes": 3,
+         "vote_margin": 0.2, "n_tie_break_proposals": 0,
+         "unresolved_tie": False},
+        {"is_correct": False, "initial_is_correct": True,
+         "candidate_correctness": [True, False, False, False, False, False],
+         "n_distinct_answers": 3, "winning_votes": 2,
+         "vote_margin": 0.0, "n_tie_break_proposals": 1,
+         "unresolved_tie": True},
+    ]
+    summary = summary_from_rows(
+        rows, "iterative_proposal_voting", "math_l5")
+    assert approx(summary["accuracy"], 0.5)
+    assert approx(summary["initial_accuracy"], 0.5)
+    assert approx(summary["proposal_accuracy"], 4 / 11)
+    assert approx(summary["distinct_answers_per_problem"], 2.5)
+    assert approx(summary["tie_break_problem_rate"], 0.5)
+    assert approx(summary["unresolved_tie_rate"], 0.5)
 
 
 if __name__ == "__main__":

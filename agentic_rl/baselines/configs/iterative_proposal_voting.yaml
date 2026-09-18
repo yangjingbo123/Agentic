@@ -1,0 +1,10 @@
+name: iterative_proposal_voting
+training: none
+roles:
+  - proposer
+independent_proposals: 3
+interactive_proposals: 2
+max_tie_break_proposals: 2
+proposal_context_chars: 600
+temperature: 0.7
+vote_mode: uniform_equivalence_majority

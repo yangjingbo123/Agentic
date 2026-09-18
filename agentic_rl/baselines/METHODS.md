@@ -49,3 +49,10 @@ measurement only and is disabled in the approved configuration.
   verifier; routing is fixed and the corrected answer is returned.
 - **Fixed Four-Role + Outcome GRPO:** the same fixed pipeline trained with shared
   terminal correctness.
+- **Iterative Proposal Voting:** proposer-only system with three independent
+  solutions followed by two pool-conditioned solutions. Every call emits a
+  complete answer; mathematically equivalent answers receive uniform votes.
+  Ties are resolved only by additional proposer answers (up to two), never by a
+  critic, verifier, learned router, or weighted vote. This differs from
+  Self-Consistency because the final two proposals observe the prior candidate
+  pool.

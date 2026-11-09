@@ -38,6 +38,7 @@ class AgenticExecutor:
         self.model = model              # v2 rollout 不再直接用训练模型前向，仅保留引用
         self.tokenizer = tokenizer
         self.cfg = dict(config)
+        self.rebuttal_diagnostics = bool(config.get("rebuttal_diagnostics", True))
         self.max_tokens = config.get("max_tokens", 512)
         self.max_rounds = config.get("max_rounds", 4)
         self.max_hops = config.get("max_hops", 2)        # 0 = 消融A：禁用交互
@@ -149,6 +150,7 @@ class AgenticExecutor:
         log_probs_list = [[] for _ in range(n)]
         turn_counters  = [0] * n
         round_records  = [[] for _ in range(n)]
+        controller_records = [[] for _ in range(n)]
         corr_answers   = [[] for _ in range(n)]   # 全部修正票
         accepted_corr_answers = [[] for _ in range(n)]  # verifier 通过的修正票
         stop_ctrl_tids = [None] * n
@@ -397,6 +399,9 @@ class AgenticExecutor:
                 "finish_reason": finish_reason,
                 "stop_reason": stop_reason,
             }
+            if self.rebuttal_diagnostics and prompt_text is not None:
+                message["input_token_count"] = len(self.tokenizer.encode(
+                    prompt_text, add_special_tokens=False))
             if split_credit:
                 spans, split_error, gap_tokens, method = token_credit_spans(text, token_ids)
                 message["credit_spans"] = spans
@@ -501,6 +506,21 @@ class AgenticExecutor:
                 text = record(i, "controller", sys, usr, res, tid,
                               prompt_text=prompt)
                 gate_blocked = False
+                if self.rebuttal_diagnostics:
+                    decision = parse_decision(text)
+                    has_score = bool(blackboards[i].scores)
+                    accepted = decision == "stop" and (not self.stop_gate or has_score)
+                    visible_answers = [a for a in blackboards[i].get_distinct_answers() if a]
+                    best_answer = (max(visible_answers, key=blackboards[i].get_avg_score)
+                                   if has_score and visible_answers else None)
+                    controller_records[i].append(dict(
+                        tid=tid, round=len(round_records[i]), context=sigma_map[i],
+                        decision=decision, score_available=has_score,
+                        latest_score=blackboards[i].scores[-1][1] if has_score else None,
+                        displayed_best_score=(blackboards[i].get_avg_score(best_answer)
+                                              if best_answer is not None else None),
+                        n_scores=len(blackboards[i].scores), accepted=accepted,
+                        blocked=decision == "stop" and not accepted))
                 if parse_decision(text) == "stop":
                     # stop 闸门：黑板存在 verifier 分数才允许终止（§2.1 约束）
                     if (not self.stop_gate) or blackboards[i].scores:
@@ -691,6 +711,7 @@ class AgenticExecutor:
                             bb.add_message(Message(1, MessageType.FLAW, {"content": shown}))
                         st["critic_turns"].append({
                             "tid": tid, "flagged": flagged,
+                            "hop": _hop + 1,
                             "reviewed_answer": reviewed,
                             "correction_followed": False,
                         })
@@ -769,6 +790,7 @@ class AgenticExecutor:
                         ep_st[i]["verifier_turns"].append({
                             "tid": tid, "score": score,
                             "reviewed_answer": reviewed, "mechanical": True,
+                            "source": "correction_verification",
                         })
                         register_verification(i, ep_st[i], reviewed, score)
 
@@ -809,6 +831,7 @@ class AgenticExecutor:
                             (reviewed, score if score is not None else 0.5)))
                         ep_st[i]["verifier_turns"].append({
                             "tid": tid, "score": score, "reviewed_answer": reviewed,
+                            "source": "gate_unlock",
                         })
                         register_verification(i, ep_st[i], reviewed, score)
                     self.n_gate_unlocked += len(unlock_info)
@@ -902,7 +925,10 @@ class AgenticExecutor:
                     if blackboards[i].traces else Counter())
             n_votes = sum(pool.values())
             top2 = pool.most_common(2)
+            last_candidate = blackboards[i].traces[-1][1] if blackboards[i].traces else ""
+            last_primary = round_records[i][-1]["primary_answer"] if round_records[i] else ""
             results.append({
+                "question": questions[i],
                 "messages":        all_messages[i],
                 "turn_ids":        turn_ids_list[i],
                 "log_probs":       log_probs_list[i],
@@ -941,6 +967,12 @@ class AgenticExecutor:
                     round_records[i]
                     and math_equal(round_records[i][0]["primary_answer"],
                                    correct_answers[i])),
+                "last_candidate_answer": last_candidate,
+                "last_candidate_is_correct": bool(last_candidate) and math_equal(
+                    last_candidate, correct_answers[i]),
+                "last_primary_answer": last_primary,
+                "last_primary_is_correct": bool(last_primary) and math_equal(
+                    last_primary, correct_answers[i]),
                 "n_rescues": int(sum(1 for meta in round_meta if meta.get("flip"))),
                 "n_harms": int(sum(1 for meta in round_meta if meta.get("unflip"))),
                 "role_calls": dict(Counter(
@@ -948,6 +980,11 @@ class AgenticExecutor:
                 "generated_tokens": int(sum(
                     len(msg.get("response_ids", [])) for msg in all_messages[i])),
             })
+            if self.rebuttal_diagnostics:
+                from training.rebuttal_diagnostics import episode_diagnostics
+                results[-1]["rebuttal"] = episode_diagnostics(
+                    round_records[i], correct_answers[i], turn_data,
+                    controller_records[i], blackboards[i].traces, all_messages[i])
         return results
 
     # ── 分片计数器聚合（v3.2 第十三轮） ─────────────────────────────────────

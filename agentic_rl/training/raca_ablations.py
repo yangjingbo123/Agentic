@@ -48,11 +48,13 @@ def make_ablated_advantage_fn(ablation):
             % (ablation, ", ".join(_ABLATIONS)))
 
     def _fn(turn_data_list, delta=1e-4,
-            balance_interaction_layers=False, interaction_balance_cap=2.0):
+            balance_interaction_layers=False, interaction_balance_cap=2.0,
+            diagnostics=None):
         return compute_raca_advantages_ablated(
             turn_data_list, ablation=mode, delta=delta,
             balance_interaction_layers=balance_interaction_layers,
-            interaction_balance_cap=interaction_balance_cap)
+            interaction_balance_cap=interaction_balance_cap,
+            diagnostics=diagnostics)
 
     return _fn
 
@@ -63,6 +65,7 @@ def compute_raca_advantages_ablated(
     delta: float = 1e-4,
     balance_interaction_layers: bool = False,
     interaction_balance_cap: float = 2.0,
+    diagnostics: list | None = None,
 ) -> list:
     """Ablated variant of :func:`training.raca_adv.compute_raca_advantages`.
 
@@ -74,7 +77,8 @@ def compute_raca_advantages_ablated(
         return _orig(
             turn_data_list, delta=delta,
             balance_interaction_layers=balance_interaction_layers,
-            interaction_balance_cap=interaction_balance_cap)
+            interaction_balance_cap=interaction_balance_cap,
+            diagnostics=diagnostics)
     if mode not in _ABLATIONS:
         raise ValueError("unknown RACA ablation %r" % (ablation,))
 
@@ -168,6 +172,9 @@ def compute_raca_advantages_ablated(
         for _ep_idx, _tid, r, dk, _name, _weight in entries:
             reps.setdefault(dk, r)
         rep_rewards = list(reps.values())
+        if diagnostics is not None:
+            from training.rebuttal_diagnostics import anchor_record
+            diagnostics.append(anchor_record(key, entries, rep_rewards, delta))
         if len(rep_rewards) < 2:
             continue
         mu, sig = _mean_std(rep_rewards)

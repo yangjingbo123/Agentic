@@ -33,6 +33,8 @@ class GRPOAgenticTrainer:
         self.max_grad_norm = config.get("max_grad_norm", 1.0)
         self.ppo_epochs    = config.get("ppo_epochs", 1)
         self.raca_delta    = config.get("raca_delta", 1e-4)   # variance floor
+        self.rebuttal_diagnostics = bool(config.get("rebuttal_diagnostics", True))
+        self.last_credit_report = None
         self.kl_coef       = config.get("kl_coef", 0.04)      # KL penalty coefficient
         # v34: keep solution reasoning anchored to SFT while allowing the short
         # interaction block to escape the SFT policy's near-deterministic request habit.
@@ -135,6 +137,8 @@ class GRPOAgenticTrainer:
         n_groups_kept = 0   # ...that produced at least one usable advantage
         int_layer_count = {0: 0, 1: 0}
         int_layer_abs = {0: 0.0, 1: 0.0}
+        audit_groups, audit_advantages, audit_anchors = [], [], []
+        self.last_credit_report = None
 
         # v2 证据指标：对全部 rollout 统计（含被优势过滤掉的 episode）
         int_metrics = self._interaction_metrics(batch_rollouts)
@@ -143,12 +147,20 @@ class GRPOAgenticTrainer:
             if len(episode_group) < 2:
                 continue
             n_groups += 1
+            question_anchors = [] if getattr(self, "rebuttal_diagnostics", True) else None
             per_ep_adv = compute_raca_advantages(
                 [ep.get("raca_turn_data", {}) for ep in episode_group],
                 delta=self.raca_delta,
                 balance_interaction_layers=self.balance_interaction_layers,
                 interaction_balance_cap=self.interaction_balance_cap,
+                diagnostics=question_anchors,
             )
+            if question_anchors is not None:
+                for row in question_anchors:
+                    row["question_index"] = len(audit_groups)
+                audit_groups.append(episode_group)
+                audit_advantages.append(per_ep_adv)
+                audit_anchors.extend(question_anchors)
             kept = 0
             for ep, adv in zip(episode_group, per_ep_adv):
                 td = ep.get("raca_turn_data", {})
@@ -172,6 +184,12 @@ class GRPOAgenticTrainer:
             if count:
                 int_metrics[f"interaction_p{layer}_adv_abs"] = (
                     int_layer_abs[layer] / count)
+
+        if getattr(self, "rebuttal_diagnostics", True):
+            from training.rebuttal_diagnostics import credit_report
+            self.last_credit_report = credit_report(
+                audit_groups, audit_advantages, audit_anchors,
+                vocab_size=self.model._model.config.vocab_size)
 
         if not all_episodes:
             if self.vllm_engine is not None:

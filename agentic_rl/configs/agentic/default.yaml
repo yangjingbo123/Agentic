@@ -1,4 +1,10 @@
 batch_size: 32
+# Rebuttal measurements only; no changes to rewards, routing, or optimization.
+rebuttal_diagnostics: true
+rebuttal_print_every: 1
+rebuttal_save_turns: true
+# null -> <ckpt_dir>/rebuttal/<unique run id>/ on the checkpoint mount.
+rebuttal_output_dir: null
 n_samples: 16
 lr: 1.0e-5
 clip_epsilon: 0.2

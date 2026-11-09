@@ -90,6 +90,7 @@ def compute_raca_advantages(
     delta: float = 1e-4,
     balance_interaction_layers: bool = False,
     interaction_balance_cap: float = 2.0,
+    diagnostics: list | None = None,
 ) -> list:
     """对同一问题的 N 个 rollout 计算逐 turn 优势。
 
@@ -171,11 +172,18 @@ def compute_raca_advantages(
         for _ep_idx, _tid, r, dk, _name, _weight in entries:
             reps.setdefault(dk, r)
         rep_rewards = list(reps.values())
+        if diagnostics is not None:
+            from training.rebuttal_diagnostics import anchor_record
+            diagnostics.append(anchor_record(key, entries, rep_rewards, delta))
         if len(rep_rewards) < 2:
             continue
         mu, sig = _mean_std(rep_rewards)
         if sig > delta:
             group_stats[key] = (mu, sig, len(entries))
+
+    if diagnostics is not None:
+        from training.rebuttal_diagnostics import add_absent_anchors
+        add_absent_anchors(diagnostics, anchor_groups)
 
     layer_weights = {key: 1.0 for key in group_stats}
     if balance_interaction_layers:

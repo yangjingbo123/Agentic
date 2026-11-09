@@ -161,6 +161,12 @@ def main(cfg: DictConfig):
         model, tokenizer, OmegaConf.to_container(cfg.agentic),
         vllm_engine=vllm_engine, eval_mode=True,
     )
+    from training.rebuttal_diagnostics import DiagnosticWriter, prediction_fields
+    _diag_base = (cfg.get("ckpt_dir") or f"checkpoints/rl-{cfg.exp_name}")
+    diag_writer = (DiagnosticWriter(
+        cfg.agentic.get("rebuttal_output_dir") or os.path.join(_diag_base, "rebuttal"),
+        OmegaConf.to_container(cfg, resolve=True), run_name=cfg.exp_name)
+        if cfg.agentic.get("rebuttal_diagnostics", True) else None)
 
     # 方案 C：每个 eval step 同时测固定 MATH Level-5 1000 与 AIME 2022--2026 150。
     eval_suites = {
@@ -207,6 +213,7 @@ def main(cfg: DictConfig):
                 for key in ("year", "exam", "problem", "level", "source"):
                     if key in item:
                         row[key] = item[key]
+                row.update(prediction_fields(ep))
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
         return path
 
@@ -216,6 +223,9 @@ def main(cfg: DictConfig):
             [it["answer"] for it in items],
         )
         n = len(episodes)
+        if diag_writer is not None:
+            diag_writer.write(f"eval_{suite_name}", step, episodes,
+                              temperature=0.0, eps_force=0.0)
         correct = sum(bool(ep["is_correct"]) for ep in episodes)
         acc = correct / max(n, 1)
         hist = _eval_histories[suite_name]
@@ -480,6 +490,10 @@ def main(cfg: DictConfig):
             if len(valid) >= 2:   # need at least 2 for anchor-group comparison
                 batch_rollouts.append(valid)
         if not batch_rollouts:
+            if diag_writer is not None:
+                diag_writer.write("train", step, [e for e in all_eps if e is not None],
+                    skipped=True, reason="no question has >=2 usable episodes",
+                    requested_episodes=len(all_q), admitted_episodes=0)
             note_skip("no group had >=2 valid episodes")
             continue
 
@@ -487,10 +501,26 @@ def main(cfg: DictConfig):
         try:
             stats = trainer.update(batch_rollouts)
         except Exception:
+            if diag_writer is not None:
+                diag_writer.write("train", step, [e for g in batch_rollouts for e in g],
+                    credit=trainer.last_credit_report, skipped=True,
+                    reason="optimizer update raised an exception")
             import traceback; traceback.print_exc()
             raise
 
         _g_kept, _g_total = stats.get("groups_kept", 0), stats.get("groups_total", 0)
+        if diag_writer is not None:
+            diag_writer.write("train", step, [e for g in batch_rollouts for e in g],
+                credit=trainer.last_credit_report, skipped=bool(stats.get("skipped", False)),
+                temperature=1.0, eps_force=eps_force, rollout_seconds=_dt_rollout,
+                requested_episodes=len(all_q),
+                returned_episodes=sum(e is not None for e in all_eps),
+                admitted_episodes=sum(len(g) for g in batch_rollouts),
+                update_seconds=time.time() - _t_train0,
+                optimizer_metrics={k: stats[k] for k in (
+                    "loss", "kl", "solution_channel_count", "interaction_channel_count",
+                    "role_valid_proposer", "role_valid_controller", "role_valid_critic",
+                    "role_valid_verifier") if k in stats})
         # 先读 credit/logprob 诊断，再判断 skipped。splitF 现在表示 interaction
         # channel 缺失；格式坏时 solution 仍可能保留。gapT 是只收 KL 的跨界 token。
         _n_split = getattr(trainer.executor, "n_credit_split_failed", 0)

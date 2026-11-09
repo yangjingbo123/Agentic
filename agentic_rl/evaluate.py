@@ -63,7 +63,7 @@ def evaluate(executor: AgenticExecutor, dataset: list) -> dict:
     critic_tp = 0   # 挑错且 proposer 确实错了
     critic_fp = 0   # 挑错但 proposer 是对的
     critic_total = 0
-    verifier_agree = 0  # verifier 判断与最终答案一致
+    verifier_agree = 0  # verifier 判断与其被审答案的真实正确性一致
     verifier_total = 0
     verifier_unparsed = 0  # 没给出可解析分数的 turn（不进一致率分母）
 
@@ -109,7 +109,8 @@ def evaluate(executor: AgenticExecutor, dataset: list) -> dict:
                     verifier_unparsed += 1
                     continue
                 verifier_total += 1
-                verifier_agree += 1 if (score > 0.5) == ep["is_correct"] else 0
+                verifier_agree += int((score > 0.5) == bool(
+                    last_proposer_ans and math_equal(last_proposer_ans, correct_answer)))
 
     n = len(dataset)
     return {
@@ -128,6 +129,7 @@ def evaluate(executor: AgenticExecutor, dataset: list) -> dict:
 def per_item_rows(dataset: list, episodes: list, suite: str) -> list:
     """生成可复查的逐题结果；不保存完整 prompt/trajectory，控制输出体积。"""
     rows = []
+    from training.rebuttal_diagnostics import prediction_fields
     for item, ep in zip(dataset, episodes):
         row = {
             "suite": suite,
@@ -150,6 +152,7 @@ def per_item_rows(dataset: list, episodes: list, suite: str) -> list:
         for key in ("year", "exam", "problem", "level", "source"):
             if key in item:
                 row[key] = item[key]
+        row.update(prediction_fields(ep))
         rows.append(row)
     return rows
 
@@ -254,6 +257,12 @@ def main():
     with open(output, "w", encoding="utf-8") as f:
         for row in per_item_rows(dataset, episodes, args.suite):
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    from training.rebuttal_diagnostics import DiagnosticWriter
+    if config["agentic"].get("rebuttal_diagnostics", True):
+        writer = DiagnosticWriter(output + ".diagnostics", config, run_name=args.suite)
+        writer.write(f"eval_{args.suite}", None, episodes,
+                     checkpoint=args.checkpoint, temperature=0.0, eps_force=0.0)
 
     print(f"Accuracy:             {results['accuracy']:.4f} "
           f"({int(results['accuracy']*results['n'])}/{results['n']})")
